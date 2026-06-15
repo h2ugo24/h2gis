@@ -855,6 +855,18 @@ class Extractor:
         irregular grids) and numpy searchsorted for time, then selects with
         isel() (integer indexing) which is faster than coordinate-based sel().
 
+        This is the low-level point-extraction engine and assumes its inputs are
+        already prepared; :meth:`extract_from_dataset` (or :meth:`process_single_varkey`
+        for the store) establishes these preconditions for you.
+
+        Preconditions (the caller must guarantee these — they are not validated):
+            - ``data`` has columns named exactly ``time``, ``lon`` and ``lat``.
+            - ``ds`` has coordinates named exactly ``lon`` and ``lat`` (read directly
+              when building the KDTree).
+            - If ``ds`` has a ``time`` coordinate it must be **sorted ascending** —
+              nearest-time lookup uses ``np.searchsorted`` and returns wrong indices
+              on an unsorted axis. No CRS is required.
+
         Parameters:
             ds (xr.Dataset | xr.DataArray): dataset with coords lon, lat and optionally time.
 
@@ -890,6 +902,19 @@ class Extractor:
     ) -> pd.DataFrame:
         """
         Extract data from shapefile using multiprocessing starmap.
+
+        This is the low-level geometry-extraction engine and assumes its inputs are
+        already prepared; :meth:`extract_from_dataset` (or :meth:`process_single_varkey`
+        for the store) establishes these preconditions for you.
+
+        Preconditions (the caller must guarantee these — they are not validated):
+            - ``data`` is a GeoDataFrame with a ``geometry`` column (and a ``time``
+              column when ``ds`` has a ``time`` coordinate).
+            - ``ds`` has a CRS set (``ds.rio.crs``) and spatial dims named ``x``/``y``,
+              because per-geometry ``ds.rio.clip`` resolves dims by name. Datasets
+              with ``lon``/``lat`` must be renamed and given a CRS first (see
+              :meth:`ensure_crs`); the ``lon``/``lat`` bbox pre-select still works,
+              but the clip step will fail without ``x``/``y`` + CRS.
 
         Args:
             gdf (gpd.GeoDataFrame): geodataframe with geometries and time column.
