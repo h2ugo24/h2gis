@@ -134,6 +134,11 @@ Columns are the **input columns carried through**, plus one column per extracted
 | CSV / points | `time`, `lon`, `lat` | one column per variable (e.g. `sst`, `tisr`); depth-sliced variables expand to `var_<depth>` |
 | SHP / geometries | `time`, `geometry` | one column per variable; `bathy` additionally yields a `bathy_std` column (mean / std over each geometry) |
 
+The in-memory `run()` return keeps the SHP `geometry` column as a `GeoDataFrame` with live
+shapely geometries (restored from the input on a checkpoint resume, since feather cannot
+round-trip them). It is dropped only when writing to CSV, where shapely geometries would
+serialize to WKT strings that cannot be read back as geometries.
+
 ---
 
 ## Parallelism

@@ -727,6 +727,16 @@ class Extractor:
                 df_processed = df_processed[
                     ~df_processed.index.duplicated(keep="first")
                 ]
+            # Feather can't round-trip live shapely geometries, so pd.read_feather
+            # brings `geometry` back as WKB bytes. Restore it from the original
+            # (index-aligned) input and re-wrap as a GeoDataFrame, matching the
+            # fresh-run return type.
+            if self.input_type == "shp":
+                df_processed = gpd.GeoDataFrame(
+                    df_processed.drop(columns="geometry", errors="ignore"),
+                    geometry=self.data.geometry.reindex(df_processed.index),
+                    crs=self.data.crs,
+                )
             completed_keys = _load_completed_keys(tmp_path)
         else:
             df_processed = self.data.copy()
@@ -1202,6 +1212,12 @@ class Extractor:
             result = existing_df.join(result, how="left")
 
         result = result.reset_index(drop=False)
+
+        # shp inputs carry a `geometry` column through to the result. Shapely
+        # geometries only serialize to WKT strings in a CSV — unusable as
+        # geometries on read-back — so drop it from the file. The in-memory
+        # return value from run() keeps it.
+        result = result.drop(columns="geometry", errors="ignore")
 
         result.to_csv(output_path, index=False)
         logger.success("Results saved")
