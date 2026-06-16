@@ -16,7 +16,7 @@ h2mare/
   │
   ├── cli/                  # Typer commands: run, convert, compile, parquet, catalog
   ├── downloader/           # Source fetchers (CMEMS, AVISO, CDS) selected via registry.py → data/raw/downloads/
-  ├── format_converters/    # netcdf2zarr (regrid → 0.25°/daily), zarr2parquet, parquet2csv
+  ├── format_converters/    # netcdf2zarr (regrid → 0.25°/daily), zarr2parquet, parquet2csv, zarr_map_export
   ├── processing/           # Per-var preprocessing; compiler.py merges → h2ds; core/ holds source transforms
   ├── storage/              # zarr_catalog (resume index); parquet_store (write) / _indexer (API) / _catalog (read)
   └── utils/                # date_range, spatial (grids/masks), labels, logging, paths
@@ -99,6 +99,20 @@ idx.plot.spatial_maps("sst", agg_by="season")
 
 Non-obvious behavior: partition writes are atomic (`.tmp_write_YYYY_MM` → rename); Float64 is downcast to Float32
 on write; `idx.plot` is a `cached_property` invalidated after `add_data()`.
+
+## Chunk layouts & map export
+
+`chunk_dataset` (`storage/xarray_helpers.py`) takes `layout`: `"timeseries"` (default — time-contiguous, small
+spatial tiles; what extraction/`Extractor` reads) or `"map"` (space-contiguous, time pinned to `map_time_chunk`,
+default 14; what interactive maps read). Both fill the 32 MB budget along the axis read *contiguously* and minimize
+the axis indexed *into* — the asymmetry is deliberate (don't budget-fill time in `map`, it would force a single-day
+viz read to decompress many unwanted days). It logs the resulting layout/shape/size on every call.
+
+`export_map_zarr` (`format_converters/zarr_map_export.py`) rewrites a per-period store into a map-chunked **sibling**
+(`h2ds` → `h2ds_map`; or any `var_key` / config-free `source_root`). It's a pure projection: lazy split-rechunk,
+atomic temp-dir swap, source never modified. The `_map` store is a full duplicate (~h2ds size) — a derived,
+rebuildable artifact. The interactive-viz field path reads `h2ds_map`; the canonical `h2ds` stays extraction-chunked.
+See `docs/api/map_export.md`.
 
 ## Git workflow
 

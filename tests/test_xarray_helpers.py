@@ -175,6 +175,122 @@ class TestChunkDataset:
         assert result.chunks["time"][0] > 1
 
 
+class TestChunkDatasetMapLayout:
+    def test_pins_time_to_one_and_keeps_space_full(self):
+        """map layout with map_time_chunk=1: one timestep per chunk, space full."""
+        ds = _make_ds(n_time=10, n_lat=50, n_lon=60)
+        result = chunk_dataset(ds, layout="map", map_time_chunk=1)
+        assert result.chunks["time"] == (1,) * 10
+        assert result.chunks["lat"] == (50,)
+        assert result.chunks["lon"] == (60,)
+
+    def test_default_map_time_chunk_is_14(self):
+        """The map layout defaults to a 14-day time block."""
+        ds = _make_ds(n_time=30, n_lat=50, n_lon=60)
+        result = chunk_dataset(ds, layout="map")
+        # 30 -> 14,14,2
+        assert result.chunks["time"] == (14, 14, 2)
+        assert result.chunks["lat"] == (50,)
+        assert result.chunks["lon"] == (60,)
+
+    def test_map_time_chunk_sets_time_block(self):
+        """map_time_chunk > 1 produces a small time block, space still full."""
+        ds = _make_ds(n_time=10, n_lat=50, n_lon=60)
+        result = chunk_dataset(ds, layout="map", map_time_chunk=4)
+        # 10 -> 4,4,2
+        assert result.chunks["time"] == (4, 4, 2)
+        assert result.chunks["lat"] == (50,)
+        assert result.chunks["lon"] == (60,)
+
+    def test_map_time_chunk_capped_at_time_size(self):
+        """A map_time_chunk larger than the time axis is capped to it."""
+        ds = _make_ds(n_time=5, n_lat=4, n_lon=4)
+        result = chunk_dataset(ds, layout="map", map_time_chunk=100)
+        assert result.chunks["time"] == (5,)
+
+    def test_collapses_depth_to_one(self):
+        """Non-spatial, non-time dims (depth) collapse to 1 in map layout."""
+        times = pd.date_range("2020-01-01", periods=6, freq="D")
+        n_depth = 5
+        data = np.ones((6, n_depth, 10, 10), dtype=np.float32)
+        ds = xr.Dataset(
+            {"thetao": (["time", "depth", "lat", "lon"], data)},
+            coords={
+                "time": times,
+                "depth": np.arange(n_depth, dtype=np.float32),
+                "lat": np.arange(10, dtype=np.float32),
+                "lon": np.arange(10, dtype=np.float32),
+            },
+        )
+        result = chunk_dataset(ds, layout="map", map_time_chunk=1)
+        assert result.chunks["depth"] == (1,) * n_depth
+        assert result.chunks["lat"] == (10,)
+        assert result.chunks["lon"] == (10,)
+        assert result.chunks["time"] == (1,) * 6
+
+    def test_tiles_space_when_single_timestep_exceeds_target(self):
+        """A single full-grid timestep above target_mb is tiled down to fit."""
+        times = pd.date_range("2020-01-01", periods=3, freq="D")
+        # one timestep = 1000*1000*4 = ~3.8 MB > target_mb=1 → spatial must tile
+        data = np.ones((3, 1000, 1000), dtype=np.float32)
+        ds = xr.Dataset(
+            {"sst": (["time", "lat", "lon"], data)},
+            coords={
+                "time": times,
+                "lat": np.linspace(0, 10, 1000),
+                "lon": np.linspace(0, 10, 1000),
+            },
+        )
+        result = chunk_dataset(ds, layout="map", map_time_chunk=1, target_mb=1)
+        assert result.chunks["time"] == (1,) * 3
+        # spatial tiled below the full 1000 so the per-chunk payload fits target
+        assert max(result.chunks["lat"]) < 1000
+        assert max(result.chunks["lon"]) < 1000
+
+    def test_warns_when_no_spatial_dims(self):
+        """map layout on non-gridded data warns and only sets the time chunk."""
+        from loguru import logger
+
+        times = pd.date_range("2020-01-01", periods=4, freq="D")
+        ds = xr.Dataset(
+            {"profile": (["time", "band"], np.ones((4, 3), dtype=np.float32))},
+            coords={"time": times, "band": np.arange(3)},
+        )
+
+        messages: list[str] = []
+        sink_id = logger.add(lambda m: messages.append(str(m)), level="WARNING")
+        try:
+            result = chunk_dataset(ds, layout="map", map_time_chunk=1)
+        finally:
+            logger.remove(sink_id)
+
+        assert any("no spatial dims" in m for m in messages)
+        # Non-spatial, non-time dim collapses to 1; time still pinned.
+        assert result.chunks["band"] == (1,) * 3
+        assert result.chunks["time"] == (1,) * 4
+
+    def test_default_layout_is_timeseries(self):
+        """Default (no layout arg) keeps the time-contiguous extraction layout."""
+        ds = _make_ds(n_time=365, n_lat=50, n_lon=60)
+        result = chunk_dataset(ds)
+        # time-contiguous: a single time chunk spans many days, not 1.
+        assert result.chunks["time"][0] > 1
+
+    def test_logs_layout_and_chunk_size(self):
+        """chunk_dataset logs the layout, chunk shape and size for any dataset."""
+        from loguru import logger
+
+        ds = _make_ds(n_time=30, n_lat=50, n_lon=60)
+        messages: list[str] = []
+        sink_id = logger.add(lambda m: messages.append(str(m)), level="INFO")
+        try:
+            chunk_dataset(ds, layout="map")
+        finally:
+            logger.remove(sink_id)
+
+        assert any("layout='map'" in m and "MB" in m for m in messages)
+
+
 class TestSnapGridCoords:
     def test_noise_drift_collapses_to_rounded_grid(self):
         """Labels off the grid by sub-4dp float noise snap to the rounded grid."""
