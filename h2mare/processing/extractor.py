@@ -26,8 +26,6 @@ from h2mare.utils.logging import configure_extraction_logging, log_time
 from h2mare.utils.paths import resolve_store_path
 from h2mare.utils.spatial import sel_padded_bbox
 
-_AUTO_INDEX_SENTINEL = "__row_id__"
-
 # Module-level KDTree cache keyed on grid identity (shape + first/last values).
 # All var_keys produced by this pipeline share the same 0.25° grid, so the tree
 # is built once per process and reused across every extract_from_csv call.
@@ -169,13 +167,54 @@ def load_dataset_to_memory(ds: xr.Dataset | xr.DataArray) -> xr.Dataset | xr.Dat
     return ds.compute()
 
 
+def ensure_row_id(
+    data: pd.DataFrame | gpd.GeoDataFrame, col: str = "row_id"
+) -> pd.DataFrame | gpd.GeoDataFrame:
+    """
+    Guarantee a stable, unique key column on ``data`` for merging extraction
+    results back onto the caller's dataframe.
+
+    The merge key must exist on *both* sides of the eventual join, so it has to
+    be established here — on the frame the caller keeps — rather than invented
+    inside :class:`Extractor`, which never sees the caller's other columns. Use
+    the returned frame for both the extraction and the later merge.
+
+    Behaviour:
+        - ``col`` present and unique     -> returned unchanged.
+        - ``col`` present with duplicates -> ``ValueError`` (a duplicated key
+          silently collapses rows on merge-back; the caller must fix it).
+        - ``col`` absent                 -> a positional ``range(len(data))`` key
+          is added on a copy.
+
+    Parameters:
+        data (pd.DataFrame | gpd.GeoDataFrame): input points or geometries.
+        col (str): name of the key column. Defaults to ``"row_id"``.
+
+    Returns:
+        The frame (same type as ``data``) carrying a unique ``col``.
+    """
+    if col in data.columns:
+        if data[col].duplicated().any():
+            n = int(data[col].duplicated().sum())
+            raise ValueError(
+                f"'{col}' has {n} duplicate value(s); the key must be unique to "
+                "merge extraction results back without collapsing rows."
+            )
+        return data
+
+    data = data.copy()
+    data[col] = range(len(data))
+    logger.info(f"No '{col}' column found — added a positional one (0..{len(data) - 1}).")
+    return data
+
+
 class Extractor:
     def __init__(
         self,
         file_path: Union[Path, gpd.GeoDataFrame, pd.DataFrame],
         *,
+        index_col: str,
         time_col: Optional[str] = None,
-        index_col: Optional[str] = None,
         lon_col: Optional[str] = None,
         lat_col: Optional[str] = None,
         app_config: Optional[AppConfig] = None,
@@ -188,8 +227,11 @@ class Extractor:
 
         Parameters:
             file_path (Union[Path, gpd.GeoDataFrame, pd.DataFrame]): Data for extraction
+            index_col (str): Name of the unique key column used to merge results
+                back onto the input. Required and must already exist in the data
+                (establish it with :func:`ensure_row_id`); a missing or duplicated
+                key raises ``ValueError``.
             time_col (str): Name of time column. Defaults to "time".
-            index_col (str, optional): Name of index column. Defaults to "row_id" if not provided.
             lon_col (str, optional): Name of longitude column. Defaults to "lon".
             lat_col (str, optional): Name of latitude column. Defaults to "lat".
             app_config (AppConfig, optional): Dataclass with environmental data specifics. Defaults to cfg.
@@ -203,7 +245,7 @@ class Extractor:
         configure_extraction_logging(log_path=log_file)
 
         self.time_col = time_col if time_col is not None else "time"
-        self.index_col = index_col if index_col is not None else _AUTO_INDEX_SENTINEL
+        self.index_col = index_col
         self.lon_col = lon_col if lon_col is not None else "lon"
         self.lat_col = lat_col if lat_col is not None else "lat"
         self.crs = crs
@@ -287,34 +329,29 @@ class Extractor:
         self, data: pd.DataFrame | gpd.GeoDataFrame
     ) -> pd.DataFrame | gpd.GeoDataFrame:
         """
-        Resolve index_col in shp and csv dataframes.
+        Set ``index_col`` as the frame index — the key used to merge results
+        back onto the caller's data.
 
-        If no index_col is provided (sentinel), a sequential index is created
-        and stored under the private name '__row_id__', which is preserved as
-        the DataFrame index throughout the pipeline — never dropped or saved
-        to output files.
+        The key is the caller's responsibility: it must already exist in the
+        data and be unique (establish it up front with :func:`ensure_row_id`).
+        The Extractor consumes the key, it never creates one.
 
         Raises:
-            ValueError: if provided index_col not found in data.columns
+            ValueError: if ``index_col`` is missing from the data, or has
+                duplicate values.
         """
-        if self.index_col == _AUTO_INDEX_SENTINEL:
-            if _AUTO_INDEX_SENTINEL in data.columns:
-                # Reuse existing __row_id__ from a previous run — do not recreate
-                logger.debug(
-                    f"Found existing '{_AUTO_INDEX_SENTINEL}' column. Reusing as index."
-                )
-                data = data.set_index(_AUTO_INDEX_SENTINEL)
-            else:
-                logger.debug(
-                    "No index column name provided. Creating sequential '__row_id__' indexation."
-                )
-                data = data.reset_index(drop=True)
-            data.index.name = _AUTO_INDEX_SENTINEL
-        else:
-            if self.index_col not in data.columns:
-                raise ValueError("Index column name not found in data attributes.")
-            data = data.set_index(self.index_col)
-        return data
+        if self.index_col not in data.columns:
+            raise ValueError(
+                f"index_col '{self.index_col}' not found in data — establish it "
+                "first, e.g. with ensure_row_id(data)."
+            )
+        if data[self.index_col].duplicated().any():
+            n = int(data[self.index_col].duplicated().sum())
+            raise ValueError(
+                f"index_col '{self.index_col}' has {n} duplicate value(s); it must "
+                "be unique to merge extraction results back without collapsing rows."
+            )
+        return data.set_index(self.index_col)
 
     def _prepare_data(
         self, data: pd.DataFrame | gpd.GeoDataFrame

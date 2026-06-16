@@ -10,6 +10,7 @@ The main classes you interact with directly.
 | `Compiler` | `h2mare.processing.compiler` | Merge variables into the h2ds grid |
 | `ZarrCatalog` | `h2mare.storage.zarr_catalog` | Query and manage Zarr stores |
 | `Extractor` | `h2mare.processing.extractor` | Extract time series at points or geometries |
+| `ensure_row_id` | `h2mare.processing.extractor` | Establish a unique merge key before extraction |
 | `PipelineManager` | `h2mare.pipeline_manager` | Orchestrate the full download → convert pipeline |
 | `ParquetIndexer` | `h2mare.storage.parquet_indexer` | Hive-partitioned Parquet store — write, read, and query |
 | `ParquetPlotter` | `h2mare.storage.parquet_plotter` | Visualization accessor for `ParquetIndexer` (via `indexer.plot`) |
