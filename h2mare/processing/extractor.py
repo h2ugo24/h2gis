@@ -21,7 +21,7 @@ from scipy.spatial import KDTree
 
 from h2mare import AppConfig, get_settings
 from h2mare.storage.zarr_catalog import ZarrCatalog
-from h2mare.types import BBox
+from h2mare.types import BBox, DateRange
 from h2mare.utils.logging import configure_extraction_logging, log_time
 from h2mare.utils.paths import resolve_store_path
 from h2mare.utils.spatial import sel_padded_bbox
@@ -511,6 +511,116 @@ class Extractor:
 
         raise ValueError(f"Unsupported input_type: {self.input_type}")
 
+    def extract_from_dataset(
+        self,
+        ds: xr.Dataset | xr.DataArray,
+        *,
+        vars: str | list[str] | None = None,
+        n_workers: int = 8,
+        clip_to_coverage: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Extract values from an arbitrary in-memory dataset, bypassing ZarrCatalog.
+
+        This is the config-free counterpart to :meth:`process_single_varkey`: it runs
+        the same extraction engine (:meth:`extract_from_csv` / :meth:`extract_from_shp`)
+        against a ``ds`` the caller already holds in memory — useful for new data that
+        is not yet ingested into the store. The prepared points/geometries in
+        ``self.data`` are reused as-is.
+
+        Only the config-free prep is applied here. Config-driven steps that
+        :meth:`process_single_varkey` performs — depth-slice expansion
+        (``extract_depth_slices``), ``rename_lonlat``, and store date/bbox coverage
+        resolution — are the caller's responsibility: prepare ``ds`` beforehand.
+
+        Parameters:
+            ds (xr.Dataset | xr.DataArray): gridded data with coords ``lon``, ``lat``
+                and optionally ``time``. For shapefile input it is assumed to be in
+                ``self.crs`` (its CRS is overwritten, not reprojected, to match the
+                geometries — see :meth:`ensure_crs`).
+            vars (str | list[str] | None): subset of variables to extract. Only valid
+                when ``ds`` is an ``xr.Dataset``; raises ``TypeError`` for a DataArray.
+            n_workers (int): parallel workers for shapefile (geometry) extraction.
+            clip_to_coverage (bool): when True, drop input rows whose location (and
+                time, if ``ds`` has a time coord) falls outside the ``ds`` extent;
+                dropped rows surface as NaN in the result. Defaults to False, since
+                nearest-neighbour (csv) / clip-or-NaN (shp) already handle them.
+
+        Returns:
+            pd.DataFrame indexed by ``self.index_col`` (aligned to ``self.data.index``)
+            with one column per variable (csv) or ``var`` / ``var_std`` columns (shp).
+        """
+        vars = [vars] if isinstance(vars, str) else vars
+
+        if vars is not None:
+            if not isinstance(ds, xr.Dataset):
+                raise TypeError(
+                    "`vars` can only be used when `ds` is an xr.Dataset, "
+                    "not an xr.DataArray."
+                )
+            ds = ds[vars]
+
+        if "time" in ds.coords:
+            ds = ds.sortby("time")
+
+        data = self._mask_to_ds_extent(ds) if clip_to_coverage else self.data
+
+        if self.input_type == "shp":
+            if not isinstance(data, gpd.GeoDataFrame):
+                raise TypeError("Data must be a GeoDataFrame for shapefile extraction")
+
+            # rioxarray's .rio.clip (used by extract_from_shp) resolves spatial dims
+            # by name and expects x/y. Geographic datasets carry lon/lat, so rename —
+            # the config-driven equivalent of var_cfg.rename_lonlat in the store path.
+            if "lon" in ds.coords and "lat" in ds.coords:
+                ds = ds.rename({"lon": "x", "lat": "y"})
+
+            ds = self.ensure_crs(data, ds)
+            result = self.extract_from_shp(
+                data, ds, self.index_col, n_workers=n_workers
+            )
+
+        elif self.input_type == "csv":
+            result = self.extract_from_csv(data, ds, self.index_col)
+
+        else:
+            raise ValueError(f"Unsupported input_type: {self.input_type}")
+
+        # When rows were clipped out, realign to the full input so dropped rows
+        # surface as NaN rather than silently vanishing from the result.
+        if clip_to_coverage:
+            result = result.reindex(self.data.index)
+
+        return result
+
+    def _mask_to_ds_extent(
+        self, ds: xr.Dataset | xr.DataArray
+    ) -> pd.DataFrame | gpd.GeoDataFrame:
+        """
+        Return a copy of ``self.data`` keeping only rows inside the ``ds`` extent.
+
+        Spatial filtering uses the dataset bbox (point for csv, geometry centroid for
+        shp); temporal filtering applies only when ``ds`` carries a ``time`` coord.
+        ``self.data`` itself is never mutated.
+        """
+        bbox = BBox.from_dataset(ds)
+
+        if self.input_type == "csv":
+            mask = self.data["lon"].between(bbox.xmin, bbox.xmax) & self.data[
+                "lat"
+            ].between(bbox.ymin, bbox.ymax)
+        else:
+            centroids = self.data.geometry.centroid
+            mask = centroids.x.between(bbox.xmin, bbox.xmax) & centroids.y.between(
+                bbox.ymin, bbox.ymax
+            )
+
+        if "time" in ds.coords:
+            dr = DateRange.from_dataset(ds)
+            mask &= self.data["time"].between(dr.start, dr.end)
+
+        return self.data.loc[mask]
+
     @overload
     def run(
         self,
@@ -617,6 +727,16 @@ class Extractor:
                 df_processed = df_processed[
                     ~df_processed.index.duplicated(keep="first")
                 ]
+            # Feather can't round-trip live shapely geometries, so pd.read_feather
+            # brings `geometry` back as WKB bytes. Restore it from the original
+            # (index-aligned) input and re-wrap as a GeoDataFrame, matching the
+            # fresh-run return type.
+            if self.input_type == "shp":
+                df_processed = gpd.GeoDataFrame(
+                    df_processed.drop(columns="geometry", errors="ignore"),
+                    geometry=self.data.geometry.reindex(df_processed.index),
+                    crs=self.data.crs,
+                )
             completed_keys = _load_completed_keys(tmp_path)
         else:
             df_processed = self.data.copy()
@@ -745,6 +865,18 @@ class Extractor:
         irregular grids) and numpy searchsorted for time, then selects with
         isel() (integer indexing) which is faster than coordinate-based sel().
 
+        This is the low-level point-extraction engine and assumes its inputs are
+        already prepared; :meth:`extract_from_dataset` (or :meth:`process_single_varkey`
+        for the store) establishes these preconditions for you.
+
+        Preconditions (the caller must guarantee these — they are not validated):
+            - ``data`` has columns named exactly ``time``, ``lon`` and ``lat``.
+            - ``ds`` has coordinates named exactly ``lon`` and ``lat`` (read directly
+              when building the KDTree).
+            - If ``ds`` has a ``time`` coordinate it must be **sorted ascending** —
+              nearest-time lookup uses ``np.searchsorted`` and returns wrong indices
+              on an unsorted axis. No CRS is required.
+
         Parameters:
             ds (xr.Dataset | xr.DataArray): dataset with coords lon, lat and optionally time.
 
@@ -780,6 +912,19 @@ class Extractor:
     ) -> pd.DataFrame:
         """
         Extract data from shapefile using multiprocessing starmap.
+
+        This is the low-level geometry-extraction engine and assumes its inputs are
+        already prepared; :meth:`extract_from_dataset` (or :meth:`process_single_varkey`
+        for the store) establishes these preconditions for you.
+
+        Preconditions (the caller must guarantee these — they are not validated):
+            - ``data`` is a GeoDataFrame with a ``geometry`` column (and a ``time``
+              column when ``ds`` has a ``time`` coordinate).
+            - ``ds`` has a CRS set (``ds.rio.crs``) and spatial dims named ``x``/``y``,
+              because per-geometry ``ds.rio.clip`` resolves dims by name. Datasets
+              with ``lon``/``lat`` must be renamed and given a CRS first (see
+              :meth:`ensure_crs`); the ``lon``/``lat`` bbox pre-select still works,
+              but the clip step will fail without ``x``/``y`` + CRS.
 
         Args:
             gdf (gpd.GeoDataFrame): geodataframe with geometries and time column.
@@ -1067,6 +1212,12 @@ class Extractor:
             result = existing_df.join(result, how="left")
 
         result = result.reset_index(drop=False)
+
+        # shp inputs carry a `geometry` column through to the result. Shapely
+        # geometries only serialize to WKT strings in a CSV — unusable as
+        # geometries on read-back — so drop it from the file. The in-memory
+        # return value from run() keeps it.
+        result = result.drop(columns="geometry", errors="ignore")
 
         result.to_csv(output_path, index=False)
         logger.success("Results saved")
