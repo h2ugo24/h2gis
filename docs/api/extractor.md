@@ -25,8 +25,8 @@ dates present in the input, intersected with each variable's store coverage.
 Extractor(
     file_path,            # path to .csv/.shp, or an in-memory DataFrame/GeoDataFrame
     *,
+    index_col,            # REQUIRED — name of a unique key column already in the data
     time_col=None,        # default "time"
-    index_col=None,       # default auto "__row_id__"
     lon_col=None,         # default "lon"  (CSV only)
     lat_col=None,         # default "lat"  (CSV only)
     app_config=None,      # default: settings.app_config
@@ -39,14 +39,51 @@ Extractor(
 | Parameter | Default | Description |
 |---|---|---|
 | `file_path` | — | A `.csv` / `.shp` path, or an in-memory `pd.DataFrame` (points) / `gpd.GeoDataFrame` (geometries). The suffix or object type selects point vs geometry mode. |
+| `index_col` | **required** | Name of the unique key column used to merge results back onto your input. It must already exist in the data and be unique — the Extractor consumes the key, it never creates one. A missing or duplicated key raises `ValueError`. Use [`ensure_row_id`](#establishing-the-merge-key-ensure_row_id) to establish it. |
 | `time_col` | `"time"` | Name of the time column in the input. |
-| `index_col` | `"__row_id__"` | Name of the column to use as the output index. If omitted, a sequential `__row_id__` index is created and preserved through the pipeline (never written to output). |
 | `lon_col` | `"lon"` | Longitude column name (CSV/point input only). |
 | `lat_col` | `"lat"` | Latitude column name (CSV/point input only). |
 | `app_config` | `settings.app_config` | Override the application configuration (variable registry, depth slices, etc.). |
 | `store_root` | `STORE_ROOT` | Root directory of the Zarr stores. |
 | `crs` | `4326` | EPSG code that geometries are reprojected to (SHP/geometry input only). |
 | `log_file` | `LOGS_DIR/extractor.log` | Extraction log file. The first `Extractor` in the process fixes this; later values are ignored. |
+
+---
+
+## Establishing the merge key (`ensure_row_id`)
+
+The Extractor keeps only the columns it needs (`time`/`lon`/`lat` for points,
+`time`/`geometry` for geometries) and returns one column per extracted variable. To stitch
+those results back onto your *original* dataframe, you need a key that exists on **both**
+sides. Because the Extractor never sees your other columns, that key must be established
+**before** extraction, on the frame you keep — not invented inside the Extractor.
+
+`ensure_row_id` is the helper for that step:
+
+```python
+from h2mare.processing.extractor import ensure_row_id
+
+df = ensure_row_id(df)        # adds a unique "row_id" column (or validates an existing one)
+```
+
+| `col` state in `data` | Behaviour |
+|---|---|
+| present, unique | returned unchanged |
+| present, duplicated | raises `ValueError` — a duplicated key collapses rows on merge-back |
+| absent | adds a positional `0..n-1` key (on a copy) — safe to merge back only against this exact frame, in this order |
+
+### Merging results back
+
+```python
+df = ensure_row_id(df)                              # key now lives on your frame
+out = Extractor(df, index_col="row_id").run("sst")  # result indexed by row_id
+enriched = df.merge(out, left_on="row_id", right_index=True)
+```
+
+Passing a `.csv`/`.shp` **path** instead of a frame is still supported, but with
+`index_col` required the file must already contain that key column — there is no
+auto-provisioning fallback. For files, read them in, call `ensure_row_id`, and pass the
+frame.
 
 ---
 
@@ -113,7 +150,8 @@ ds = xr.Dataset(
             "lat": [40, 41, 42], "lon": [-10, -9, -8]},
 )
 pts = pd.DataFrame({"time": ["2021-01-01", "2021-01-02"], "lon": [-10, -8], "lat": [40, 42]})
-out = Extractor(pts).extract_from_dataset(ds)   # sst at the two nearest grid/time cells
+pts = ensure_row_id(pts)
+out = Extractor(pts, index_col="row_id").extract_from_dataset(ds)   # sst at nearest cells
 ```
 
 ---
@@ -123,8 +161,9 @@ out = Extractor(pts).extract_from_dataset(ds)   # sst at the two nearest grid/ti
 `run()` produces a single tabular result, indexed by `index_col`:
 
 - **Returned as a `DataFrame`** when `output_path` is `None`.
-- **Written as a CSV** when `output_path` is given (and `run()` returns `None`). If the
-  file already exists, overlapping columns are dropped from the existing file and the new
+- **Written as a CSV** when `output_path` is given (and `run()` returns `None`). The
+  `index_col` key is written as a column so you can merge the result back. If the file
+  already exists, overlapping columns are dropped from the existing file and the new
   columns are joined in.
 
 Columns are the **input columns carried through**, plus one column per extracted variable:
