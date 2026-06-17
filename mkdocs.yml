@@ -46,5 +46,6 @@ nav:
     - Extractor: api/extractor.md
     - ParquetIndexer: api/parquet_indexer.md
     - ParquetPlotter: api/parquet_plotter.md
+    - Plotting utilities: api/plotting.md
     - Ad-hoc converters & exports: api/adhoc_converters.md
     - Map export: api/map_export.md
