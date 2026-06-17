@@ -81,6 +81,12 @@ def download_subset(
         minimum_depth=depth_range[0] if depth_range else None,
         maximum_depth=depth_range[1] if depth_range else None,
         output_directory=output_dir,
+        # Overwrite an existing target instead of the toolbox default, which
+        # writes a new 'filename_(1).nc'. Gaps are recomputed from catalog
+        # coverage, so a re-triggered download must cleanly replace any stale
+        # or partially written file from a previous failed run rather than
+        # leaving duplicates for the convert step to glob.
+        overwrite=True,
         # The progress bar redraws via carriage returns; redirected to a file
         # (scheduled runs) every refresh persists as its own line.
         disable_progress_bar=not sys.stderr.isatty(),
@@ -218,6 +224,10 @@ def download_original(
             filter=pattern,
             output_directory=output_dir,
             no_directories=True,
+            # Overwrite stale/partial files from a previous failed run instead
+            # of the toolbox default ('filename_(1).nc' duplicates). See note
+            # in download_subset.
+            overwrite=True,
             disable_progress_bar=not sys.stderr.isatty(),
         )
     logger.debug(f"Downloaded to {output_dir}")
