@@ -18,7 +18,7 @@ CLI (h2mare/cli/main.py)
 
 Zarr2Parquet : BaseConverter         (uses ParquetIndexer)
 Extractor                            (uses ParquetIndexer)
-parquet2csv                          (reads Parquet directly)
+convert_parquet_to_csv               (one-way export; reads Parquet directly)
 
 ParquetIndexer  (facade)
   ├── ParquetStore   (writes: add_data, overlap resolution, atomic I/O)

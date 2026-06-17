@@ -1,20 +1,27 @@
-# Ad-hoc converters
+# Ad-hoc converters & exports
 
-Three config-free functions convert arbitrary files through the pipeline's engine
-**without a configured `var_key`**. Use them to process files that are not
-registered in `config.yaml` — a one-off download, a manually placed store, or an
-externally produced dataset.
+Config-free functions that move data through the pipeline's engine **without a
+configured `var_key`**. Use them on files that are not registered in
+`config.yaml` — a one-off download, a manually placed store, or an externally
+produced dataset — driven by arguments instead of config.
 
-They are the standalone counterparts to the `Netcdf2Zarr` and `Zarr2Parquet`
-classes: same generic transform and overlap-resolving write path, but driven by
-arguments instead of `config.yaml`. The classes remain the right tool for
-configured, resumable pipeline runs.
+Two kinds live here:
+
+- **Converters** (`convert_<src>_to_<dst>`) — the standalone counterparts to the
+  `Netcdf2Zarr` and `Zarr2Parquet` classes: same generic transform and
+  overlap-resolving write path. They move data *between* the pipeline's working
+  formats (NetCDF/GRIB ↔ Zarr ↔ Parquet), so they round-trip and append/merge
+  on re-run. The classes remain the right tool for configured, resumable runs.
+- **Exports** (`convert_parquet_to_csv`) — a one-way dump to a terminal format
+  for external consumption. No overlap-resolving write path, no class
+  counterpart; see the [Export to CSV](#export-to-csv) section.
 
 | Function | Module | Converts |
 |---|---|---|
 | `convert_netcdf_to_zarr` | `h2mare.format_converters.netcdf2zarr` | NetCDF / GRIB → Zarr |
 | `convert_zarr_to_parquet` | `h2mare.format_converters.zarr2parquet` | Zarr → Hive-partitioned Parquet |
 | `convert_parquet_to_zarr` | `h2mare.format_converters.parquet2zarr` | Hive-partitioned Parquet → Zarr |
+| `convert_parquet_to_csv` | `h2mare.format_converters.parquet2csv` | Hive-partitioned Parquet → CSV (one-way export) |
 
 ---
 
@@ -194,6 +201,72 @@ Returns the list of distinct `.zarr` paths written (one per output period). Rais
     Float32, with midnight-normalized time. It is the faithful inverse of what
     was written to Parquet, not necessarily byte-identical to an original
     NetCDF-derived store.
+
+---
+
+## Export to CSV
+
+`convert_parquet_to_csv` exports a date-filtered slice of the Parquet store to
+CSV files, one file per day, month, or year. Unlike the converters above this is
+a **one-way export** to a terminal format — it does not go through the
+overlap-resolving write path, has no class counterpart, and is not the inverse of
+any pipeline step.
+
+```python
+from h2mare.format_converters.parquet2csv import convert_parquet_to_csv
+
+convert_parquet_to_csv(
+    parquet_root="data/processed/parquet",
+    csv_root="data/processed/csv",
+    start_date="2021-01-01",
+    end_date="2021-12-31",
+    freq="month",
+)
+```
+
+!!! note "Deprecated alias"
+    The previous name `parquet2csv` remains importable as an alias of
+    `convert_parquet_to_csv` and is scheduled for removal in a future release.
+    Prefer the `convert_*` name, which matches the other functions on this page.
+
+### Parameters
+
+```python
+convert_parquet_to_csv(
+    parquet_root,         # path to Parquet store (file or directory)
+    csv_root,             # output directory for CSV files
+    start_date,
+    end_date,
+    freq="day",           # "day" | "month" | "year"
+    n_workers=8,
+)
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `parquet_root` | — | Path to the Parquet store (file or Hive-partitioned directory) |
+| `csv_root` | — | Root output directory; year subdirectories are created automatically |
+| `start_date` | — | Start of export period (`str`, e.g. `"2021-01-01"`) |
+| `end_date` | — | End of export period (`str`, e.g. `"2021-12-31"`) |
+| `freq` | `"day"` | Output granularity: `"day"`, `"month"`, or `"year"` |
+| `n_workers` | `8` | Number of threads for parallel CSV writes |
+
+Returns the `csv_root` directory written. Raises `ValueError` if `freq` is not
+`"day"`, `"month"`, or `"year"`.
+
+### Output layout
+
+```
+csv_root/
+└── YYYY/
+    ├── YYYY-MM-DD.csv   # day
+    ├── YYYY-MM.csv      # month
+    └── YYYY.csv         # year
+```
+
+Each file has a `time` column (`YYYY-MM-DD`) plus one column per variable. Hive
+partition columns (`year`, `month`) are stripped, and rows where every variable
+column is empty (null or NaN) are dropped.
 
 ---
 
