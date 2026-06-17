@@ -6,7 +6,10 @@ import polars as pl
 import pytest
 from conftest import make_grid_df
 
-from h2mare.format_converters.parquet2csv import parquet2csv
+from h2mare.format_converters.parquet2csv import (
+    convert_parquet_to_csv,
+    parquet2csv,
+)
 
 
 @pytest.fixture
@@ -23,14 +26,14 @@ def parquet_root(tmp_path):
 
 def test_invalid_freq_raises(parquet_root, tmp_path):
     with pytest.raises(ValueError, match="freq must be"):
-        parquet2csv(
+        convert_parquet_to_csv(
             parquet_root, tmp_path / "out", "2021-01-01", "2021-12-31", freq="hourly"
         )
 
 
 def test_daily_creates_one_file_per_day(parquet_root, tmp_path):
     out = tmp_path / "out"
-    parquet2csv(parquet_root, out, "2021-01-01", "2021-01-02", freq="day")
+    convert_parquet_to_csv(parquet_root, out, "2021-01-01", "2021-01-02", freq="day")
     files = list(out.rglob("*.csv"))
     assert len(files) == 2
     names = {f.stem for f in files}
@@ -39,7 +42,7 @@ def test_daily_creates_one_file_per_day(parquet_root, tmp_path):
 
 def test_monthly_creates_one_file_per_month(parquet_root, tmp_path):
     out = tmp_path / "out"
-    parquet2csv(parquet_root, out, "2021-01-01", "2021-02-28", freq="month")
+    convert_parquet_to_csv(parquet_root, out, "2021-01-01", "2021-02-28", freq="month")
     files = list(out.rglob("*.csv"))
     assert len(files) == 2
     names = {f.stem for f in files}
@@ -48,7 +51,7 @@ def test_monthly_creates_one_file_per_month(parquet_root, tmp_path):
 
 def test_yearly_creates_one_file_per_year(parquet_root, tmp_path):
     out = tmp_path / "out"
-    parquet2csv(parquet_root, out, "2021-01-01", "2022-12-31", freq="year")
+    convert_parquet_to_csv(parquet_root, out, "2021-01-01", "2022-12-31", freq="year")
     files = list(out.rglob("*.csv"))
     assert len(files) == 2
     names = {f.stem for f in files}
@@ -57,13 +60,13 @@ def test_yearly_creates_one_file_per_year(parquet_root, tmp_path):
 
 def test_files_organised_under_year_subdir(parquet_root, tmp_path):
     out = tmp_path / "out"
-    parquet2csv(parquet_root, out, "2021-01-01", "2021-01-01", freq="day")
+    convert_parquet_to_csv(parquet_root, out, "2021-01-01", "2021-01-01", freq="day")
     assert (out / "2021" / "2021-01-01.csv").exists()
 
 
 def test_date_range_filters_data(parquet_root, tmp_path):
     out = tmp_path / "out"
-    parquet2csv(parquet_root, out, "2021-01-01", "2021-01-01", freq="day")
+    convert_parquet_to_csv(parquet_root, out, "2021-01-01", "2021-01-01", freq="day")
     files = list(out.rglob("*.csv"))
     assert len(files) == 1
     assert files[0].stem == "2021-01-01"
@@ -84,7 +87,7 @@ def test_year_month_partition_cols_absent(parquet_root, tmp_path):
     df.write_parquet(p / "data.parquet")
 
     out = tmp_path / "out"
-    parquet2csv(p, out, "2021-01-01", "2021-01-31", freq="day")
+    convert_parquet_to_csv(p, out, "2021-01-01", "2021-01-31", freq="day")
     result = pl.read_csv(out / "2021" / "2021-01-01.csv")
     assert "year" not in result.columns
     assert "month" not in result.columns
@@ -104,7 +107,7 @@ def test_all_nan_rows_dropped(tmp_path):
     df.write_parquet(p / "data.parquet")
 
     out = tmp_path / "out"
-    parquet2csv(p, out, "2021-01-01", "2021-01-31", freq="day")
+    convert_parquet_to_csv(p, out, "2021-01-01", "2021-01-31", freq="day")
     result = pl.read_csv(out / "2021" / "2021-01-02.csv")
     assert len(result) == 1
     assert (out / "2021" / "2021-01-01.csv").exists() is False
@@ -126,7 +129,7 @@ def test_all_null_rows_dropped(tmp_path):
     df.write_parquet(p / "data.parquet")
 
     out = tmp_path / "out"
-    parquet2csv(p, out, "2021-01-01", "2021-01-31", freq="day")
+    convert_parquet_to_csv(p, out, "2021-01-01", "2021-01-31", freq="day")
     result = pl.read_csv(out / "2021" / "2021-01-02.csv")
     assert len(result) == 1
     assert (out / "2021" / "2021-01-01.csv").exists() is False
@@ -134,13 +137,15 @@ def test_all_null_rows_dropped(tmp_path):
 
 def test_returns_csv_root(parquet_root, tmp_path):
     out = tmp_path / "out"
-    result = parquet2csv(parquet_root, out, "2021-01-01", "2021-01-01", freq="day")
+    result = convert_parquet_to_csv(
+        parquet_root, out, "2021-01-01", "2021-01-01", freq="day"
+    )
     assert result == out
 
 
 def test_csv_contains_expected_columns(parquet_root, tmp_path):
     out = tmp_path / "out"
-    parquet2csv(parquet_root, out, "2021-01-01", "2021-01-01", freq="day")
+    convert_parquet_to_csv(parquet_root, out, "2021-01-01", "2021-01-01", freq="day")
     result = pl.read_csv(out / "2021" / "2021-01-01.csv")
     assert set(result.columns) >= {"time", "lat", "lon", "sst", "ssh"}
     assert "date_key" not in result.columns
@@ -160,7 +165,12 @@ def test_float64_downcast_to_float32(tmp_path):
     df.write_parquet(p / "data.parquet")
 
     out = tmp_path / "out"
-    parquet2csv(p, out, "2021-01-01", "2021-01-31", freq="day")
+    convert_parquet_to_csv(p, out, "2021-01-01", "2021-01-31", freq="day")
     result = pl.read_csv(out / "2021" / "2021-01-01.csv")
     # float32 precision: ~7 significant digits
     assert abs(result["sst"][0] - 20.123456789) < 1e-4
+
+
+def test_deprecated_alias_points_to_canonical():
+    """The pre-rename name stays importable and is the same callable."""
+    assert parquet2csv is convert_parquet_to_csv

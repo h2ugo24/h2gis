@@ -11,7 +11,7 @@ import polars as pl
 from loguru import logger
 
 
-def parquet2csv(
+def convert_parquet_to_csv(
     parquet_root: Path | str,
     csv_root: Path | str,
     start_date: str,
@@ -90,3 +90,9 @@ def parquet2csv(
         f"Finished exporting {len(date_keys)} {freq} CSV files to {csv_root}"
     )
     return csv_root
+
+
+# Backward-compatible alias for the pre-rename name. Deprecated: prefer
+# convert_parquet_to_csv, which matches the other ad-hoc converter functions
+# (convert_<src>_to_<dst>). Scheduled for removal in a future release.
+parquet2csv = convert_parquet_to_csv
