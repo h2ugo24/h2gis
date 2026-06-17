@@ -17,4 +17,5 @@ The main classes you interact with directly.
 | `parquet2csv` | `h2mare.format_converters.parquet2csv` | Export Parquet data to day / month / year CSV files |
 | `convert_netcdf_to_zarr` | `h2mare.format_converters.netcdf2zarr` | Config-free NetCDF/GRIB → Zarr for unregistered files |
 | `convert_zarr_to_parquet` | `h2mare.format_converters.zarr2parquet` | Config-free Zarr → Parquet for unregistered stores |
+| `convert_parquet_to_zarr` | `h2mare.format_converters.parquet2zarr` | Config-free Parquet → Zarr; rebuild per-period stores from Parquet |
 | `export_map_zarr` | `h2mare.format_converters.zarr_map_export` | Rewrite a store into a map-optimized (display) sibling, e.g. `h2ds` → `h2ds_map` |
