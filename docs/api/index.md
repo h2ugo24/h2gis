@@ -19,3 +19,4 @@ The main classes you interact with directly.
 | `convert_parquet_to_zarr` | `h2mare.format_converters.parquet2zarr` | Config-free Parquet → Zarr; rebuild per-period stores from Parquet |
 | `convert_parquet_to_csv` | `h2mare.format_converters.parquet2csv` | Export Parquet data to day / month / year CSV files (one-way; alias `parquet2csv`) |
 | `export_map_zarr` | `h2mare.format_converters.zarr_map_export` | Rewrite a store into a map-optimized (display) sibling, e.g. `h2ds` → `h2ds_map` |
+| [Plotting utilities](plotting.md) | `h2mare.utils.plot` | Standalone plot helpers: `plot_maps`, `plot_snapshot`, `animate_vars`, `plot_interactive_map`, `plot_records_on_field` |
