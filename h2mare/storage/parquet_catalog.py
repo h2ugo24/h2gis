@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import polars as pl
 from loguru import logger
 
+from h2mare.storage.parquet_store import iter_store_parquet_files
 from h2mare.types import BBox, DateRange
 from h2mare.utils.datetime_utils import to_datetime
 
@@ -88,7 +89,7 @@ class ParquetCatalog:
         _partition_by = self._store._partition_by
 
         if dates is None:
-            return sorted(parquet_root.rglob("*.parquet"))
+            return sorted(iter_store_parquet_files(parquet_root))
 
         has_year = "year" in _partition_by
         has_month = "month" in _partition_by
@@ -116,7 +117,7 @@ class ParquetCatalog:
                     files.extend((parquet_root / f"year={y}").rglob("*.parquet"))
                 return sorted(files)
             else:
-                return sorted(parquet_root.rglob("*.parquet"))
+                return sorted(iter_store_parquet_files(parquet_root))
 
         elif isinstance(dates, list):
             if has_year and has_month:
@@ -132,9 +133,9 @@ class ParquetCatalog:
                             "*.parquet"
                         )
                     )
-                return sorted(result) or sorted(parquet_root.rglob("*.parquet"))
+                return sorted(result) or sorted(iter_store_parquet_files(parquet_root))
             else:
-                return sorted(parquet_root.rglob("*.parquet"))
+                return sorted(iter_store_parquet_files(parquet_root))
 
         else:
             raise ValueError("`dates` must be list or (start, end) tuple")

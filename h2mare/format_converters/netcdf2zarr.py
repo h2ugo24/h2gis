@@ -19,6 +19,7 @@ from loguru import logger
 from h2mare.config import AppConfig, get_settings
 from h2mare.format_converters.base import BaseConverter
 from h2mare.processing.registry import PROCESSORS
+from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import chunk_dataset, rename_dims, snap_grid_coords
 from h2mare.storage.zarr_catalog import ZarrCatalog
@@ -149,6 +150,11 @@ class Netcdf2Zarr(BaseConverter):
         logger.info(
             f"Initializing Netcdf -> Zarr conversion for variable key: {self.var_key.upper()}"
         )
+
+        # Reconcile any zarr write interrupted by a hard kill before gap
+        # detection reads the store, so a half-written store is not trusted and
+        # data stranded in a backup is restored.
+        recover_zarr_store(self.store_root)
 
         # Trajectory-format variables (e.g. eddies) require spatial binning
         # before zarr storage — bypass the standard open_mfdataset pipeline.
@@ -427,6 +433,7 @@ class Netcdf2Zarr(BaseConverter):
             ds.close()
             del ds
             self._archive_raw_files(period, paths)
+            self._cleanup_period_files(paths)
 
         except Exception as e:
             raise RuntimeError(
@@ -491,6 +498,31 @@ class Netcdf2Zarr(BaseConverter):
             dest_dir.mkdir(parents=True, exist_ok=True)
 
             safe_move_files(paths, dest_dir, retries=retries, delay=delay)
+
+    def _cleanup_period_files(self, paths: list[Path]) -> None:
+        """
+        Delete a period's raw files once it has been converted successfully.
+
+        Without this, a failure on a later period aborts ``run()`` with every
+        raw file still on disk, so the next run re-globs and reprocesses *all*
+        periods (correct, via the overlap resolver, but wasteful — and it
+        rewrites already-good stores, widening the crash-exposure window).
+        Removing each period's inputs as it completes makes the convert step
+        incrementally resumable.
+
+        Sources whose raw files are archived into the store (``cds``, ``aviso``)
+        are handled by :meth:`_archive_raw_files` and skipped here; so is the
+        in-place layout where downloads live in the store itself.
+        """
+        if self.var_config.source in ("cds", "aviso"):
+            return
+        if self.download_root == self.store_root:
+            return
+        for p in paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError as e:
+                logger.debug(f"Could not remove raw file {p}: {e}")
 
     def _cleanup_downloads(self) -> None:
         """Remove raw data from dowloads folder if download_root is different from store_root to avoid cluttering downloads with raw files."""

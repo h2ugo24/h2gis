@@ -39,6 +39,13 @@ def write_append_zarr(
     # Idempotent: a no-op for data already on the rounded grid.
     ds = snap_grid_coords(ds)
 
+    # Recover an orphaned backup before choosing the write path. An append that
+    # crashed mid-swap (after moving path → .bak, before moving tmp → path)
+    # leaves the only full copy in .bak with path missing. Without this, the
+    # branch below would take the new-file path and overwrite the store with
+    # just the increment, silently dropping the store's history.
+    _restore_orphaned_backup(path)
+
     if path.exists():
         # No log here: each append path announces itself (in-place append,
         # variable-addition, or overlap merge).
@@ -47,14 +54,41 @@ def write_append_zarr(
     else:
         logger.info(f"Saving new dataset at {path}")
         t0 = time.perf_counter()
-        ds.to_zarr(path)
+        # Write to a sibling tmp and promote it only after verification. A hard
+        # kill mid-write then leaves a *.zarr.tmp (which the catalog scanner
+        # ignores — it globs *.zarr) instead of a partial *.zarr that gap
+        # detection would trust as complete and never re-convert.
+        tmp_path = path.with_name(path.name + ".tmp")
+        shutil.rmtree(tmp_path, ignore_errors=True)
         try:
-            xr.open_zarr(path, consolidated=False).close()
+            ds.to_zarr(tmp_path)
+            xr.open_zarr(tmp_path, consolidated=False).close()
         except Exception as e:
-            shutil.rmtree(path, ignore_errors=True)
+            shutil.rmtree(tmp_path, ignore_errors=True)
             raise RuntimeError(f"Zarr write verification failed for {path}") from e
-        ds.close()
+        finally:
+            ds.close()
+        shutil.move(str(tmp_path), str(path))
         logger.success(f"Saved in {time.perf_counter() - t0:.1f}s")
+
+
+def _restore_orphaned_backup(path: Path) -> None:
+    """
+    Restore a ``*.zarr.bak`` left by an append that crashed mid-swap.
+
+    The backup-swap in :func:`_append_data` moves ``path`` → ``path.bak`` and
+    then ``tmp`` → ``path``. A hard kill between those two moves leaves ``path``
+    missing with the only complete copy in ``path.bak``. Restoring it here lets
+    the caller take the append (history-preserving) path instead of the
+    new-file path. No-op when ``path`` exists or no backup is present.
+    """
+    backup_path = path.with_name(path.name + ".bak")
+    if not path.exists() and backup_path.exists():
+        logger.warning(
+            f"Restoring orphaned backup {backup_path.name} → {path.name} "
+            "(previous append was interrupted mid-swap)."
+        )
+        shutil.move(str(backup_path), str(path))
 
 
 def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
@@ -359,8 +393,16 @@ def _resolve_overlap(ds_new: xr.Dataset, path: Path) -> Optional[xr.Dataset]:
     daterange_new = DateRange.from_dataset(ds_new)
 
     if not BBox.from_dataset(ds_old).overlaps(BBox.from_dataset(ds_new)):
-        raise AssertionError(
-            f"Geographic extents from stored zarr file {path} and new data does not overlap."
+        # A plain ValueError (not assert — assertions vanish under `python -O`)
+        # with an actionable message: this usually means the config bbox changed
+        # between the stored history and the new run, so the two no longer share
+        # any geography to merge.
+        ds_old.close()
+        raise ValueError(
+            f"Geographic extents of stored zarr {path.name} "
+            f"({BBox.from_dataset(ds_old)}) and new data "
+            f"({BBox.from_dataset(ds_new)}) do not overlap — has the configured "
+            "bbox changed since this store was written?"
         )
 
     if daterange_old == daterange_new and ds_old_vars == ds_new_vars:

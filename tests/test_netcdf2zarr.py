@@ -286,6 +286,25 @@ class TestStageEddiesToStore:
 # ---------------------------------------------------------------------------
 
 
+class TestCleanupPeriodFiles:
+    def test_cmems_period_files_deleted_after_convert(self, tmp_path):
+        """A non-archiving source's raw files are removed once the period is done,
+        so a later period's failure doesn't force reprocessing this one."""
+        n2z = _make_converter(tmp_path)  # source=cmems, download != store
+        f = n2z.download_root / "sst_20210101_20210131.nc"
+        f.touch()
+        n2z._cleanup_period_files([f])
+        assert not f.exists()
+
+    def test_cds_period_files_preserved(self, tmp_path):
+        """cds/aviso files are archived by _archive_raw_files, not deleted here."""
+        n2z = _make_converter(tmp_path, entry={**_SST_ENTRY_SUBSET, "source": "cds"})
+        f = n2z.download_root / "sst_20210101_20210131.nc"
+        f.touch()
+        n2z._cleanup_period_files([f])
+        assert f.exists()
+
+
 class TestProcessDataset:
     def test_calls_registered_processor_for_var_key(self, tmp_path):
         n2z = _make_converter(tmp_path)
