@@ -22,7 +22,6 @@ from loguru import logger
 
 from h2mare.config import get_settings
 from h2mare.storage.parquet_helpers import _required_columns
-from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import BBox
 
 _PANEL_WIDTH = 3.0  # inches per panel column
@@ -577,6 +576,10 @@ def plot_records_on_field(
         max_plots: Maximum number of records to plot.
         title_fn: Optional callable mapping a row to a plot title. Defaults to the date.
     """
+    # Imported lazily: a module-level import would create a cycle, since
+    # zarr_catalog imports h2mare.utils (whose __init__ imports this module).
+    from h2mare.storage.zarr_catalog import ZarrCatalog
+
     cat = ZarrCatalog(var_key)
     is_geo = isinstance(data, gpd.GeoDataFrame)
     if is_geo:
