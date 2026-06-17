@@ -7,7 +7,8 @@ from .parquet_helpers import (
     polars_float64_to_float32,
 )
 from .parquet_indexer import ParquetIndexer
-from .parquet_store import ParquetStore
+from .parquet_store import ParquetStore, iter_store_parquet_files
+from .recovery import recover_parquet_store, recover_zarr_store
 from .storage import write_append_zarr
 from .xarray_helpers import (
     chunk_dataset,
@@ -41,4 +42,7 @@ __all__ = [
     "ds_float64_to_float32",  # backward-compatible alias
     "convert360_180",
     "write_append_zarr",
+    "iter_store_parquet_files",
+    "recover_zarr_store",
+    "recover_parquet_store",
 ]

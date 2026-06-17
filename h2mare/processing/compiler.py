@@ -18,6 +18,7 @@ from loguru import logger
 from h2mare.config import AppConfig, get_settings
 from h2mare.models import SYSTEM_VAR_KEYS
 from h2mare.storage.coverage import get_store_coverage, split_time_range
+from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import chunk_dataset
 from h2mare.storage.zarr_catalog import ZarrCatalog
@@ -158,6 +159,10 @@ class Compiler:
         logger.info(
             f"Initializing Zarr compilation for variable key: {self.var_key.upper()}"
         )
+
+        # Reconcile any interrupted h2ds write before gap detection reads the
+        # store (restore a stranded backup, discard a half-written temp).
+        recover_zarr_store(self.catalog.store_root)
 
         start = normalize_date(start_date) if start_date else None
         end = normalize_date(end_date) if end_date else None
