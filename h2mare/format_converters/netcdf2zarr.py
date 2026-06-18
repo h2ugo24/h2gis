@@ -255,6 +255,8 @@ class Netcdf2Zarr(BaseConverter):
         return sorted(files)
 
     def _parse_file_dates(self, file: Path) -> list[pd.Timestamp]:
+        if self.var_config.pattern is None:
+            return []
         match = re.search(self.var_config.pattern, file.name)
         if not match:
             return []
@@ -269,6 +271,8 @@ class Netcdf2Zarr(BaseConverter):
         self, file: Path
     ) -> tuple[pd.Timestamp, pd.Timestamp] | None:
         """Return (start, end) date for a raw file without expanding the full date range."""
+        if self.var_config.pattern is None:
+            return None
         match = re.search(self.var_config.pattern, file.name)
         if not match:
             return None

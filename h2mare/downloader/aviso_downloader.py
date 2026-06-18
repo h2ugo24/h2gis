@@ -141,6 +141,11 @@ class AVISODownloader(BaseDownloader):
         files = [files] if isinstance(files, str) else files
 
         # regex patterns for ftp file search
+        if self.var_config.pattern is None:
+            raise ValueError(
+                f"Variable '{self.var_key}' has no `pattern`; cannot extract dates "
+                "from filenames"
+            )
         fsle_pattern = re.compile(self.var_config.pattern)
         eddies_pattern = re.compile(self.var_config.pattern)
 
