@@ -20,6 +20,7 @@ _ENTRY = {
     "dataset_id_rep": "/dataset/fsle/rep",
     "dataset_id_nrt": "/dataset/fsle/nrt",
     "source": "aviso",
+    "archive_raw": True,
     "pattern": r"(\d{8})",
     "subset": False,
 }

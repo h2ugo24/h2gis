@@ -20,6 +20,10 @@ class KeyVarConfigEntry(msgspec.Struct):
     source: str
     # Regex for extracting dates from raw filenames.
     pattern: str
+    # Whether this variable's raw NetCDF/GRIB files are archived into the store
+    # (and kept) after conversion, or deleted per-period. Required and explicit:
+    # True keeps raw files, False deletes them.
+    archive_raw: bool
     # Near-real-time dataset identifier. Omit for reanalysis-only products.
     dataset_id_nrt: Optional[str] = None
     # Whether to spatially subset on download (default True).

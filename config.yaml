@@ -4,6 +4,7 @@
 variables:
   sst:
     local_folder: CMEMS_SST
+    archive_raw: false
     source_vars: [analysed_sst, analysis_error]
     compiled_vars: [sst, analysis_error, sst_std, sst_fdist]
     dataset_id_rep: METOFFICE-GLO-SST-L4-REP-OBS-SST
@@ -16,6 +17,7 @@ variables:
 
   ssh:
     local_folder: CMEMS_SSH
+    archive_raw: false
     source_vars: [adt, sla, ugos, vgos]
     compiled_vars: [adt, sla, ugos, vgos, adt_std, sla_std, gke]
     dataset_id_rep: cmems_obs-sl_glo_phy-ssh_my_allsat-l4-duacs-0.125deg_P1D
@@ -28,6 +30,7 @@ variables:
 
   mld:
     local_folder: CMEMS_MLD
+    archive_raw: false
     source_vars: [mlotst]
     compiled_vars: [mld]
     dataset_id_rep: cmems_mod_glo_phy_my_0.083deg_P1D-m
@@ -39,6 +42,7 @@ variables:
 
   thetao:
     local_folder: CMEMS_Thetao
+    archive_raw: false
     source_vars: [thetao]
     compiled_vars: [thetao_100, thetao_200, thetao_500, thetao_1000]
     dataset_id_rep: cmems_mod_glo_phy_my_0.083deg_P1D-m
@@ -52,6 +56,7 @@ variables:
 
   chl:
     local_folder: CMEMS_Chla_4km_daily
+    archive_raw: false
     source_vars: [CHL]
     compiled_vars: [chl, chl_fdist]
     dataset_id_rep: cmems_obs-oc_glo_bgc-plankton_my_l4-gapfree-multi-4km_P1D
@@ -63,6 +68,7 @@ variables:
 
   seapodym:
     local_folder: CMEMS_2nd_productivity/mnkc
+    archive_raw: false
     source_vars: [mnkc_epi, mnkc_umeso, mnkc_mumeso, npp, zooc, zeu, mnkc_lmeso, mnkc_hmlmeso, mnkc_mlmeso]
     compiled_vars: [mnkc_epi, mnkc_umeso, mnkc_mumeso, npp, zooc, zeu,mnkc_lmeso, mnkc_hmlmeso, mnkc_mlmeso]
     dataset_id_rep: cmems_mod_glo_bgc_my_0.083deg-lmtl_P1D-i
@@ -73,6 +79,7 @@ variables:
 
   o2:
     local_folder: CMEMS_Biochemical
+    archive_raw: false
     source_vars: [o2]
     compiled_vars: [o2_0, o2_100, o2_500, o2_1000]
     dataset_id_rep: cmems_mod_glo_bgc_my_0.25deg_P1D-m
@@ -87,6 +94,7 @@ variables:
     
   fsle:
     local_folder: AVISO_FSLE
+    archive_raw: true
     source_vars: [fsle_max]
     compiled_vars: [fsle_max]
     dataset_id_rep: /value-added/lyapunov/delayed-time/global
@@ -99,6 +107,7 @@ variables:
 
   eddies:
     local_folder: AVISO_Eddy_Trajectory
+    archive_raw: true
     source_vars: [
       time,
       latitude,
@@ -124,6 +133,7 @@ variables:
   
   atm-instante:
     local_folder: CDS_Atm_instante
+    archive_raw: true
     source_vars: [
       mean_sea_level_pressure,
       10m_u_component_of_wind,
@@ -140,6 +150,7 @@ variables:
 
   atm-accum-avg:
     local_folder: CDS_Atm_accum
+    archive_raw: true
     source_vars: [
       total_precipitation,
       mean_northward_turbulent_surface_stress,
@@ -160,6 +171,7 @@ variables:
 
   radiation:
     local_folder: CDS_Radiation
+    archive_raw: true
     source_vars: [
       surface_latent_heat_flux,
       surface_solar_radiation_downwards,
@@ -176,6 +188,7 @@ variables:
 
   waves:
     local_folder: CDS_Waves
+    archive_raw: true
     source_vars: [
       significant_height_of_combined_wind_waves_and_swell,
       mean_direction_of_total_swell,
@@ -190,6 +203,7 @@ variables:
 
   bathy:
     local_folder: ETOPO_Topography
+    archive_raw: false
     source_vars: [z]
     compiled_vars: [bathy, bathy_std]
     dataset_id_rep: Etopo_v1
@@ -202,6 +216,7 @@ variables:
 
   moon:
     local_folder: MOON_Phases
+    archive_raw: false
     source_vars: [moon_phase]
     compiled_vars: [moon_phase]
     dataset_id_rep: ephem4.2
@@ -211,6 +226,7 @@ variables:
 
   h2ds:
     local_folder: h2ds
+    archive_raw: false
     source_vars: []
     compiled_vars: []
     dataset_id_rep: compiled-data-0.25deg-P1D

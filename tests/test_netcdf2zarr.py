@@ -23,6 +23,7 @@ _SST_ENTRY_SUBSET = {
     "source_vars": ["analysed_sst"],
     "dataset_id_rep": "cmems-rep-sst",
     "source": "cmems",
+    "archive_raw": False,
     "pattern": r"(\d{8})_(\d{8})",
     "subset": True,
     "filename_date_range": True,
@@ -41,6 +42,7 @@ _MLD_ENTRY = {
     "source_vars": ["mlotst"],
     "dataset_id_rep": "cmems-mld",
     "source": "cmems",
+    "archive_raw": False,
     "pattern": r"(\d{8})_(\d{8})",
     "subset": True,
     "filename_date_range": True,
@@ -296,12 +298,45 @@ class TestCleanupPeriodFiles:
         n2z._cleanup_period_files([f])
         assert not f.exists()
 
-    def test_cds_period_files_preserved(self, tmp_path):
-        """cds/aviso files are archived by _archive_raw_files, not deleted here."""
-        n2z = _make_converter(tmp_path, entry={**_SST_ENTRY_SUBSET, "source": "cds"})
+
+class TestArchiveRawOption:
+    """archive_raw drives the archive/delete decision."""
+
+    def test_archive_raw_true_keeps_files(self, tmp_path):
+        """archive_raw=True keeps raw files from per-period deletion."""
+        entry = {**_SST_ENTRY_SUBSET, "archive_raw": True}
+        n2z = _make_converter(tmp_path, entry=entry)
         f = n2z.download_root / "sst_20210101_20210131.nc"
         f.touch()
         n2z._cleanup_period_files([f])
+        assert f.exists()
+
+    def test_archive_raw_true_moves_cmems_to_store(self, tmp_path):
+        """archive_raw=True archives a cmems source's files into the store."""
+        entry = {**_SST_ENTRY_SUBSET, "archive_raw": True}
+        n2z = _make_converter(tmp_path, entry=entry)
+        f = n2z.download_root / "sst_20210101_20210131.nc"
+        f.touch()
+        n2z._archive_raw_files(2021, [f])
+        assert (n2z.store_root / "2021" / f.name).exists()
+
+    def test_archive_raw_false_deletes_cds_files(self, tmp_path):
+        """archive_raw=False deletes a cds source's files instead of archiving."""
+        entry = {**_SST_ENTRY_SUBSET, "source": "cds", "archive_raw": False}
+        n2z = _make_converter(tmp_path, entry=entry)
+        f = n2z.download_root / "sst_20210101_20210131.nc"
+        f.touch()
+        n2z._cleanup_period_files([f])
+        assert not f.exists()
+
+    def test_archive_raw_false_skips_cds_archive(self, tmp_path):
+        """archive_raw=False makes _archive_raw_files a no-op for a cds source."""
+        entry = {**_SST_ENTRY_SUBSET, "source": "cds", "archive_raw": False}
+        n2z = _make_converter(tmp_path, entry=entry)
+        f = n2z.download_root / "sst_20210101_20210131.nc"
+        f.touch()
+        n2z._archive_raw_files(2021, [f])
+        assert not (n2z.store_root / "2021" / f.name).exists()
         assert f.exists()
 
 
