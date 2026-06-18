@@ -10,7 +10,7 @@ variables:
     dataset_id_rep: METOFFICE-GLO-SST-L4-REP-OBS-SST
     dataset_id_nrt: METOFFICE-GLO-SST-L4-NRT-OBS-SST-V2
     source: cmems
-    pattern: (\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2}) #(\d{8})* Check this because it was original files pattern
+    pattern: (\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})
     subset: true
     filename_date_range: true
     bbox: [-80, 0, 10, 70]
@@ -203,7 +203,6 @@ variables:
     compiled_vars: [bathy, bathy_std]
     dataset_id_rep: Etopo_v1
     source: noaa
-    pattern: ()
     bbox: [-80, 0, 10, 70]
     data_file: etopo_0.25deg_80W-10E-0N-70N_mean-std_surface.nc
     data_file_hires: etopo_15s_80W-10E-0N-70N_surface.zarr
@@ -215,7 +214,6 @@ variables:
     compiled_vars: [moon_phase]
     dataset_id_rep: ephem4.2
     source: python
-    pattern: ()
 
   h2ds:
     local_folder: h2ds
@@ -224,7 +222,6 @@ variables:
     compiled_vars: []
     dataset_id_rep: compiled-data-0.25deg-P1D
     source: h2mare
-    pattern: ()
     bbox: [-80, 0, 10, 70]
 
 

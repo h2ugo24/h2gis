@@ -123,6 +123,36 @@ class TestKeyVarConfigEntry:
         entry = msgspec.convert({**VALID_ENTRY, "depth_range": None}, KeyVarConfigEntry)
         assert entry.depth_range is None
 
+    # --- pattern / filename_date_range validation ---
+
+    def test_pattern_optional_defaults_none(self):
+        """pattern may be omitted (derived/system vars) and defaults to None."""
+        no_pattern = {k: v for k, v in VALID_ENTRY.items() if k != "pattern"}
+        entry = msgspec.convert(no_pattern, KeyVarConfigEntry)
+        assert entry.pattern is None
+
+    def test_filename_date_range_two_groups_ok(self):
+        entry = msgspec.convert(
+            {**VALID_ENTRY, "filename_date_range": True, "pattern": r"(\d{8})_(\d{8})"},
+            KeyVarConfigEntry,
+        )
+        assert entry.filename_date_range is True
+
+    def test_filename_date_range_wrong_group_count_raises(self):
+        """Range mode unpacks exactly 2 groups — fewer/more must fail at load."""
+        with pytest.raises(msgspec.ValidationError, match="exactly 2 capture groups"):
+            msgspec.convert(
+                {**VALID_ENTRY, "filename_date_range": True, "pattern": r"(\d{8})"},
+                KeyVarConfigEntry,
+            )
+
+    def test_filename_date_range_without_pattern_raises(self):
+        no_pattern = {k: v for k, v in VALID_ENTRY.items() if k != "pattern"}
+        with pytest.raises(msgspec.ValidationError, match="with 2 capture groups"):
+            msgspec.convert(
+                {**no_pattern, "filename_date_range": True}, KeyVarConfigEntry
+            )
+
 
 # ---------------------------------------------------------------------------
 # AppConfig
