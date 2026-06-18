@@ -18,6 +18,7 @@ variables:
     dataset_id_rep: <cmems-id>        # reprocessed (multiyear) dataset ID
     dataset_id_nrt: <cmems-id>        # near-real-time dataset ID (optional)
     source: cmems                     # cmems | aviso | cds
+    archive_raw: false                # keep raw files in store (true) or delete after convert (false)
     pattern: "(\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})"  # filename date pattern
     subset: true                      # spatial subset on download
     bbox: [-80, 0, 10, 70]           # [xmin, ymin, xmax, ymax]
@@ -31,6 +32,7 @@ variables:
 | `dataset_id_rep` | yes | Reprocessed dataset identifier |
 | `dataset_id_nrt` | no | Near-real-time dataset identifier. Omit for reanalysis-only products |
 | `source` | yes | Provider: `cmems`, `aviso`, or `cds` |
+| `archive_raw` | yes | Whether to keep this variable's raw NetCDF/GRIB files by moving them into the store after conversion (`true`), or delete them per-period once converted (`false`). |
 | `pattern` | yes | Regex for extracting date ranges from raw filenames |
 | `subset` | no | Whether to spatially subset on download (default `false`) |
 | `merge_time_step` | no | Set to `true` for CDS/ERA5 accumulated or averaged variables whose GRIB files have a 2-D `time × step` coordinate grid instead of a flat `time` axis (e.g. `atm-accum-avg`, `radiation`). Triggers a preprocess step that merges the two dimensions and trims overlapping timestamps at month edges. Default `false`. |

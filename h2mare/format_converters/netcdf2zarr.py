@@ -137,6 +137,10 @@ class Netcdf2Zarr(BaseConverter):
         self.var_key = validate_var_key(var_key, self.app_config)
         self.var_config = self.app_config.variables[self.var_key]
 
+        # Single source of truth for the archive-vs-delete decision, read by
+        # both _archive_raw_files and _cleanup_period_files so they cannot drift.
+        self.archive_raw = self.var_config.archive_raw
+
         self.download_root = resolve_download_path(self.var_config, download_root)
 
         self.time_resolution = validate_time_resolution(time_resolution)
@@ -485,9 +489,9 @@ class Netcdf2Zarr(BaseConverter):
     ) -> None:
         """
         Move files for period folders (year or month as defined in period) if store_root is different from download root.
-        Currently only for aviso (fsle only) and cds data.
+        Runs when ``archive_raw`` is set (by default aviso (fsle only) and cds data).
         """
-        if self.var_config.source not in ["cds", "aviso"]:
+        if not self.archive_raw:
             return None
 
         if self.download_root != self.store_root:
@@ -510,11 +514,12 @@ class Netcdf2Zarr(BaseConverter):
         Removing each period's inputs as it completes makes the convert step
         incrementally resumable.
 
-        Sources whose raw files are archived into the store (``cds``, ``aviso``)
-        are handled by :meth:`_archive_raw_files` and skipped here; so is the
-        in-place layout where downloads live in the store itself.
+        Variables whose raw files are archived into the store (``archive_raw``;
+        by default ``cds``/``aviso``) are handled by :meth:`_archive_raw_files`
+        and skipped here; so is the in-place layout where downloads live in the
+        store itself.
         """
-        if self.var_config.source in ("cds", "aviso"):
+        if self.archive_raw:
             return
         if self.download_root == self.store_root:
             return

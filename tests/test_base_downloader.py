@@ -18,6 +18,7 @@ _ENTRY = {
     "source_vars": ["analysed_sst"],
     "dataset_id_rep": "cmems-rep-sst",
     "source": "cmems",
+    "archive_raw": False,
     "pattern": r".*\.nc",
     "subset": True,
     "bbox": (-80, 0, 10, 70),

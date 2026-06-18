@@ -16,6 +16,7 @@ _ENTRY = {
     "source_vars": ["analysed_sst"],
     "dataset_id_rep": "cmems_mod_glo_phy_my_0.083deg_P1D-m",
     "source": "cmems",
+    "archive_raw": False,
     "pattern": r".*\.nc",
 }
 _CONFIG = msgspec.convert({"variables": {"sst": _ENTRY}, "secrets": {}}, AppConfig)

@@ -17,6 +17,7 @@ _ENTRY = {
     "source_vars": ["analysed_sst"],
     "dataset_id_rep": "cmems_mod_glo_phy_my",
     "source": "cmems",
+    "archive_raw": False,
     "pattern": r".*\.nc",
 }
 
@@ -288,6 +289,7 @@ class TestCleanup:
                         "source_vars": ["analysed_sst"],
                         "dataset_id_rep": "cmems_mod",
                         "source": "cmems",
+                        "archive_raw": False,
                         "pattern": r".*\.nc",
                     }
                 },

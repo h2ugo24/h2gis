@@ -22,6 +22,7 @@ variables:
       - analysed_sst
     dataset_id_rep: cmems-rep-sst
     source: cmems
+    archive_raw: false
     pattern: '.*\.nc'
     subset: true
     bbox:

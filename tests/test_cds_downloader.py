@@ -19,6 +19,7 @@ _CDS_ENTRY = {
     "source_vars": ["10m_u_component_of_wind", "10m_v_component_of_wind"],
     "dataset_id_rep": "reanalysis-era5-single-levels",
     "source": "cds",
+    "archive_raw": True,
     "pattern": r".*\.grib",
     "subset": False,
     "bbox": (-20, 25, 15, 55),
