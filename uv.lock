@@ -1140,7 +1140,7 @@ requires-dist = [
     { name = "mkdocs-material", specifier = ">=9.7.6" },
     { name = "msgspec", specifier = ">=0.18.0" },
     { name = "netcdf4", specifier = ">=1.6.0" },
-    { name = "plotly", specifier = ">=5.18.0" },
+    { name = "plotly", specifier = ">=5.24.0" },
     { name = "polars", specifier = ">=1.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "pyyaml", specifier = ">=6.0.0" },
