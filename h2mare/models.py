@@ -26,7 +26,10 @@ class KeyVarConfigEntry(msgspec.Struct):
     archive_raw: bool
     # Near-real-time dataset identifier. Omit for reanalysis-only products.
     dataset_id_nrt: Optional[str] = None
-    # Whether to spatially subset on download (default True).
+    # CMEMS only. Chooses the copernicusmarine download API: True (default)
+    # downloads via subset() (spatial/variable subset honoring bbox/source_vars);
+    # False downloads full original files via get(). Ignored for non-CMEMS
+    # sources (aviso, cds, …), which do not consult this field.
     subset: Optional[bool] = True
     # Set True for CDS/ERA5 accumulated or averaged variables whose GRIB files
     # have a 2-D time×step coordinate grid instead of a flat time axis
