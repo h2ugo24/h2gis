@@ -5,6 +5,8 @@ CMEMS data downloader using Copernicus Marine Toolbox API.
 from __future__ import annotations
 
 import json
+import sys
+import time
 import warnings
 from datetime import timedelta
 from pathlib import Path
@@ -79,6 +81,15 @@ def download_subset(
         minimum_depth=depth_range[0] if depth_range else None,
         maximum_depth=depth_range[1] if depth_range else None,
         output_directory=output_dir,
+        # Overwrite an existing target instead of the toolbox default, which
+        # writes a new 'filename_(1).nc'. Gaps are recomputed from catalog
+        # coverage, so a re-triggered download must cleanly replace any stale
+        # or partially written file from a previous failed run rather than
+        # leaving duplicates for the convert step to glob.
+        overwrite=True,
+        # The progress bar redraws via carriage returns; redirected to a file
+        # (scheduled runs) every refresh persists as its own line.
+        disable_progress_bar=not sys.stderr.isatty(),
     )
     logger.debug(f"Downloaded to {output_dir}")
 
@@ -213,6 +224,11 @@ def download_original(
             filter=pattern,
             output_directory=output_dir,
             no_directories=True,
+            # Overwrite stale/partial files from a previous failed run instead
+            # of the toolbox default ('filename_(1).nc' duplicates). See note
+            # in download_subset.
+            overwrite=True,
+            disable_progress_bar=not sys.stderr.isatty(),
         )
     logger.debug(f"Downloaded to {output_dir}")
 
@@ -403,16 +419,22 @@ class CMEMSDownloader(BaseDownloader):
             self._cleanup_empty_download_dir()
             return False
 
+        t0 = time.perf_counter()
         for task in tasks:
             self._execute_task(task=task, time_split=time_split, output_dir=output_dir)
 
-            logger.success(
+            logger.debug(
                 f"Task complete: {task.dataset_id} "
                 f"for period {task.date_range} downloaded"
             )
 
         self._write_manifest(tasks, output_dir or self.download_dir)
         self._cleanup_empty_download_dir()
+        logger.success(
+            f"Download complete: {len(tasks)} task(s) "
+            f"({requested_range.start.date()} → {requested_range.end.date()}) "
+            f"in {time.perf_counter() - t0:.1f}s"
+        )
         return True
 
     def _write_manifest(self, tasks: list[DownloadTask], output_dir: Path) -> None:

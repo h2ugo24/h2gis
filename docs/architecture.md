@@ -18,7 +18,7 @@ CLI (h2mare/cli/main.py)
 
 Zarr2Parquet : BaseConverter         (uses ParquetIndexer)
 Extractor                            (uses ParquetIndexer)
-parquet2csv                          (reads Parquet directly)
+convert_parquet_to_csv               (one-way export; reads Parquet directly)
 
 ParquetIndexer  (facade)
   ├── ParquetStore   (writes: add_data, overlap resolution, atomic I/O)
@@ -62,6 +62,8 @@ Special variables handled outside the general path:
 - **`moon`** — computed on the fly from the `ephem` library
 - **`o2`** — depth-sliced before interpolation
 
+The `h2ds` store is chunked for **extraction** (time-contiguous: long time block per small spatial tile), which makes point/geometry time series cheap but full-grid single-date reads costly. For interactive visualization, `export_map_zarr` produces a separate **map-optimized** sibling store (`h2ds_map`) chunked the other way — space-contiguous with a small time chunk — so one date's full field reads as a single small chunk. See [Map export](api/map_export.md).
+
 ---
 
 ## ZarrCatalog / ZarrDirectoryScanner
@@ -86,6 +88,11 @@ Special variables handled outside the general path:
 ## BaseConverter
 
 `BaseConverter` (`format_converters/base.py`) is the shared ABC for `Netcdf2Zarr` and `Zarr2Parquet`. It enforces an abstract `run() -> bool` method and a default no-op `validate()` hook, providing a stable contract for any future converter (e.g. `GRIB2Zarr`).
+
+For files that are **not** registered in `config.yaml`, two config-free module
+functions — `convert_netcdf_to_zarr` and `convert_zarr_to_parquet` — run the same
+engine (generic transform + overlap-resolving write) driven by arguments instead
+of a `var_key`. See [Ad-hoc converters](api/adhoc_converters.md).
 
 ---
 

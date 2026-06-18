@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import xarray as xr
@@ -37,26 +38,60 @@ def get_dataset_encoding(ds: xr.Dataset) -> dict:
     }
 
 
+def _log_chunk_layout(ds: xr.Dataset, layout: str, time_dim: str = "time") -> None:
+    """Log the chunk layout, shape and uncompressed size of a chunked dataset.
+
+    Reports a representative time-bearing variable (the one with the most
+    timesteps); every gridded variable shares the same per-chunk shape, so this
+    one line tells you how big a single read is and which layout produced it.
+    """
+    time_vars = [v for v in ds.data_vars if time_dim in ds[v].dims]
+    if not time_vars:
+        return
+    rep = max(time_vars, key=lambda v: ds[v].sizes[time_dim])
+    da = ds[rep]
+    chunk_shape = {str(d): int(da.chunksizes[d][0]) for d in da.dims}
+    n_cells = 1
+    for c in chunk_shape.values():
+        n_cells *= c
+    mb = n_cells * da.dtype.itemsize / 1024**2
+    logger.info(
+        f"chunk_dataset: layout='{layout}' chunk {chunk_shape} "
+        f"~{mb:.2f} MB ({da.dtype}, e.g. '{rep}')"
+    )
+
+
 def chunk_dataset(
     ds: xr.Dataset,
     target_mb: int = 32,
     time_dim: str = "time",
     spatial_chunk: int = 256,
+    layout: Literal["timeseries", "map"] = "timeseries",
+    map_time_chunk: int = 14,
 ) -> xr.Dataset:
     """
     Convert all variables from float64 to float32 and chunk for storage,
     keeping each chunk close to target_mb.
 
-    Spatial dims (lat/lon/x/y) are tiled to ``spatial_chunk`` cells (capped at the
-    dim size). Tiling is what makes point/geometry extraction cheap: a small bbox
-    reads only the overlapping tiles instead of decompressing the full grid for
-    every timestep. The time chunk then fills the remaining budget up to ~target_mb.
-    Non-spatial, non-time dims (e.g. depth) are chunked to 1 when a full-grid
-    per-step payload exceeds target_mb, preventing oversized chunks on 4-D datasets.
+    Two layouts trade off opposite access patterns; pick by how the store is read:
 
-    Trade-off: tiling speeds up subset reads but produces more, smaller chunk files
-    and makes full-grid single-timestep reads (e.g. a global daily map) costlier,
-    since the larger time chunk pulls neighbouring timesteps per tile.
+    ``"timeseries"`` (default) tiles spatial dims (lat/lon/x/y) to ``spatial_chunk``
+    cells (capped at the dim size) and fills the remaining byte budget with time.
+    Tiling is what makes point/geometry extraction cheap: a small bbox reads only
+    the overlapping tiles instead of decompressing the full grid for every
+    timestep. Non-spatial, non-time dims (e.g. depth) are chunked to 1 when a
+    full-grid per-step payload exceeds target_mb, preventing oversized chunks on
+    4-D datasets. Trade-off: tiling speeds up subset reads but makes full-grid
+    single-timestep reads (e.g. a global daily map) costlier, since the larger
+    time chunk pulls neighbouring timesteps per tile.
+
+    ``"map"`` keeps spatial dims contiguous and pins the time chunk to
+    ``map_time_chunk`` (default 14), so a small block of full-grid fields is the
+    fewest possible chunks while a single-day field still reads just one chunk.
+    This is the layout an interactive map / animation wants. Trade-off: long
+    time-series reads are now costly (few timesteps per chunk). Spatial dims are
+    only tiled down here if a *single* full-grid timestep already exceeds
+    target_mb (hi-res grids).
 
     Note: appends rewrite a period file at its *existing* chunking
     (``write_append_zarr`` reads ``ds_old.chunksizes``), so changing this only
@@ -67,7 +102,15 @@ def chunk_dataset(
         ds: dataset to chunk.
         target_mb : Target uncompressed chunk size in MB.
         time_dim : Time dimension name.
-        spatial_chunk : Max cells per chunk along each spatial dim (lat/lon/x/y).
+        spatial_chunk : Max cells per chunk along each spatial dim (lat/lon/x/y);
+            ``"timeseries"`` layout only.
+        layout : ``"timeseries"`` (time-contiguous, extraction) or ``"map"``
+            (space-contiguous, interactive display).
+        map_time_chunk : Time chunk for the ``"map"`` layout. A single-day field
+            still reads one chunk regardless; larger values pack more days per
+            chunk, cutting the chunk-file count (at the cost of pulling
+            neighbouring days per read). 1 is the smallest/most-random-friendly.
+            Ignored for ``"timeseries"``.
     """
     ds = xr_float64_to_float32(ds)
 
@@ -87,6 +130,46 @@ def chunk_dataset(
         int(np.prod([s for i, s in enumerate(da.shape) if i != time_idx]))
         * da.dtype.itemsize
     )
+
+    if layout == "map":
+        # Asymmetry vs "timeseries" is deliberate, do NOT "fix" it to mirror the
+        # budget-fill-with-time behaviour. Both layouts fill the byte budget along
+        # the axis read *contiguously* and minimise the axis indexed *into*:
+        # timeseries reads all time for a small tile (fill time), map reads one
+        # timestep across the full grid (fill space, minimise time). The 32 MB
+        # budget therefore caps the *spatial* extent here (see the oversized-step
+        # guard below), while time is pinned to the small ``map_time_chunk``.
+        # Filling time to the budget instead would force a single-day viz read to
+        # decompress dozens of unwanted days per frame (read amplification),
+        # degrading the interactive scrubbing this layout exists for.
+        #
+        # Keep spatial dims contiguous so a single full-grid field is one chunk;
+        # collapse any other non-time dim (e.g. depth) to 1.
+        map_dims: dict[str, int] = {}
+        for dim, size in ds.sizes.items():
+            name = str(dim)
+            if name == time_dim:
+                continue
+            map_dims[name] = int(size) if name.lower() in spatial_dims else 1
+
+        spatial = [d for d in map_dims if d.lower() in spatial_dims]
+        if not spatial:
+            logger.warning(
+                "chunk_dataset(layout='map'): no spatial dims (lat/lon/x/y) found "
+                f"in {list(ds.sizes)}; only the time chunk is being set. The map "
+                "layout is meant for gridded data — check the input dataset."
+            )
+        # Guard a single oversized timestep (hi-res grids): if one full field
+        # exceeds the budget, shrink spatial tiles uniformly so the chunk fits.
+        step_bytes = int(np.prod(list(map_dims.values()) or [1])) * da.dtype.itemsize
+        if step_bytes > target_bytes and spatial:
+            scale = (target_bytes / step_bytes) ** (1 / len(spatial))
+            for d in spatial:
+                map_dims[d] = max(1, int(ds.sizes[d] * scale))
+        tchunk = max(1, min(map_time_chunk, ds.sizes[time_dim]))
+        out = ds.chunk({time_dim: tchunk} | map_dims)
+        _log_chunk_layout(out, "map", time_dim)
+        return out
 
     dim_dict: dict[str, int] = {}
     for dim, size in ds.sizes.items():
@@ -108,7 +191,9 @@ def chunk_dataset(
         ),
     )
 
-    return ds.chunk({time_dim: time_chunk} | dim_dict)
+    out = ds.chunk({time_dim: time_chunk} | dim_dict)
+    _log_chunk_layout(out, "timeseries", time_dim)
+    return out
 
 
 def unified_time_chunk(

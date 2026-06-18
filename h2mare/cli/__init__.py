@@ -6,6 +6,7 @@ from h2mare.cli.catalog import catalog
 from h2mare.cli.compile import compile
 from h2mare.cli.main import run
 from h2mare.cli.nc2zarr import convert
+from h2mare.cli.parquet2zarr import parquet2zarr
 from h2mare.cli.zarr2parquet import parquet
 from h2mare.utils.logging import configure_logging
 
@@ -35,3 +36,7 @@ app.command(
     "parquet",
     help="Convert compiled Zarr stores to Hive-partitioned Parquet.",
 )(parquet)
+app.command(
+    "parquet2zarr",
+    help="Rebuild per-period Zarr files from a Parquet store.",
+)(parquet2zarr)

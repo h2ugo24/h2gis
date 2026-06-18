@@ -174,6 +174,44 @@ Each var_key passed to `--add-var` is resolved to its `compiled_vars` list in `c
 
 ---
 
+## `h2mare parquet2zarr`
+
+Rebuild per-period Zarr files from a Hive-partitioned Parquet store — the inverse of `h2mare parquet`. Reads the long-format Parquet rows, pivots each time chunk back to a gridded dataset, and writes per-period `.zarr` files (one per year by default) using the pipeline's standard snap → chunk → append path. This is the config-free [`convert_parquet_to_zarr`](api/adhoc_converters.md#convert_parquet_to_zarr) function — no `var_key` or `config.yaml` is consulted.
+
+```
+uv run h2mare parquet2zarr PARQUET_ROOT OUT_DIR [OPTIONS]
+```
+
+| Argument / Option | Type | Default | Description |
+|---|---|---|---|
+| `PARQUET_ROOT` | path | — | Root of the Parquet store to read (required) |
+| `OUT_DIR` | path | — | Directory to write per-period `.zarr` files into (required) |
+| `--name` | text | `data` | Identity label used in the output filename (`{name}_{label}.zarr`) |
+| `--start-date` | YYYY-MM-DD | store start | Start of date range (must be paired with `--end-date`) |
+| `--end-date` | YYYY-MM-DD | store end | End of date range (must be paired with `--start-date`) |
+| `-v, --vars` | text (repeatable) | all | Variable column(s) to read |
+| `--time-resolution` | `month` \| `year` | `month` | Read/append chunk granularity (memory control) |
+| `--date-format` | `year` \| `yearmonth` \| `date` | `year` | Output file granularity |
+| `--layout` | `timeseries` \| `map` | `timeseries` | Zarr chunk layout — extraction vs interactive display |
+
+**Examples**
+
+```bash
+# Rebuild the whole store into per-year Zarr files
+uv run h2mare parquet2zarr D:/parquet_store/h2ds D:/rebuilt_zarr --name h2ds
+
+# Restrict to a date range and a subset of variables
+uv run h2mare parquet2zarr D:/parquet_store/h2ds D:/rebuilt_zarr \
+    --name h2ds --start-date 2021-01-01 --end-date 2021-12-31 -v sst -v ssh
+
+# Write one file per month instead of per year
+uv run h2mare parquet2zarr D:/parquet_store/h2ds D:/out --date-format yearmonth
+```
+
+The rebuilt store is the faithful inverse of what was written to Parquet (`time × lat × lon`, Float32, midnight-normalized time), not necessarily byte-identical to an original NetCDF-derived store. Re-running over an existing output appends/merges via the standard overlap resolution.
+
+---
+
 ## `h2mare catalog`
 
 Inspect `ZarrCatalog` metadata for one or more variable keys without opening any Zarr files.

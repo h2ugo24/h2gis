@@ -22,6 +22,7 @@ _MINIMAL_APP_CONFIG = msgspec.convert(
                 "source_vars": ["analysed_sst"],
                 "dataset_id_rep": "cmems-sst",
                 "source": "cmems",
+                "archive_raw": False,
                 "pattern": r".*\.nc",
             }
         },

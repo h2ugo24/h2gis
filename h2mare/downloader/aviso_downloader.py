@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ftplib import FTP
@@ -140,6 +141,11 @@ class AVISODownloader(BaseDownloader):
         files = [files] if isinstance(files, str) else files
 
         # regex patterns for ftp file search
+        if self.var_config.pattern is None:
+            raise ValueError(
+                f"Variable '{self.var_key}' has no `pattern`; cannot extract dates "
+                "from filenames"
+            )
         fsle_pattern = re.compile(self.var_config.pattern)
         eddies_pattern = re.compile(self.var_config.pattern)
 
@@ -268,11 +274,14 @@ class AVISODownloader(BaseDownloader):
 
             with open(local_path, "wb") as f:
                 if file_size:
+                    # disable=None: tqdm auto-disables on non-tty, so scheduled
+                    # runs don't persist one log line per refresh tick.
                     with tqdm(
                         total=file_size,
                         unit="B",
                         unit_scale=True,
                         desc=path.split("/")[-1],
+                        disable=None,
                     ) as pbar:
 
                         def callback(data):
@@ -319,6 +328,7 @@ class AVISODownloader(BaseDownloader):
                                 unit="B",
                                 unit_scale=True,
                                 desc=path.split("/")[-1],
+                                disable=None,
                             ) as pbar:
 
                                 def callback(data):
@@ -400,6 +410,7 @@ class AVISODownloader(BaseDownloader):
             return False
 
         base_dir = output_dir or self.download_dir
+        t0 = time.perf_counter()
 
         rep_paths = [t.filepath for t in tasks if t.source == "rep"]
         nrt_paths = [t.filepath for t in tasks if t.source == "nrt"]
@@ -446,6 +457,9 @@ class AVISODownloader(BaseDownloader):
 
         # Disconnect FTP
         # self.ftp.quit()
-        logger.success(f"Key-Variable: {self.var_key.upper()} processed!")
+        logger.success(
+            f"Download complete: {len(rep_paths)} REP + {len(nrt_paths)} NRT file(s) "
+            f"in {time.perf_counter() - t0:.1f}s"
+        )
         self._cleanup_empty_download_dir()
         return True

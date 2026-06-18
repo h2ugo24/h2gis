@@ -18,8 +18,9 @@ variables:
     dataset_id_rep: <cmems-id>        # reprocessed (multiyear) dataset ID
     dataset_id_nrt: <cmems-id>        # near-real-time dataset ID (optional)
     source: cmems                     # cmems | aviso | cds
+    archive_raw: false                # keep raw files in store (true) or delete after convert (false)
     pattern: "(\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})"  # filename date pattern
-    subset: true                      # spatial subset on download
+    subset: true                      # CMEMS only: subset() vs get() download API
     bbox: [-80, 0, 10, 70]           # [xmin, ymin, xmax, ymax]
     depth_range: [0.0, 500.0]        # [min_depth, max_depth]
 ```
@@ -31,8 +32,9 @@ variables:
 | `dataset_id_rep` | yes | Reprocessed dataset identifier |
 | `dataset_id_nrt` | no | Near-real-time dataset identifier. Omit for reanalysis-only products |
 | `source` | yes | Provider: `cmems`, `aviso`, or `cds` |
-| `pattern` | yes | Regex for extracting date ranges from raw filenames |
-| `subset` | no | Whether to spatially subset on download (default `false`) |
+| `archive_raw` | yes | Whether to keep this variable's raw NetCDF/GRIB files by moving them into the store after conversion (`true`), or delete them per-period once converted (`false`). |
+| `pattern` | download vars | Regex matched against each raw filename to extract date component(s). Its capture groups must agree with `filename_date_range`: with `true`, exactly **2** groups giving `(start, end)`; with `false`, the groups are joined with `-` and parsed as a single date (e.g. `(\d{8})` → `20210115`; `(\d{4})(\d{2})(\d{2})` → `2021-01-15`). Omit for derived/system variables (`bathy`, `moon`, `h2ds`) that are never matched against filenames. |
+| `subset` | CMEMS only | Chooses the CMEMS download API: `true` (default) uses `copernicusmarine.subset()` (spatial/variable subset honoring `bbox`/`source_vars`); `false` uses `copernicusmarine.get()` to fetch full original files. Ignored for non-CMEMS sources. |
 | `merge_time_step` | no | Set to `true` for CDS/ERA5 accumulated or averaged variables whose GRIB files have a 2-D `time × step` coordinate grid instead of a flat `time` axis (e.g. `atm-accum-avg`, `radiation`). Triggers a preprocess step that merges the two dimensions and trims overlapping timestamps at month edges. Default `false`. |
 | `filename_date_range` | no | Set to `true` when the `pattern` has two capture groups encoding a `(start, end)` date range (e.g. CMEMS/CDS files named `2021-01-01-2021-01-31.nc`). Leave `false` (default) when the pattern yields a single date (e.g. AVISO FSLE: `_20210115_`). Controls how `Netcdf2Zarr` expands filenames into daily time steps. |
 | `bbox` | no | Bounding box for subset. If omitted, the full available extent is downloaded |

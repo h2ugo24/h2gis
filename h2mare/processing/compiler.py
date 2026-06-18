@@ -5,6 +5,7 @@ Create h2ds zarr files
 from __future__ import annotations
 
 import shutil
+import time
 import warnings
 from pathlib import Path
 from typing import Literal, Optional
@@ -17,6 +18,7 @@ from loguru import logger
 from h2mare.config import AppConfig, get_settings
 from h2mare.models import SYSTEM_VAR_KEYS
 from h2mare.storage.coverage import get_store_coverage, split_time_range
+from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import chunk_dataset
 from h2mare.storage.zarr_catalog import ZarrCatalog
@@ -153,9 +155,14 @@ class Compiler:
             zarr_backup: Copy written zarr files to the local store. Defaults to False.
             zarr_backup_dir: Override destination for the zarr backup. Defaults to local_store_root.
         """
+        t0 = time.perf_counter()
         logger.info(
             f"Initializing Zarr compilation for variable key: {self.var_key.upper()}"
         )
+
+        # Reconcile any interrupted h2ds write before gap detection reads the
+        # store (restore a stranded backup, discard a half-written temp).
+        recover_zarr_store(self.catalog.store_root)
 
         start = normalize_date(start_date) if start_date else None
         end = normalize_date(end_date) if end_date else None
@@ -195,7 +202,8 @@ class Compiler:
                 if vkey == self.var_key:
                     continue
 
-                ds = self._process_variable(vkey, chunk)
+                with logger.contextualize(var=vkey):
+                    ds = self._process_variable(vkey, chunk)
                 if ds is not None:
                     datasets.append(ds)
 
@@ -228,6 +236,12 @@ class Compiler:
             # large directory copies after each individual chunk
             for path in written_paths:
                 self.sync_data(path, backup_dir=zarr_backup_dir)
+
+        logger.success(
+            f"Compile complete: {len(written_paths)}/{len(chunks)} chunk(s) written "
+            f"({requested_range.start.date()} → {requested_range.end.date()}) "
+            f"in {time.perf_counter() - t0:.1f}s"
+        )
 
     # =========== DATE RANGE RESOLUTION ===========
     def _compute_source_coverage(self) -> dict[str, DateRange]:

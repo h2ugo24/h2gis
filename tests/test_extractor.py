@@ -2,11 +2,19 @@
 
 import json
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
+import pytest
 import xarray as xr
+from shapely.geometry import box
 
-from h2mare.processing.extractor import Extractor, _keys_path, _save_completed_keys
+from h2mare.processing.extractor import (
+    Extractor,
+    _keys_path,
+    _save_completed_keys,
+    ensure_row_id,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -39,6 +47,12 @@ def _make_spatiotemporal_ds(
     )
 
 
+def _extractor(data, **kwargs) -> Extractor:
+    """Build an Extractor, adding the positional row_id key first (the pre-step
+    every caller now performs; index_col is required)."""
+    return Extractor(ensure_row_id(data), index_col="row_id", **kwargs)
+
+
 def _make_extractor(time_values: list, time_col: str = "time") -> Extractor:
     """Build a minimal Extractor from a list of time strings."""
     df = pd.DataFrame(
@@ -48,7 +62,28 @@ def _make_extractor(time_values: list, time_col: str = "time") -> Extractor:
             "lat": [40.0] * len(time_values),
         }
     )
-    return Extractor(df, time_col=time_col)
+    return _extractor(df, time_col=time_col)
+
+
+def _make_distinct_ds() -> xr.Dataset:
+    """Spatiotemporal dataset with a distinct value per (time, lat, lon) cell.
+
+    sst[t, lat_i, lon_i] = t * 9 + lat_i * 3 + lon_i, so each cell is uniquely
+    identifiable — lets a point/time extraction assert an exact expected value.
+    """
+    times = pd.to_datetime(["2020-01-01", "2020-01-02"])
+    lats = [30.0, 35.0, 40.0]
+    lons = [-10.0, -5.0, 0.0]
+    data = np.arange(2 * 3 * 3, dtype=float).reshape(2, 3, 3)
+    return xr.Dataset(
+        {"sst": (["time", "lat", "lon"], data)},
+        coords={"time": times, "lat": lats, "lon": lons},
+    )
+
+
+def _make_geodf(geometries: list, times: list) -> gpd.GeoDataFrame:
+    """Minimal GeoDataFrame with a time column and EPSG:4326 geometries."""
+    return gpd.GeoDataFrame({"time": times, "geometry": geometries}, crs="EPSG:4326")
 
 
 # ---------------------------------------------------------------------------
@@ -269,3 +304,162 @@ class TestAtomicCheckpoint:
 
         loaded = pd.read_feather(feather_path)
         pd.testing.assert_frame_equal(df, loaded)
+
+
+# ---------------------------------------------------------------------------
+# extract_from_dataset — extraction against an arbitrary in-memory dataset
+# ---------------------------------------------------------------------------
+
+
+class TestExtractFromDataset:
+    def test_csv_spatiotemporal_exact_values(self):
+        """Points resolve to the exact nearest (time, lat, lon) cell value."""
+        ds = _make_distinct_ds()
+        pts = pd.DataFrame(
+            {
+                "time": ["2020-01-02", "2020-01-01"],
+                "lon": [-10.0, 0.0],
+                "lat": [40.0, 30.0],
+            }
+        )
+        out = _extractor(pts).extract_from_dataset(ds)
+
+        # row 0: t=1, lat_i=2, lon_i=0 -> 1*9 + 2*3 + 0 = 15
+        # row 1: t=0, lat_i=0, lon_i=2 -> 0    + 0   + 2 = 2
+        assert out["sst"].tolist() == [15.0, 2.0]
+        assert out.index.tolist() == [0, 1]
+
+    def test_csv_spatial_only_no_time_coord(self):
+        """A dataset without a time coord extracts purely on space (no raise)."""
+        ds = _make_spatial_ds()  # sst = arange(9), lat rows, lon cols
+        pts = pd.DataFrame({"time": ["2020-01-01"], "lon": [0.0], "lat": [40.0]})
+        out = _extractor(pts).extract_from_dataset(ds)
+        # lat_i=2, lon_i=2 -> 2*3 + 2 = 8
+        assert out["sst"].tolist() == [8.0]
+
+    def test_csv_vars_subset(self):
+        """`vars` restricts the extracted columns to the requested variable."""
+        ds = _make_spatial_ds()
+        ds = ds.assign(mld=ds["sst"] + 100)
+        pts = pd.DataFrame({"time": ["2020-01-01"], "lon": [0.0], "lat": [40.0]})
+        out = _extractor(pts).extract_from_dataset(ds, vars="sst")
+        # to_dataframe also carries lon/lat coord columns; the point is that the
+        # unselected variable (mld) is absent.
+        assert "sst" in out.columns
+        assert "mld" not in out.columns
+
+    def test_csv_clip_to_coverage_drops_out_of_extent(self):
+        """Out-of-extent rows become NaN; in-extent rows keep their value."""
+        ds = _make_distinct_ds()  # lon in [-10, 0], lat in [30, 40]
+        pts = pd.DataFrame(
+            {
+                "time": ["2020-01-01", "2020-01-01"],
+                "lon": [0.0, 50.0],  # second point is far outside
+                "lat": [30.0, 30.0],
+            }
+        )
+        out = _extractor(pts).extract_from_dataset(ds, clip_to_coverage=True)
+        assert out["sst"].iloc[0] == 2.0
+        assert np.isnan(out["sst"].iloc[1])
+
+    def test_dataarray_with_vars_raises(self):
+        """`vars` against a DataArray is a TypeError (ds[vars] is invalid)."""
+        da = _make_spatial_ds()["sst"]
+        pts = pd.DataFrame({"time": ["2020-01-01"], "lon": [0.0], "lat": [40.0]})
+        with pytest.raises(TypeError):
+            _extractor(pts).extract_from_dataset(da, vars="sst")
+
+    def test_shp_geometry_mean_on_ds_without_crs(self):
+        """Geometry extraction computes the clipped mean and sets CRS via ensure_crs.
+
+        The dataset is passed WITHOUT a rio CRS; ensure_crs must write the
+        GeoDataFrame's CRS onto it so ds.rio.clip succeeds.
+        """
+        # Spatial-only ds: sst = arange(9); lat rows [30,35,40], lon cols [-10,-5,0]
+        #   row(lat30): 0 1 2 | row(lat35): 3 4 5 | row(lat40): 6 7 8
+        ds = _make_spatial_ds()
+        assert ds.rio.crs is None  # precondition: no CRS on the dataset
+
+        geoms = [
+            box(-12, 28, -3, 36),  # touches lon{-10,-5} x lat{30,35} -> 0,1,3,4
+            box(-1, 38, 1, 42),  # touches lon{0} x lat{40} -> 8
+        ]
+        gdf = _make_geodf(geoms, ["2020-01-01", "2020-01-01"])
+        out = _extractor(gdf).extract_from_dataset(ds, n_workers=2)
+
+        out = out.sort_index()
+        assert out.loc[0, "sst"] == pytest.approx(2.0)  # mean(0,1,3,4)
+        assert out.loc[1, "sst"] == pytest.approx(8.0)
+
+
+# ---------------------------------------------------------------------------
+# ensure_row_id — caller-side merge-key helper
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureRowId:
+    def test_unique_existing_key_passthrough(self):
+        """An existing unique key is returned untouched."""
+        df = pd.DataFrame({"row_id": [5, 6, 7], "x": [1, 2, 3]})
+        out = ensure_row_id(df)
+        assert out["row_id"].tolist() == [5, 6, 7]
+
+    def test_duplicate_existing_key_raises(self):
+        """A duplicated key is a caller error — raise, never overwrite."""
+        df = pd.DataFrame({"row_id": [1, 1, 2]})
+        with pytest.raises(ValueError):
+            ensure_row_id(df)
+
+    def test_absent_key_creates_positional_without_mutating_input(self):
+        """A missing key is added as 0..n-1 on a copy; the input is untouched."""
+        df = pd.DataFrame({"x": [10, 20, 30]})
+        out = ensure_row_id(df)
+        assert out["row_id"].tolist() == [0, 1, 2]
+        assert "row_id" not in df.columns  # original not mutated
+
+    def test_geodataframe_preserved(self):
+        """Works on a GeoDataFrame and keeps the type."""
+        gdf = _make_geodf([box(0, 0, 1, 1)], ["2020-01-01"])
+        out = ensure_row_id(gdf)
+        assert isinstance(out, gpd.GeoDataFrame)
+        assert out["row_id"].tolist() == [0]
+
+
+# ---------------------------------------------------------------------------
+# _resolve_index — the Extractor consumes a caller-supplied key, never authors it
+# ---------------------------------------------------------------------------
+
+
+class TestResolveIndex:
+    def test_missing_index_col_raises(self):
+        """Constructing without the key column present is a hard error."""
+        df = pd.DataFrame({"time": ["2020-01-01"], "lon": [0.0], "lat": [40.0]})
+        with pytest.raises(ValueError):
+            Extractor(df, index_col="row_id")
+
+    def test_duplicate_index_col_raises(self):
+        """A non-unique key column is rejected at construction."""
+        df = pd.DataFrame(
+            {
+                "row_id": [1, 1],
+                "time": ["2020-01-01", "2020-01-02"],
+                "lon": [0.0, 1.0],
+                "lat": [40.0, 41.0],
+            }
+        )
+        with pytest.raises(ValueError):
+            Extractor(df, index_col="row_id")
+
+    def test_explicit_unique_key_sets_index(self):
+        """A valid key becomes the frame index, preserving its values."""
+        df = pd.DataFrame(
+            {
+                "event_id": [101, 102],
+                "time": ["2020-01-01", "2020-01-02"],
+                "lon": [0.0, 1.0],
+                "lat": [40.0, 41.0],
+            }
+        )
+        ext = Extractor(df, index_col="event_id")
+        assert ext.data.index.tolist() == [101, 102]
+        assert ext.data.index.name == "event_id"

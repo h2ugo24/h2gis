@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import warnings
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -17,6 +19,7 @@ from loguru import logger
 from h2mare.config import AppConfig, get_settings
 from h2mare.format_converters.base import BaseConverter
 from h2mare.processing.registry import PROCESSORS
+from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import chunk_dataset, rename_dims, snap_grid_coords
 from h2mare.storage.zarr_catalog import ZarrCatalog
@@ -26,6 +29,85 @@ from h2mare.utils.paths import resolve_download_path
 from h2mare.validators import validate_time_resolution, validate_var_key
 
 warnings.filterwarnings("ignore")
+
+
+def convert_netcdf_to_zarr(
+    paths: Path | str | Iterable[Path | str],
+    out_path: Path | str,
+    *,
+    name: str = "data",
+    processor: Callable[[xr.Dataset], xr.Dataset] | None = None,
+    apply_rename: bool = True,
+    open_kwargs: Optional[dict] = None,
+) -> Path:
+    """
+    Convert one or more NetCDF/GRIB files to a single Zarr store, without a
+    configured ``var_key``.
+
+    This is the config-free counterpart to :class:`Netcdf2Zarr`. It applies the
+    same generic Zarr-prep the pipeline uses — open → (optional ``rename_dims``)
+    → (optional ``processor``) → ``snap_grid_coords`` → ``chunk_dataset`` →
+    ``write_append_zarr`` — but driven entirely by arguments instead of
+    ``config.yaml``. Use it to convert arbitrary files (a single path or a list)
+    that are not registered as a variable.
+
+    Args:
+        paths: One path, or an iterable of paths, to ``.nc``/``.grib`` files.
+            NetCDF and GRIB may be mixed; the engine is auto-detected from the
+            first file.
+        out_path: Destination ``.zarr`` path. If it already exists, the data is
+            appended using the store's standard overlap semantics.
+        name: Identity label used in the write/append logs and overlap
+            resolution. It need **not** exist in config.
+        processor: Optional callable applied after rename and before snap/chunk —
+            the same slot a registry processor occupies in
+            ``Netcdf2Zarr.process_dataset``. To reuse a registered processor,
+            wrap it: ``processor=lambda ds: PROCESSORS["sst"](ds, cfg, "sst")``.
+        apply_rename: Apply ``rename_dims`` (``longitude/latitude/valid_time`` →
+            ``lon/lat/time``). Set ``False`` when the files already use canonical
+            dim names.
+        open_kwargs: Extra keyword arguments forwarded to ``xr.open_mfdataset``.
+
+    Returns:
+        The ``out_path`` that was written.
+
+    Raises:
+        FileNotFoundError: If no input paths are given.
+    """
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+    files = sorted(Path(p) for p in paths)
+    if not files:
+        raise FileNotFoundError("convert_netcdf_to_zarr: no input files given")
+
+    out_path = Path(out_path)
+    engine = "cfgrib" if files[0].suffix.lower() in {".grib", ".grb"} else "netcdf4"
+
+    logger.info(
+        f"Converting {len(files)} file(s) → {out_path.name} "
+        f"(engine={engine}, name={name!r})"
+    )
+
+    ds = xr.open_mfdataset(
+        files,
+        combine="by_coords",
+        engine=engine,
+        decode_timedelta=True,
+        chunks={"time": 1, "depth": 1},
+        **(open_kwargs or {}),
+    )
+    try:
+        if apply_rename:
+            ds = rename_dims(ds)
+        if processor is not None:
+            ds = processor(ds)
+        ds = snap_grid_coords(ds)
+        ds = chunk_dataset(ds)
+        write_append_zarr(name, ds, out_path)
+    finally:
+        ds.close()
+
+    return out_path
 
 
 class Netcdf2Zarr(BaseConverter):
@@ -55,6 +137,10 @@ class Netcdf2Zarr(BaseConverter):
         self.var_key = validate_var_key(var_key, self.app_config)
         self.var_config = self.app_config.variables[self.var_key]
 
+        # Single source of truth for the archive-vs-delete decision, read by
+        # both _archive_raw_files and _cleanup_period_files so they cannot drift.
+        self.archive_raw = self.var_config.archive_raw
+
         self.download_root = resolve_download_path(self.var_config, download_root)
 
         self.time_resolution = validate_time_resolution(time_resolution)
@@ -64,16 +150,24 @@ class Netcdf2Zarr(BaseConverter):
         self.store_root = self.catalog.store_root
 
     def run(self) -> bool:
-
+        t0 = time.perf_counter()
         logger.info(
             f"Initializing Netcdf -> Zarr conversion for variable key: {self.var_key.upper()}"
         )
+
+        # Reconcile any zarr write interrupted by a hard kill before gap
+        # detection reads the store, so a half-written store is not trusted and
+        # data stranded in a backup is restored.
+        recover_zarr_store(self.store_root)
 
         # Trajectory-format variables (e.g. eddies) require spatial binning
         # before zarr storage — bypass the standard open_mfdataset pipeline.
         if self.var_config.trajectory_format:
             self._process_eddies()
             self.catalog.refresh(force=True)
+            logger.success(
+                f"Conversion complete (trajectory) in {time.perf_counter() - t0:.1f}s"
+            )
             return True
 
         file_groups = self._group_map(groupby=self.time_resolution)
@@ -83,6 +177,10 @@ class Netcdf2Zarr(BaseConverter):
 
         self.catalog.refresh(force=True)
         self._cleanup_downloads()
+        logger.success(
+            f"Conversion complete: {len(file_groups)} period(s) "
+            f"in {time.perf_counter() - t0:.1f}s"
+        )
         return True
 
     # ========= DATA PREPARATION FUNCTIONS =========
@@ -157,6 +255,8 @@ class Netcdf2Zarr(BaseConverter):
         return sorted(files)
 
     def _parse_file_dates(self, file: Path) -> list[pd.Timestamp]:
+        if self.var_config.pattern is None:
+            return []
         match = re.search(self.var_config.pattern, file.name)
         if not match:
             return []
@@ -171,6 +271,8 @@ class Netcdf2Zarr(BaseConverter):
         self, file: Path
     ) -> tuple[pd.Timestamp, pd.Timestamp] | None:
         """Return (start, end) date for a raw file without expanding the full date range."""
+        if self.var_config.pattern is None:
+            return None
         match = re.search(self.var_config.pattern, file.name)
         if not match:
             return None
@@ -339,6 +441,7 @@ class Netcdf2Zarr(BaseConverter):
             ds.close()
             del ds
             self._archive_raw_files(period, paths)
+            self._cleanup_period_files(paths)
 
         except Exception as e:
             raise RuntimeError(
@@ -390,9 +493,9 @@ class Netcdf2Zarr(BaseConverter):
     ) -> None:
         """
         Move files for period folders (year or month as defined in period) if store_root is different from download root.
-        Currently only for aviso (fsle only) and cds data.
+        Runs when ``archive_raw`` is set (by default aviso (fsle only) and cds data).
         """
-        if self.var_config.source not in ["cds", "aviso"]:
+        if not self.archive_raw:
             return None
 
         if self.download_root != self.store_root:
@@ -403,6 +506,32 @@ class Netcdf2Zarr(BaseConverter):
             dest_dir.mkdir(parents=True, exist_ok=True)
 
             safe_move_files(paths, dest_dir, retries=retries, delay=delay)
+
+    def _cleanup_period_files(self, paths: list[Path]) -> None:
+        """
+        Delete a period's raw files once it has been converted successfully.
+
+        Without this, a failure on a later period aborts ``run()`` with every
+        raw file still on disk, so the next run re-globs and reprocesses *all*
+        periods (correct, via the overlap resolver, but wasteful — and it
+        rewrites already-good stores, widening the crash-exposure window).
+        Removing each period's inputs as it completes makes the convert step
+        incrementally resumable.
+
+        Variables whose raw files are archived into the store (``archive_raw``;
+        by default ``cds``/``aviso``) are handled by :meth:`_archive_raw_files`
+        and skipped here; so is the in-place layout where downloads live in the
+        store itself.
+        """
+        if self.archive_raw:
+            return
+        if self.download_root == self.store_root:
+            return
+        for p in paths:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError as e:
+                logger.debug(f"Could not remove raw file {p}: {e}")
 
     def _cleanup_downloads(self) -> None:
         """Remove raw data from dowloads folder if download_root is different from store_root to avoid cluttering downloads with raw files."""

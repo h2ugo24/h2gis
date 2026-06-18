@@ -17,6 +17,7 @@ from loguru import logger
 from h2mare.types import BBox, DateRange, to_datetime
 
 from .parquet_helpers import polars_float64_to_float32
+from .recovery import PARQUET_TMP_PREFIX, recover_parquet_store
 
 _TIME_COMPONENTS = {"year", "month", "day"}
 
@@ -26,6 +27,26 @@ def _coerce_partition_value(s: str) -> int | str:
         return int(s)
     except ValueError:
         return s
+
+
+def iter_store_parquet_files(root: Path) -> list[Path]:
+    """
+    Every committed parquet file under *root*, excluding interrupted
+    ``.tmp_write_*`` partition writes.
+
+    A crash mid ``atomic_partition_write`` can leave a ``.tmp_write_<partition>``
+    dir full of parquet files; without this filter the store-wide
+    ``rglob('*.parquet')`` scans would read them as committed data and pollute
+    schema, coverage, and query results. Partition-scoped globs
+    (``year=…/month=…``) don't need it — the temp dirs live at the store root.
+    """
+    return [
+        p
+        for p in root.rglob("*.parquet")
+        if not any(
+            part.startswith(PARQUET_TMP_PREFIX) for part in p.relative_to(root).parts
+        )
+    ]
 
 
 class ParquetStore:
@@ -61,10 +82,15 @@ class ParquetStore:
         # gap on every chunk of a multi-chunk write (e.g. lagging biology vars).
         self._missing_warned: set[str] = set()
 
+        # Reconcile any partition write interrupted by a hard kill before reading
+        # the store: promote a stranded temp dir whose final partition is gone,
+        # discard the rest, so metadata init and reads see only committed data.
+        recover_parquet_store(self.parquet_root, self._partition_by)
+
         self._init_dataset_metadata()
 
-        if not self.parquet_root.exists() or not any(
-            self.parquet_root.rglob("*.parquet")
+        if not self.parquet_root.exists() or not iter_store_parquet_files(
+            self.parquet_root
         ):
             # parquet_root is the configured store location — create it without
             # asking. Prompting here (a library constructor) stalled pipeline
@@ -147,7 +173,7 @@ class ParquetStore:
             lf_max = pl.scan_parquet(last_files).select(pl.col(self.time_col).max())
             dt_min, dt_max = (r.item() for r in pl.collect_all([lf_min, lf_max]))
         else:
-            all_files = list(self.parquet_root.rglob("*.parquet"))
+            all_files = iter_store_parquet_files(self.parquet_root)
             # Stream the scan: without a year partition shortcut this reads every
             # file in the store, and the default engine would buffer the whole
             # time column in memory.
@@ -167,8 +193,8 @@ class ParquetStore:
 
     def _init_dataset_metadata(self) -> None:
         """Initialize dataset-level metadata from parquet_root."""
-        if not self.parquet_root.exists() or not any(
-            self.parquet_root.rglob("*.parquet")
+        if not self.parquet_root.exists() or not iter_store_parquet_files(
+            self.parquet_root
         ):
             self._time_range = None
             self._geoextent = None
@@ -189,7 +215,7 @@ class ParquetStore:
         else:
             first_dir = self.parquet_root
 
-        first_file = next(first_dir.rglob("*.parquet"))
+        first_file = next(iter(iter_store_parquet_files(first_dir)))
         scan = pl.scan_parquet(first_file)
         self._geoextent = BBox.from_dataframe(
             scan, lon_col=self.lon_col, lat_col=self.lat_col
@@ -370,7 +396,7 @@ class ParquetStore:
 
         df = self._prepare_df(df)
 
-        if any(self.parquet_root.rglob("*.parquet")):
+        if iter_store_parquet_files(self.parquet_root):
             is_resolved = self.resolve_dims_overlap(df)
             if is_resolved:
                 logger.debug("Overlap resolved. Data added.")
@@ -649,7 +675,7 @@ class ParquetStore:
         if not candidate:
             return {}
 
-        all_files = list(self.parquet_root.rglob("*.parquet"))
+        all_files = iter_store_parquet_files(self.parquet_root)
         exprs: list[pl.Expr] = []
         for c in candidate:
             non_null_time = pl.col(self.time_col).filter(pl.col(c).is_not_null())
@@ -847,7 +873,7 @@ class ParquetStore:
         """Return the union schema across all partitions."""
         if self.physical_schema is not None:
             return self.physical_schema
-        all_files = list(self.parquet_root.rglob("*.parquet"))
+        all_files = iter_store_parquet_files(self.parquet_root)
         if len(all_files) == 1:
             return dict(pl.read_parquet_schema(all_files[0]))
         # One file per partition directory is enough — schema is uniform within a partition

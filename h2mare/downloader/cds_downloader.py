@@ -6,6 +6,8 @@ Go to https://cds.climate.copernicus.eu/datasets to check API request code
 
 from __future__ import annotations
 
+import sys
+import time
 import warnings
 from pathlib import Path
 from typing import Optional
@@ -88,20 +90,26 @@ class CDSDownloader(BaseDownloader):
             logger.info(f"'{self.var_key}' is already up to date — skipping.")
             return False
 
-        logger.info(f"Created {len(splits)} download task(s):")
+        logger.info(f"Created {len(splits)} download task(s)")
         for i, dt in enumerate(splits, 1):
-            logger.info(f"  {i}. {DateRange(start=dt.start, end=dt.end)}")
+            logger.debug(f"  {i}. {DateRange(start=dt.start, end=dt.end)}")
 
         if dry_run:
             logger.info("DRY RUN - no downloads executed")
             self._cleanup_empty_download_dir()
             return False
 
+        t0 = time.perf_counter()
         for dt in splits:
             dt = DateRange(start=dt.start, end=dt.end)
             self.download_file(dt, output_dir=output_dir)
 
         self._cleanup_empty_download_dir()
+        logger.success(
+            f"Download complete: {len(splits)} task(s) "
+            f"({requested_range.start.date()} → {requested_range.end.date()}) "
+            f"in {time.perf_counter() - t0:.1f}s"
+        )
         return True
 
     def _resolve_date_range(
@@ -195,7 +203,9 @@ class CDSDownloader(BaseDownloader):
                 f"{d:02d}" for d in range(date_range.start.day, date_range.end.day + 1)
             ]
 
-        client = cdsapi.Client()
+        # The progress bar redraws via carriage returns; redirected to a file
+        # (scheduled runs) every refresh persists as its own line.
+        client = cdsapi.Client(progress=sys.stderr.isatty())
 
         bbox = (
             BBox.from_tuple(self.var_config.bbox)

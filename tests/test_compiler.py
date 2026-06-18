@@ -25,6 +25,7 @@ _H2DS_ENTRY = {
     "source_vars": ["sst"],
     "dataset_id_rep": "h2ds",
     "source": "compiled",
+    "archive_raw": False,
     "pattern": r"(\d{4})",
     "subset": False,
     "bbox": (-80, 0, 10, 70),
@@ -35,6 +36,7 @@ _SST_ENTRY = {
     "source_vars": ["analysed_sst"],
     "dataset_id_rep": "cmems-rep-sst",
     "source": "cmems",
+    "archive_raw": False,
     "pattern": r".*\.nc",
     "subset": True,
     "bbox": (-80, 0, 10, 70),
@@ -225,6 +227,7 @@ _EDDIES_ENTRY = {
     "compiled_vars": ["ac_amp", "c_amp"],  # compiled h2ds names
     "dataset_id_rep": "aviso-eddies",
     "source": "aviso",
+    "archive_raw": True,
     "pattern": r".*",
     "subset": True,
     "bbox": (-80, 0, 10, 70),

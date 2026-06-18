@@ -5,6 +5,7 @@ Extract data based on csv or shapefile format files from datasets in zarr format
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Union, overload
@@ -20,12 +21,10 @@ from scipy.spatial import KDTree
 
 from h2mare import AppConfig, get_settings
 from h2mare.storage.zarr_catalog import ZarrCatalog
-from h2mare.types import BBox
-from h2mare.utils.logging import log_time
+from h2mare.types import BBox, DateRange
+from h2mare.utils.logging import configure_extraction_logging, log_time
 from h2mare.utils.paths import resolve_store_path
 from h2mare.utils.spatial import sel_padded_bbox
-
-_AUTO_INDEX_SENTINEL = "__row_id__"
 
 # Module-level KDTree cache keyed on grid identity (shape + first/last values).
 # All var_keys produced by this pipeline share the same 0.25° grid, so the tree
@@ -97,7 +96,9 @@ def _extract_geometry(
         return result
 
     except (OSError, ValueError, RuntimeError) as e:
-        logger.error(f"Extraction failed for id={id}, date={date}: {e}")
+        # Per-geometry detail only — thousands of geometries would flood the
+        # log at ERROR. The end-of-run null summary carries the aggregate.
+        logger.debug(f"Extraction failed for id={id}, date={date}: {e}")
 
     # --- Return NaNs for failed geometry to preserve structure ---
     nan_result: dict = {index_col: id}
@@ -147,7 +148,8 @@ def _extract_geometry_bathy(
         return result
 
     except (OSError, ValueError, RuntimeError) as e:
-        logger.error(f"Extraction failed for id={id}: {e}")
+        # Per-geometry detail only — see _extract_geometry.
+        logger.debug(f"Extraction failed for id={id}: {e}")
 
     # --- Return NaNs for failed geometry to preserve structure ---
     nan_result: dict = {index_col: id}
@@ -165,35 +167,85 @@ def load_dataset_to_memory(ds: xr.Dataset | xr.DataArray) -> xr.Dataset | xr.Dat
     return ds.compute()
 
 
+def ensure_row_id(
+    data: pd.DataFrame | gpd.GeoDataFrame, col: str = "row_id"
+) -> pd.DataFrame | gpd.GeoDataFrame:
+    """
+    Guarantee a stable, unique key column on ``data`` for merging extraction
+    results back onto the caller's dataframe.
+
+    The merge key must exist on *both* sides of the eventual join, so it has to
+    be established here — on the frame the caller keeps — rather than invented
+    inside :class:`Extractor`, which never sees the caller's other columns. Use
+    the returned frame for both the extraction and the later merge.
+
+    Behaviour:
+        - ``col`` present and unique     -> returned unchanged.
+        - ``col`` present with duplicates -> ``ValueError`` (a duplicated key
+          silently collapses rows on merge-back; the caller must fix it).
+        - ``col`` absent                 -> a positional ``range(len(data))`` key
+          is added on a copy.
+
+    Parameters:
+        data (pd.DataFrame | gpd.GeoDataFrame): input points or geometries.
+        col (str): name of the key column. Defaults to ``"row_id"``.
+
+    Returns:
+        The frame (same type as ``data``) carrying a unique ``col``.
+    """
+    if col in data.columns:
+        if data[col].duplicated().any():
+            n = int(data[col].duplicated().sum())
+            raise ValueError(
+                f"'{col}' has {n} duplicate value(s); the key must be unique to "
+                "merge extraction results back without collapsing rows."
+            )
+        return data
+
+    data = data.copy()
+    data[col] = range(len(data))
+    logger.info(f"No '{col}' column found — added a positional one (0..{len(data) - 1}).")
+    return data
+
+
 class Extractor:
     def __init__(
         self,
         file_path: Union[Path, gpd.GeoDataFrame, pd.DataFrame],
         *,
+        index_col: str,
         time_col: Optional[str] = None,
-        index_col: Optional[str] = None,
         lon_col: Optional[str] = None,
         lat_col: Optional[str] = None,
         app_config: Optional[AppConfig] = None,
         store_root: Optional[Union[str, Path]] = None,
         crs: int | None = 4326,
+        log_file: Optional[Union[str, Path]] = None,
     ):
         """
         Extract data from shp/csv file_path of open file
 
         Parameters:
             file_path (Union[Path, gpd.GeoDataFrame, pd.DataFrame]): Data for extraction
+            index_col (str): Name of the unique key column used to merge results
+                back onto the input. Required and must already exist in the data
+                (establish it with :func:`ensure_row_id`); a missing or duplicated
+                key raises ``ValueError``.
             time_col (str): Name of time column. Defaults to "time".
-            index_col (str, optional): Name of index column. Defaults to "row_id" if not provided.
             lon_col (str, optional): Name of longitude column. Defaults to "lon".
             lat_col (str, optional): Name of latitude column. Defaults to "lat".
             app_config (AppConfig, optional): Dataclass with environmental data specifics. Defaults to cfg.
             store_root (Union[str, Path], optional): Path for environmental data main folder. Defaults to STORE_ROOT.
             crs (int | None, optional): Projection EPSG code for geometry extraction. Defaults to 4326.
+            log_file (str | Path, optional): Extraction log file for this session.
+                Defaults to LOGS_DIR/extractor.log (first Extractor in the
+                process decides; subsequent values are ignored).
 
         """
+        configure_extraction_logging(log_path=log_file)
+
         self.time_col = time_col if time_col is not None else "time"
-        self.index_col = index_col if index_col is not None else _AUTO_INDEX_SENTINEL
+        self.index_col = index_col
         self.lon_col = lon_col if lon_col is not None else "lon"
         self.lat_col = lat_col if lat_col is not None else "lat"
         self.crs = crs
@@ -232,12 +284,12 @@ class Extractor:
         if has_time_component:
             time_is_uniform = data["time"].dt.time.nunique() == 1
             if time_is_uniform:
-                logger.info("Uniform time component detected. Truncating to date.")
+                logger.debug("Uniform time component detected. Truncating to date.")
                 data["time"] = data["time"].dt.normalize()
             else:
-                logger.info("Variable time component detected. Keeping full datetime.")
+                logger.debug("Variable time component detected. Keeping full datetime.")
         else:
-            logger.info("No time component detected. Keeping as date.")
+            logger.debug("No time component detected. Keeping as date.")
 
         return data
 
@@ -249,14 +301,17 @@ class Extractor:
         if isinstance(file_path, gpd.GeoDataFrame):
             data_base = file_path.copy()
             self.input_type = "shp"
+            self.input_label = "<in-memory GeoDataFrame>"
 
         elif isinstance(file_path, pd.DataFrame):
             data_base = file_path.copy()
             self.input_type = "csv"
+            self.input_label = "<in-memory DataFrame>"
 
         else:
             file_path = Path(file_path)
             suffix = file_path.suffix.lower()
+            self.input_label = file_path.name
 
             if suffix == ".shp":
                 data_base = gpd.read_file(file_path)
@@ -274,34 +329,29 @@ class Extractor:
         self, data: pd.DataFrame | gpd.GeoDataFrame
     ) -> pd.DataFrame | gpd.GeoDataFrame:
         """
-        Resolve index_col in shp and csv dataframes.
+        Set ``index_col`` as the frame index — the key used to merge results
+        back onto the caller's data.
 
-        If no index_col is provided (sentinel), a sequential index is created
-        and stored under the private name '__row_id__', which is preserved as
-        the DataFrame index throughout the pipeline — never dropped or saved
-        to output files.
+        The key is the caller's responsibility: it must already exist in the
+        data and be unique (establish it up front with :func:`ensure_row_id`).
+        The Extractor consumes the key, it never creates one.
 
         Raises:
-            ValueError: if provided index_col not found in data.columns
+            ValueError: if ``index_col`` is missing from the data, or has
+                duplicate values.
         """
-        if self.index_col == _AUTO_INDEX_SENTINEL:
-            if _AUTO_INDEX_SENTINEL in data.columns:
-                # Reuse existing __row_id__ from a previous run — do not recreate
-                logger.info(
-                    f"Found existing '{_AUTO_INDEX_SENTINEL}' column. Reusing as index."
-                )
-                data = data.set_index(_AUTO_INDEX_SENTINEL)
-            else:
-                logger.info(
-                    "No index column name provided. Creating sequential '__row_id__' indexation."
-                )
-                data = data.reset_index(drop=True)
-            data.index.name = _AUTO_INDEX_SENTINEL
-        else:
-            if self.index_col not in data.columns:
-                raise ValueError("Index column name not found in data attributes.")
-            data = data.set_index(self.index_col)
-        return data
+        if self.index_col not in data.columns:
+            raise ValueError(
+                f"index_col '{self.index_col}' not found in data — establish it "
+                "first, e.g. with ensure_row_id(data)."
+            )
+        if data[self.index_col].duplicated().any():
+            n = int(data[self.index_col].duplicated().sum())
+            raise ValueError(
+                f"index_col '{self.index_col}' has {n} duplicate value(s); it must "
+                "be unique to merge extraction results back without collapsing rows."
+            )
+        return data.set_index(self.index_col)
 
     def _prepare_data(
         self, data: pd.DataFrame | gpd.GeoDataFrame
@@ -498,6 +548,116 @@ class Extractor:
 
         raise ValueError(f"Unsupported input_type: {self.input_type}")
 
+    def extract_from_dataset(
+        self,
+        ds: xr.Dataset | xr.DataArray,
+        *,
+        vars: str | list[str] | None = None,
+        n_workers: int = 8,
+        clip_to_coverage: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Extract values from an arbitrary in-memory dataset, bypassing ZarrCatalog.
+
+        This is the config-free counterpart to :meth:`process_single_varkey`: it runs
+        the same extraction engine (:meth:`extract_from_csv` / :meth:`extract_from_shp`)
+        against a ``ds`` the caller already holds in memory — useful for new data that
+        is not yet ingested into the store. The prepared points/geometries in
+        ``self.data`` are reused as-is.
+
+        Only the config-free prep is applied here. Config-driven steps that
+        :meth:`process_single_varkey` performs — depth-slice expansion
+        (``extract_depth_slices``), ``rename_lonlat``, and store date/bbox coverage
+        resolution — are the caller's responsibility: prepare ``ds`` beforehand.
+
+        Parameters:
+            ds (xr.Dataset | xr.DataArray): gridded data with coords ``lon``, ``lat``
+                and optionally ``time``. For shapefile input it is assumed to be in
+                ``self.crs`` (its CRS is overwritten, not reprojected, to match the
+                geometries — see :meth:`ensure_crs`).
+            vars (str | list[str] | None): subset of variables to extract. Only valid
+                when ``ds`` is an ``xr.Dataset``; raises ``TypeError`` for a DataArray.
+            n_workers (int): parallel workers for shapefile (geometry) extraction.
+            clip_to_coverage (bool): when True, drop input rows whose location (and
+                time, if ``ds`` has a time coord) falls outside the ``ds`` extent;
+                dropped rows surface as NaN in the result. Defaults to False, since
+                nearest-neighbour (csv) / clip-or-NaN (shp) already handle them.
+
+        Returns:
+            pd.DataFrame indexed by ``self.index_col`` (aligned to ``self.data.index``)
+            with one column per variable (csv) or ``var`` / ``var_std`` columns (shp).
+        """
+        vars = [vars] if isinstance(vars, str) else vars
+
+        if vars is not None:
+            if not isinstance(ds, xr.Dataset):
+                raise TypeError(
+                    "`vars` can only be used when `ds` is an xr.Dataset, "
+                    "not an xr.DataArray."
+                )
+            ds = ds[vars]
+
+        if "time" in ds.coords:
+            ds = ds.sortby("time")
+
+        data = self._mask_to_ds_extent(ds) if clip_to_coverage else self.data
+
+        if self.input_type == "shp":
+            if not isinstance(data, gpd.GeoDataFrame):
+                raise TypeError("Data must be a GeoDataFrame for shapefile extraction")
+
+            # rioxarray's .rio.clip (used by extract_from_shp) resolves spatial dims
+            # by name and expects x/y. Geographic datasets carry lon/lat, so rename —
+            # the config-driven equivalent of var_cfg.rename_lonlat in the store path.
+            if "lon" in ds.coords and "lat" in ds.coords:
+                ds = ds.rename({"lon": "x", "lat": "y"})
+
+            ds = self.ensure_crs(data, ds)
+            result = self.extract_from_shp(
+                data, ds, self.index_col, n_workers=n_workers
+            )
+
+        elif self.input_type == "csv":
+            result = self.extract_from_csv(data, ds, self.index_col)
+
+        else:
+            raise ValueError(f"Unsupported input_type: {self.input_type}")
+
+        # When rows were clipped out, realign to the full input so dropped rows
+        # surface as NaN rather than silently vanishing from the result.
+        if clip_to_coverage:
+            result = result.reindex(self.data.index)
+
+        return result
+
+    def _mask_to_ds_extent(
+        self, ds: xr.Dataset | xr.DataArray
+    ) -> pd.DataFrame | gpd.GeoDataFrame:
+        """
+        Return a copy of ``self.data`` keeping only rows inside the ``ds`` extent.
+
+        Spatial filtering uses the dataset bbox (point for csv, geometry centroid for
+        shp); temporal filtering applies only when ``ds`` carries a ``time`` coord.
+        ``self.data`` itself is never mutated.
+        """
+        bbox = BBox.from_dataset(ds)
+
+        if self.input_type == "csv":
+            mask = self.data["lon"].between(bbox.xmin, bbox.xmax) & self.data[
+                "lat"
+            ].between(bbox.ymin, bbox.ymax)
+        else:
+            centroids = self.data.geometry.centroid
+            mask = centroids.x.between(bbox.xmin, bbox.xmax) & centroids.y.between(
+                bbox.ymin, bbox.ymax
+            )
+
+        if "time" in ds.coords:
+            dr = DateRange.from_dataset(ds)
+            mask &= self.data["time"].between(dr.start, dr.end)
+
+        return self.data.loc[mask]
+
     @overload
     def run(
         self,
@@ -518,7 +678,6 @@ class Extractor:
         n_workers: int = ...,
     ) -> None: ...
 
-    @log_time
     def run(
         self,
         var_dict: Optional[
@@ -545,6 +704,45 @@ class Extractor:
             >>> extractor = Extractor(file_path=input_path, time_col='ls_date', index_col='idlance')
             >>> results = extractor.run(output_path, var_dict=var_dict, n_workers=12)
         """
+        t0 = time.perf_counter()
+        # job="extract" routes every message in this scope (including from the
+        # storage layer) to the extraction sink; see configure_extraction_logging.
+        with logger.contextualize(job="extract"):
+            out_label = str(output_path) if output_path is not None else "DataFrame"
+            logger.info(
+                f"Extraction started: input={self.input_label} "
+                f"({self.data.shape[0]} rows, {self.input_type}) → output={out_label}"
+            )
+
+            df_processed, all_succeeded = self._run_impl(var_dict, n_workers)
+
+            if output_path is not None:
+                self._save_results(df_processed, Path(output_path))
+
+            n_new = sum(1 for c in df_processed.columns if c not in self.data.columns)
+            outcome = (
+                f"input={self.input_label} → output={out_label}, "
+                f"{len(df_processed)} rows × {n_new} new column(s) "
+                f"in {time.perf_counter() - t0:.1f}s"
+            )
+            if all_succeeded:
+                logger.success(f"Extraction complete: {outcome}")
+            else:
+                logger.warning(
+                    f"Extraction finished with errors: {outcome} — "
+                    "checkpoint preserved for resume."
+                )
+
+        if output_path is not None:
+            return None
+        return df_processed
+
+    def _run_impl(
+        self,
+        var_dict: Optional[Union[str, list[str], dict[str, str | list[str] | None]]],
+        n_workers: int,
+    ) -> tuple[pd.DataFrame, bool]:
+        """Extraction loop body; returns (results, all_succeeded)."""
         # n_workers only drives the ThreadPoolExecutor in shp (geometry) extraction;
         # csv (point) extraction is vectorized and ignores it — so don't advertise it there.
         if self.input_type == "shp":
@@ -566,6 +764,16 @@ class Extractor:
                 df_processed = df_processed[
                     ~df_processed.index.duplicated(keep="first")
                 ]
+            # Feather can't round-trip live shapely geometries, so pd.read_feather
+            # brings `geometry` back as WKB bytes. Restore it from the original
+            # (index-aligned) input and re-wrap as a GeoDataFrame, matching the
+            # fresh-run return type.
+            if self.input_type == "shp":
+                df_processed = gpd.GeoDataFrame(
+                    df_processed.drop(columns="geometry", errors="ignore"),
+                    geometry=self.data.geometry.reindex(df_processed.index),
+                    crs=self.data.crs,
+                )
             completed_keys = _load_completed_keys(tmp_path)
         else:
             df_processed = self.data.copy()
@@ -578,37 +786,44 @@ class Extractor:
                 logger.info(f"Skipping {var_key}: already extracted.")
                 continue
 
+            t0 = time.perf_counter()
             try:
-                result = self.process_single_varkey(
-                    var_key=var_key, vars=vars_, n_workers=n_workers
-                )
-
-                result.drop(
-                    columns=["time", "lat", "lon", "geom"],
-                    errors="ignore",
-                    inplace=True,
-                )
-                if result.index.duplicated().any():
-                    logger.warning(
-                        f"Duplicate index values in '{var_key}' result — keeping first occurrence."
+                with logger.contextualize(var=var_key):
+                    result = self.process_single_varkey(
+                        var_key=var_key, vars=vars_, n_workers=n_workers
                     )
-                    result = result[~result.index.duplicated(keep="first")]
-                df_processed = df_processed.join(result)
 
-                # Mark var_key as completed and save checkpoint atomically
-                completed_keys.add(var_key)
-                staging = tmp_path.with_suffix(".tmp")
-                df_processed.reset_index().to_feather(staging)
-                staging.replace(tmp_path)
-                _save_completed_keys(tmp_path, completed_keys)
-                logger.info(f"Checkpoint saved to {tmp_path}")
+                    result.drop(
+                        columns=["time", "lat", "lon", "geom"],
+                        errors="ignore",
+                        inplace=True,
+                    )
+                    if result.index.duplicated().any():
+                        logger.warning(
+                            f"Duplicate index values in '{var_key}' result — keeping first occurrence."
+                        )
+                        result = result[~result.index.duplicated(keep="first")]
+                    df_processed = df_processed.join(result)
+
+                    # Mark var_key as completed and save checkpoint atomically
+                    completed_keys.add(var_key)
+                    staging = tmp_path.with_suffix(".tmp")
+                    df_processed.reset_index().to_feather(staging)
+                    staging.replace(tmp_path)
+                    _save_completed_keys(tmp_path, completed_keys)
+                    logger.debug(f"Checkpoint saved to {tmp_path}")
+
+                    logger.success(
+                        f"{var_key}: {len(result)} row(s), "
+                        f"{result.shape[1]} column(s) "
+                        f"in {time.perf_counter() - t0:.1f}s"
+                    )
 
             except Exception as e:
-                logger.error(f"Error processing '{var_key}': {e}")
+                logger.opt(exception=True).error(f"Error processing '{var_key}': {e}")
                 all_succeeded = False
                 continue
 
-        logger.success("Extraction completed!")
         logger.info("=" * 60)
         logger.info("  Number of null values per variable:")
         result_cols = [c for c in df_processed.columns if c not in self.data.columns]
@@ -619,16 +834,8 @@ class Extractor:
         if all_succeeded:
             tmp_path.unlink(missing_ok=True)
             _keys_path(tmp_path).unlink(missing_ok=True)
-        else:
-            logger.warning(
-                "Some var_keys failed. Checkpoint files preserved for resume."
-            )
 
-        if output_path is not None:
-            self._save_results(df_processed, Path(output_path))
-            return
-
-        return df_processed
+        return df_processed, all_succeeded
 
     @staticmethod
     def _nearest_grid_indices(
@@ -695,6 +902,18 @@ class Extractor:
         irregular grids) and numpy searchsorted for time, then selects with
         isel() (integer indexing) which is faster than coordinate-based sel().
 
+        This is the low-level point-extraction engine and assumes its inputs are
+        already prepared; :meth:`extract_from_dataset` (or :meth:`process_single_varkey`
+        for the store) establishes these preconditions for you.
+
+        Preconditions (the caller must guarantee these — they are not validated):
+            - ``data`` has columns named exactly ``time``, ``lon`` and ``lat``.
+            - ``ds`` has coordinates named exactly ``lon`` and ``lat`` (read directly
+              when building the KDTree).
+            - If ``ds`` has a ``time`` coordinate it must be **sorted ascending** —
+              nearest-time lookup uses ``np.searchsorted`` and returns wrong indices
+              on an unsorted axis. No CRS is required.
+
         Parameters:
             ds (xr.Dataset | xr.DataArray): dataset with coords lon, lat and optionally time.
 
@@ -730,6 +949,19 @@ class Extractor:
     ) -> pd.DataFrame:
         """
         Extract data from shapefile using multiprocessing starmap.
+
+        This is the low-level geometry-extraction engine and assumes its inputs are
+        already prepared; :meth:`extract_from_dataset` (or :meth:`process_single_varkey`
+        for the store) establishes these preconditions for you.
+
+        Preconditions (the caller must guarantee these — they are not validated):
+            - ``data`` is a GeoDataFrame with a ``geometry`` column (and a ``time``
+              column when ``ds`` has a ``time`` coordinate).
+            - ``ds`` has a CRS set (``ds.rio.crs``) and spatial dims named ``x``/``y``,
+              because per-geometry ``ds.rio.clip`` resolves dims by name. Datasets
+              with ``lon``/``lat`` must be renamed and given a CRS first (see
+              :meth:`ensure_crs`); the ``lon``/``lat`` bbox pre-select still works,
+              but the clip step will fail without ``x``/``y`` + CRS.
 
         Args:
             gdf (gpd.GeoDataFrame): geodataframe with geometries and time column.
@@ -1017,6 +1249,12 @@ class Extractor:
             result = existing_df.join(result, how="left")
 
         result = result.reset_index(drop=False)
+
+        # shp inputs carry a `geometry` column through to the result. Shapely
+        # geometries only serialize to WKT strings in a CSV — unusable as
+        # geometries on read-back — so drop it from the file. The in-memory
+        # return value from run() keeps it.
+        result = result.drop(columns="geometry", errors="ignore")
 
         result.to_csv(output_path, index=False)
         logger.success("Results saved")

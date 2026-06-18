@@ -16,7 +16,7 @@ h2mare/
   │
   ├── cli/                  # Typer commands: run, convert, compile, parquet, catalog
   ├── downloader/           # Source fetchers (CMEMS, AVISO, CDS) selected via registry.py → data/raw/downloads/
-  ├── format_converters/    # netcdf2zarr (regrid → 0.25°/daily), zarr2parquet, parquet2csv
+  ├── format_converters/    # netcdf2zarr (regrid → 0.25°/daily), zarr2parquet, parquet2csv, zarr_map_export
   ├── processing/           # Per-var preprocessing; compiler.py merges → h2ds; core/ holds source transforms
   ├── storage/              # zarr_catalog (resume index); parquet_store (write) / _indexer (API) / _catalog (read)
   └── utils/                # date_range, spatial (grids/masks), labels, logging, paths
@@ -74,6 +74,13 @@ uv run ruff check --fix h2mare/
 uv run ruff format h2mare/
 ```
 
+## Pipeline semantics & gotchas
+
+- `run -v X` compiles **only X's columns** into h2ds; other lagging variables catch up on the next full `uv run h2mare compile` (no `-v`).
+- Store repair: explicit dates re-read **all** variables and rewrite affected partitions wholesale — `uv run h2mare parquet --start-date ... --end-date ...`. Prefer whole-month windows.
+- Write-path merge semantics are deliberate and pinned by regression tests (`tests/test_storage.py`, `tests/test_parquet_store.py`): incoming data wins where it has rows (even when null); stored values survive outside its window; time-less statics (bathy) come from the fresh side; tails and absent variables are preserved. Read those tests before changing `storage.py::_append_data` or `parquet_store.py::resolve_dims_overlap`.
+- Data quirks: `chl` has legitimate all-null days (~1999/2000 — the raw product never published them; the zarr is null too, so they are not backfillable). `seapodym` covers 2025 only.
+
 ## ParquetIndexer
 
 Primary interface for reading and writing the Parquet store (`storage/parquet_indexer.py`).
@@ -92,6 +99,20 @@ idx.plot.spatial_maps("sst", agg_by="season")
 
 Non-obvious behavior: partition writes are atomic (`.tmp_write_YYYY_MM` → rename); Float64 is downcast to Float32
 on write; `idx.plot` is a `cached_property` invalidated after `add_data()`.
+
+## Chunk layouts & map export
+
+`chunk_dataset` (`storage/xarray_helpers.py`) takes `layout`: `"timeseries"` (default — time-contiguous, small
+spatial tiles; what extraction/`Extractor` reads) or `"map"` (space-contiguous, time pinned to `map_time_chunk`,
+default 14; what interactive maps read). Both fill the 32 MB budget along the axis read *contiguously* and minimize
+the axis indexed *into* — the asymmetry is deliberate (don't budget-fill time in `map`, it would force a single-day
+viz read to decompress many unwanted days). It logs the resulting layout/shape/size on every call.
+
+`export_map_zarr` (`format_converters/zarr_map_export.py`) rewrites a per-period store into a map-chunked **sibling**
+(`h2ds` → `h2ds_map`; or any `var_key` / config-free `source_root`). It's a pure projection: lazy split-rechunk,
+atomic temp-dir swap, source never modified. The `_map` store is a full duplicate (~h2ds size) — a derived,
+rebuildable artifact. The interactive-viz field path reads `h2ds_map`; the canonical `h2ds` stays extraction-chunked.
+See `docs/api/map_export.md`.
 
 ## Git workflow
 
@@ -114,6 +135,7 @@ Follows the global Git Workflow (see `~/.claude/CLAUDE.md`).
 **Release**
 - PR `dev` → `main`, review, merge; then `git checkout main && git pull origin main`.
 - Optional tag: `git tag -a v1.0.0 -m "..." && git push origin v1.0.0`.
+- Bump `pyproject.toml` version + `uv lock` via a `chore/` PR into `dev` *before* the release PR.
 
 **Rules**
 - Always branch from the latest `dev` — *pull before you branch*.
@@ -121,6 +143,7 @@ Follows the global Git Workflow (see `~/.claude/CLAUDE.md`).
 - Commit with a type: `feat:` / `fix:` / `docs:` / `chore:` / `perf:` / `refactor:`; say what changed and why.
 - Branch with a matching prefix: `feature/` / `fix/` / `docs/` / `chore/` / `perf/` / `refactor/`.
 - Protect `main` and `dev` (require PR review).
+- Merging requires 3 green checks (`branch-name`, `commit-lint`, `quality`) **and** an up-to-date branch: `gh pr update-branch <#> --rebase`, wait for checks, then `gh pr merge <#> --merge --delete-branch`.
 
 ## Coding Rules
 
@@ -128,3 +151,5 @@ Follows the global Git Workflow (see `~/.claude/CLAUDE.md`).
 - **Paths** — always access paths via `settings.*`; never hardcode
 - **`.env`** — `STORE_ROOT` (required); `AVISO_FTP_SERVER`, `AVISO_USERNAME`, `AVISO_PASSWORD` (required for AVISO variables); `H2MARE_ROOT` (optional, overrides project root detection)
 - **Types** — use `DateRange`, `BBox`, `DateLike` from `h2mare/types.py`; no raw tuples. Accept plain tuples in public APIs and construct the named type internally.
+- **Regression tests** — must fail on unfixed code; verify with `git stash push <src-file>` → run test → `git stash pop`.
+- **Test helpers** — `tests/conftest.py:make_grid_df` builds time×lon×lat Polars frames for parquet-layer tests; `_make_ds` helpers in `tests/test_storage.py` build zarr-ready datasets.

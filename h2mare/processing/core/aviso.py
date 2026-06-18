@@ -163,6 +163,11 @@ class EDDIESProcessor:
         self.store_root = resolve_store_path(self.var_config, store_root)
         self.download_root = resolve_download_path(self.var_config, download_root)
 
+        if self.var_config.pattern is None:
+            raise ValueError(
+                f"Variable '{self.var_key}' has no `pattern`; cannot extract dates "
+                "from eddies filenames"
+            )
         self.date_pattern = re.compile(self.var_config.pattern)
         self.type_pattern = re.compile(r"(anticyclonic|cyclonic)", re.IGNORECASE)
 

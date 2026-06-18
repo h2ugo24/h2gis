@@ -8,10 +8,11 @@ from .core.cds import (
 )
 from .core.cmems import process_chl, process_mld, process_ssh, process_sst
 from .core.fronts import FrontProcessor
-from .extractor import Extractor
+from .extractor import Extractor, ensure_row_id
 
 __all__ = [
     "Extractor",
+    "ensure_row_id",
     "Compiler",
     "EDDIESProcessor",
     "FrontProcessor",

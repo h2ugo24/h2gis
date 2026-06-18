@@ -22,6 +22,7 @@ variables:
       - analysed_sst
     dataset_id_rep: cmems-rep-sst
     source: cmems
+    archive_raw: false
     pattern: '.*\.nc'
     subset: true
     bbox:
@@ -125,6 +126,25 @@ class TestLoadAppConfig:
             warnings.simplefilter("always")
             s.load_app_config()
         assert any(issubclass(warning.category, RuntimeWarning) for warning in w)
+
+    def test_warns_when_subset_set_on_non_cmems_var(self, tmp_path, monkeypatch):
+        """`subset` only affects CMEMS; setting it elsewhere logs a warning."""
+        from loguru import logger
+
+        monkeypatch.setenv("H2MARE_ROOT", str(tmp_path))
+        monkeypatch.delenv("STORE_ROOT", raising=False)
+        cds_yaml = _MINIMAL_CONFIG_YAML.replace("source: cmems", "source: cds")
+        (tmp_path / "config.yaml").write_text(cds_yaml)
+        s = Settings()
+
+        messages: list[str] = []
+        sink_id = logger.add(messages.append, level="WARNING")
+        try:
+            s.load_app_config()
+        finally:
+            logger.remove(sink_id)
+
+        assert any("subset" in m and "non-CMEMS" in m for m in messages)
 
 
 # ---------------------------------------------------------------------------

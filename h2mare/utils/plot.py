@@ -4,16 +4,21 @@ plot functions
 
 import calendar
 import math
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, Optional
 
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import plotly.express as px
 import polars as pl
 import xarray as xr
 from IPython.display import clear_output, display
+from loguru import logger
 
 from h2mare.config import get_settings
 from h2mare.storage.parquet_helpers import _required_columns
@@ -409,3 +414,215 @@ def plot_snapshot(
             da = da.isel(depth=depth_idx if depth_idx is not None else 0)
         da.plot()  # type: ignore
         plt.show()
+
+
+# --------------------------------
+#       INTERACTIVE
+# --------------------------------
+
+
+def _to_wgs84(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Reproject a GeoDataFrame to WGS84 (EPSG:4326) if it carries a different CRS.
+
+    Plotly and the zarr grid both expect lon/lat in WGS84; a GeoDataFrame in another CRS
+    would otherwise plot in the wrong place. A GeoDataFrame with no CRS is left untouched.
+    """
+    if gdf.crs is not None and not gdf.crs.equals("EPSG:4326"):
+        return gdf.to_crs(4326)
+    return gdf
+
+
+def _points_to_latlon(gdf: gpd.GeoDataFrame) -> tuple[pd.DataFrame, str, str]:
+    """Reproject a point GeoDataFrame to WGS84 and extract lon/lat columns.
+
+    MultiPoint geometries are exploded into one Point per row. Non-point geometries
+    are rejected because they need a different Plotly trace type (choropleth/line map).
+
+    Args:
+        gdf: Source GeoDataFrame with point (or multipoint) geometry.
+
+    Returns:
+        A tuple ``(df, lat_col, lon_col)`` where *df* is a plain DataFrame carrying the
+        original attribute columns plus synthesized ``"_lat"`` / ``"_lon"`` columns.
+
+    Raises:
+        ValueError: if the GeoDataFrame contains non-point geometry.
+    """
+    geom_types = set(gdf.geom_type.dropna().unique())
+    allowed = {"Point", "MultiPoint"}
+    if not geom_types <= allowed:
+        raise ValueError(
+            f"plot_interactive_map supports point geometry only; got {sorted(geom_types)}. "
+            "Polygons/lines need a choropleth or line map instead."
+        )
+
+    gdf = _to_wgs84(gdf)
+
+    if "MultiPoint" in geom_types:
+        gdf = gdf.explode(index_parts=False)
+
+    geom = gdf.geometry
+    df = pd.DataFrame(gdf.drop(columns=geom.name))
+    df["_lon"] = geom.x.to_numpy()
+    df["_lat"] = geom.y.to_numpy()
+    return df, "_lat", "_lon"
+
+
+def plot_interactive_map(
+    df: pd.DataFrame | gpd.GeoDataFrame,
+    lat: str | None = None,
+    lon: str | None = None,
+    hover_cols: str | list[str] | None = None,
+    export_path: str | Path | None = None,
+    map_style: str = "open-street-map",
+    zoom: int = 4,
+) -> None:
+    """Show an interactive scatter map from a DataFrame or point GeoDataFrame.
+
+    Args:
+        df: Source data. A plain DataFrame with explicit lat/lon columns, or a
+            GeoDataFrame with point (or multipoint) geometry. For a GeoDataFrame the
+            geometry is reprojected to WGS84 and lat/lon are derived from it, so the
+            *lat* / *lon* arguments are ignored.
+        lat: Name of the latitude column. Required for a plain DataFrame; ignored for a
+            GeoDataFrame.
+        lon: Name of the longitude column. Required for a plain DataFrame; ignored for a
+            GeoDataFrame.
+        hover_cols: Column name(s) to display on hover. Pass None to show no extra data.
+        export_path: If provided, saves the map as an HTML file at this path.
+        map_style: Plotly basemap style. Defaults to "open-street-map". If exported to HTML,
+            "carto-positron" or "carto-darkmatter" are recommended because OpenStreetMap's
+            tile servers reject requests with no Referer header (e.g. an exported HTML
+            opened from a file:// path), which shows up as "403 Access blocked" tiles.
+            The mentioned Carto basemaps need no token and no Referer, so they render in
+            exported files.
+        zoom: Initial map zoom level. Defaults to 4.
+
+    Raises:
+        ValueError: if *df* is empty, if lat/lon are missing for a plain DataFrame, or
+            if a GeoDataFrame carries non-point geometry.
+    """
+    if isinstance(hover_cols, str):
+        hover_cols = [hover_cols]
+
+    # Normalize point GeoDataFrame input to a plain DataFrame with lat/lon columns.
+    if isinstance(df, gpd.GeoDataFrame):
+        df, lat, lon = _points_to_latlon(df)
+    elif lat is None or lon is None:
+        raise ValueError(
+            "lat and lon column names are required for non-GeoDataFrame input."
+        )
+
+    if len(df) == 0:
+        raise ValueError("No data to plot.")
+
+    # Suppress lat/lon from the tooltip; show requested hover columns on top.
+    hover_data: dict[str, bool] = {lat: False, lon: False}
+    if hover_cols:
+        hover_data.update({col: True for col in hover_cols})
+
+    center = {"lat": df[lat].mean(), "lon": df[lon].mean()}
+
+    fig = px.scatter_map(
+        df,
+        lat=lat,
+        lon=lon,
+        hover_data=hover_data,
+        center=center,
+        zoom=zoom,
+        map_style=map_style,
+    )
+    fig.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0})
+
+    if export_path is not None:
+        fig.write_html(str(export_path))
+        logger.info(f"Map saved to {export_path}")
+
+    fig.show()
+
+
+def plot_records_on_field(
+    data: pd.DataFrame | gpd.GeoDataFrame,
+    var_key: str,
+    var: str | None = None,
+    time_col: str = "date",
+    lon_col: str = "lon",
+    lat_col: str = "lat",
+    offset: float = 1.0,
+    max_plots: int = 12,
+    title_fn: Callable[[pd.Series], str] | None = None,
+) -> None:
+    """Plot the variable field around each record, with the location overlaid.
+
+    For each of the first ``max_plots`` records, opens the gridded ``var`` field in a bbox
+    around the record's location and overlays that location in red. Records with no data
+    for their date/bbox are skipped with a warning.
+
+    Works off either spatial source, no index required:
+    - a GeoDataFrame: reprojected to WGS84; the bbox is each row's geometry bounds
+      (+/- ``offset``) and the geometry is overlaid in red.
+    - a plain DataFrame: the bbox is the (``lon_col``, ``lat_col``) point (+/- ``offset``)
+      and the point is overlaid in red.
+
+    Args:
+        data: Records to plot. If a GeoDataFrame, its active geometry is used (and
+            reprojected to WGS84); otherwise ``lon_col``/``lat_col`` are used.
+        var_key: Variable key storage (passed to ``ZarrCatalog``).
+        var: Data variable name within the dataset. Defaults to the first data variable
+            in the ``var_key`` store (names need not match the key).
+        time_col: Name of the date column.
+        lon_col, lat_col: Coordinate columns, used only when ``data`` has no geometry.
+        offset: Half-width (in degrees) of the bbox drawn around each location.
+        max_plots: Maximum number of records to plot.
+        title_fn: Optional callable mapping a row to a plot title. Defaults to the date.
+    """
+    # Imported lazily: a module-level import would create a cycle, since
+    # zarr_catalog imports h2mare.utils (whose __init__ imports this module).
+    from h2mare.storage.zarr_catalog import ZarrCatalog
+
+    cat = ZarrCatalog(var_key)
+    is_geo = isinstance(data, gpd.GeoDataFrame)
+    if is_geo:
+        data = _to_wgs84(data)
+
+    announced = False
+    for _, row in data.head(max_plots).iterrows():
+        date = row[time_col]
+
+        if is_geo:
+            minx, miny, maxx, maxy = row.geometry.bounds
+        else:
+            minx = maxx = row[lon_col]
+            miny = maxy = row[lat_col]
+        bbox = (minx - offset, miny - offset, maxx + offset, maxy + offset)
+
+        ds = cat.open_dataset(dates=date, bbox=bbox, variables=var)  # type: ignore[arg-type]
+        if ds is None:
+            logger.warning(f"No data for record at {date}; skipping.")
+            continue
+
+        # Resolve the data variable; when unset, fall back to the first one and tell the
+        # user the full list (logged once) so they can pick a specific var and re-run.
+        field = var
+        if field is None:
+            field = next(iter(ds.data_vars))
+            if not announced:
+                logger.info(
+                    f"var not set; plotting '{field}'. Available vars for '{var_key}': "
+                    f"{list(ds.data_vars)}"
+                )
+                announced = True
+
+        fig, ax = plt.subplots()
+        ds[field].plot(ax=ax)  # type: ignore
+        if is_geo:
+            gpd.GeoSeries([row.geometry], crs=data.crs).plot(
+                ax=ax, color="red", markersize=10, zorder=5
+            )
+        else:
+            ax.scatter(row[lon_col], row[lat_col], color="red", s=10, zorder=5)
+
+        title = title_fn(row) if title_fn else str(pd.to_datetime(date).date())  # type: ignore
+        ax.set_title(title)
+        plt.show()
+        plt.close(fig)

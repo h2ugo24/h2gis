@@ -1,8 +1,88 @@
 """Tests for utils/logging.py."""
 
+import logging as stdlib_logging
 from unittest.mock import patch
 
-from h2mare.utils.logging import log_time
+from loguru import logger
+
+from h2mare.utils.logging import LOG_FILE_FORMAT, _InterceptHandler, log_time
+
+
+class TestVarContextColumn:
+    """The file format carries a `var` column filled by logger.contextualize;
+    messages outside any variable scope show '-'."""
+
+    def test_contextualize_fills_var_column(self):
+        captured: list[str] = []
+        logger.configure(extra={"var": "-"})  # mirrors configure_logging
+        sink_id = logger.add(captured.append, format=LOG_FILE_FORMAT)
+        try:
+            logger.info("outside any scope")
+            with logger.contextualize(var="sst"):
+                logger.info("inside sst scope")
+        finally:
+            logger.remove(sink_id)
+
+        outside = next(line for line in captured if "outside any scope" in line)
+        inside = next(line for line in captured if "inside sst scope" in line)
+        assert "| -" in outside
+        assert "| sst" in inside
+
+
+class TestConfigureExtractionLogging:
+    def test_routes_only_extract_scoped_records(self, tmp_path):
+        from h2mare.utils import logging as hlog
+
+        hlog._extract_configured = False
+        sink_id = hlog.configure_extraction_logging(log_path=tmp_path / "extractor.log")
+        assert sink_id is not None
+        assert hlog.configure_extraction_logging() is None  # idempotent
+        try:
+            logger.info("outside extract scope")
+            with logger.contextualize(job="extract"):
+                logger.info("inside extract scope")
+            logger.complete()
+            text = (tmp_path / "extractor.log").read_text(encoding="utf-8")
+        finally:
+            logger.remove(sink_id)
+            hlog._extract_configured = False
+
+        assert "inside extract scope" in text
+        assert "outside extract scope" not in text
+
+
+class TestInterceptHandler:
+    """Stdlib logging records (cdsapi, copernicusmarine, …) must flow into
+    loguru so they land in the same pipeline.log file sink."""
+
+    def _stdlib_logger_with_intercept(self, name: str) -> stdlib_logging.Logger:
+        lg = stdlib_logging.getLogger(name)
+        lg.setLevel(stdlib_logging.INFO)
+        lg.handlers = [_InterceptHandler()]
+        lg.propagate = False
+        return lg
+
+    def test_stdlib_record_reaches_loguru_sink(self):
+        captured: list[str] = []
+        sink_id = logger.add(captured.append, format="{level}|{message}")
+        try:
+            lg = self._stdlib_logger_with_intercept("test_intercept_a")
+            lg.info("request accepted")
+        finally:
+            logger.remove(sink_id)
+
+        assert any("INFO|request accepted" in line for line in captured)
+
+    def test_unknown_level_falls_back_to_levelno(self):
+        captured: list[str] = []
+        sink_id = logger.add(captured.append, format="{message}")
+        try:
+            lg = self._stdlib_logger_with_intercept("test_intercept_b")
+            lg.log(35, "custom level message")  # 35 has no loguru name
+        finally:
+            logger.remove(sink_id)
+
+        assert any("custom level message" in line for line in captured)
 
 
 class TestLogTime:

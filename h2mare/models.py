@@ -18,17 +18,32 @@ class KeyVarConfigEntry(msgspec.Struct):
     dataset_id_rep: str
     # Provider: "cmems", "aviso", or "cds".
     source: str
-    # Regex for extracting dates from raw filenames.
-    pattern: str
+    # Whether this variable's raw NetCDF/GRIB files are archived into the store
+    # (and kept) after conversion, or deleted per-period. Required and explicit:
+    # True keeps raw files, False deletes them.
+    archive_raw: bool
     # Near-real-time dataset identifier. Omit for reanalysis-only products.
     dataset_id_nrt: Optional[str] = None
-    # Whether to spatially subset on download (default True).
+    # CMEMS only. Chooses the copernicusmarine download API: True (default)
+    # downloads via subset() (spatial/variable subset honoring bbox/source_vars);
+    # False downloads full original files via get(). Ignored for non-CMEMS
+    # sources (aviso, cds, …), which do not consult this field.
     subset: Optional[bool] = True
     # Set True for CDS/ERA5 accumulated or averaged variables whose GRIB files
     # have a 2-D time×step coordinate grid instead of a flat time axis
     # (e.g. atm-accum-avg, radiation). Triggers a preprocess step that merges
     # the two dimensions and trims overlapping timestamps at month edges.
     merge_time_step: bool = False
+    # Regex matched (via re.search) against each raw filename to extract the
+    # date component(s); the capture groups must agree with filename_date_range:
+    #   - filename_date_range=True  -> exactly 2 groups, each a full parseable
+    #     date (start, end); the file expands to that daily range.
+    #   - filename_date_range=False -> the groups are joined with "-" and parsed
+    #     as one date (e.g. (\d{8}) -> "20210115";
+    #     (\d{4})(\d{2})(\d{2}) -> "2021-01-15").
+    # None for derived/system variables (bathy, moon, h2ds) that are never
+    # matched against downloaded filenames.
+    pattern: Optional[str] = None
     # Set True when the filename pattern has two capture groups encoding a
     # (start, end) date range (e.g. CMEMS/CDS: "2021-01-01-2021-01-31.nc").
     # Set False (default) when the pattern yields a single date
@@ -79,6 +94,24 @@ class KeyVarConfigEntry(msgspec.Struct):
         if self.depth_range is not None:
             if self.depth_range[0] >= self.depth_range[1]:
                 raise ValueError("depth_min must be less than depth_max")
+
+        # Range-mode parsing unpacks exactly two capture groups (start, end);
+        # fail fast at config load rather than deep in the convert step with a
+        # cryptic "not enough values to unpack".
+        if self.filename_date_range:
+            if self.pattern is None:
+                raise ValueError(
+                    "filename_date_range=True requires a `pattern` with 2 capture "
+                    "groups (start, end)"
+                )
+            import re
+
+            ngroups = re.compile(self.pattern).groups
+            if ngroups != 2:
+                raise ValueError(
+                    "filename_date_range=True requires `pattern` to have exactly 2 "
+                    f"capture groups (start, end); got {ngroups} in {self.pattern!r}"
+                )
 
 
 class SecretsConfig(msgspec.Struct):
