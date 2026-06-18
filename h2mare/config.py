@@ -183,6 +183,20 @@ class Settings:
                     stacklevel=2,
                 )
 
+        # `subset` only affects CMEMS downloads (subset() vs get() API choice);
+        # it is ignored for every other source. Flag it when set elsewhere so a
+        # misplaced `subset:` is not silently no-op'd.
+        misplaced_subset = [
+            k
+            for k, v in config_dict.get("variables", {}).items()
+            if isinstance(v, dict) and v.get("source") != "cmems" and "subset" in v
+        ]
+        if misplaced_subset:
+            logger.warning(
+                f"`subset` is set on non-CMEMS variable(s) {sorted(misplaced_subset)} "
+                "but only applies to CMEMS downloads — it will be ignored there."
+            )
+
         self._app_config = msgspec.convert(config_dict, AppConfig)
         return self._app_config
 
