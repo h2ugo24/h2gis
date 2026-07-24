@@ -72,6 +72,7 @@ The `bbox` here sets the spatial extent of the compiled dataset.
 | Variable | Required | Description |
 |---|---|---|
 | `STORE_ROOT` | yes | Root path for Zarr output (can be an external drive) |
+| `H2MARE_ROOT` | no | Directory containing `config.yaml` and `.env`. Overrides the default auto-detection (walking up from the current working directory). Set it when running `h2mare` from an unrelated directory or when another project imports h2mare. See [Installation](installation.md#where-to-place-these-files). |
 | `CMEMS_USERNAME` | CMEMS only | Copernicus Marine account username |
 | `CMEMS_PASSWORD` | CMEMS only | Copernicus Marine account password |
 | `AVISO_USERNAME` | AVISO only | AVISO account username |
