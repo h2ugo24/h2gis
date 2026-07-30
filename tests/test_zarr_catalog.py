@@ -613,8 +613,8 @@ def routed_catalog(tmp_path, monkeypatch):
         calls["kwargs"] = kwargs
         return "range-ds"
 
-    monkeypatch.setattr(catalog, "_open_sparse_dates", _sparse)
-    monkeypatch.setattr(catalog, "_open_date_range", _range)
+    monkeypatch.setattr(catalog._reader, "_open_sparse_dates", _sparse)
+    monkeypatch.setattr(catalog._reader, "_open_date_range", _range)
     return catalog, calls
 
 
@@ -929,7 +929,7 @@ class TestOpenDatasetIntegration:
             coords={"row": [0, 1], "col": [0, 1]},
         )
 
-        out = catalog._apply_bbox(ds, BBox(-6.0, 34.0, -4.0, 36.0))
+        out = catalog._reader._apply_bbox(ds, BBox(-6.0, 34.0, -4.0, 36.0))
 
         assert out.sizes == ds.sizes
 
@@ -959,7 +959,7 @@ class TestOpenDatasetIntegration:
             coords={"lat": [30.0, 32.0], "lon": [-10.0, -8.0]},
         )
 
-        assert catalog._normalize_time(ds) is ds
+        assert catalog._reader._normalize_time(ds) is ds
 
     def test_range_on_empty_catalog_raises(self, tmp_path):
         """Explicit dates against a store with no zarr files at all."""
