@@ -133,6 +133,24 @@ def _group_dates(
                 yield (int(year), int(month)), dates[mask]
 
 
+def _is_degenerate_axis(values: NDArray[np.float64], tol: float = 1e-6) -> bool:
+    """
+    True when a coordinate axis carries near-duplicate points.
+
+    That is the signature of an axis produced by unioning two grids that differ
+    only in floating-point representation: the smallest gap collapses to ~1e-16
+    of the nominal spacing. Native product grids are not perfectly uniform
+    either (1/12°, 1/24°, 15″ are not exactly representable), so the test is a
+    ratio against the median step rather than strict uniformity.
+    """
+    if values.size < 3:
+        return False
+    steps = np.abs(np.diff(values))
+    if (steps <= 0).any():
+        return True
+    return bool(steps.min() / np.median(steps) < tol)
+
+
 class EDDIESProcessor:
     def __init__(
         self,
@@ -281,17 +299,61 @@ class EDDIESProcessor:
                 sea_mask,
             )
 
-        if self.catalog.exists():
-            with self.catalog.open_dataset() as ds:
-                lat = ds.coords["lat"].values
-                lon = ds.coords["lon"].values
-        else:
+        grid = self._grid_from_store() if self.catalog.exists() else None
+        if grid is None:
             base_grid = GridBuilder(self.bbox, dx=dx, dy=dy).generate_grid()
             lat = base_grid.coords["lat"].values
             lon = base_grid.coords["lon"].values
+        else:
+            lat, lon = grid
 
         latlon_arr, sea_mask = create_base_grid(lat, lon)
         return GridData(lat, lon, latlon_arr, sea_mask)
+
+    def _grid_from_store(
+        self,
+    ) -> Optional[tuple[NDArray[np.float64], NDArray[np.float64]]]:
+        """
+        Read the store's established grid from a single canonical Zarr file.
+
+        Deliberately *not* ``catalog.open_dataset()``: with no arguments that
+        opens every file at once, and ``combine="by_coords"`` then takes the
+        union of their coordinate axes. Axes that differ only in the last
+        floating-point bits therefore merge into a doubled axis full of
+        near-duplicate points — and because the result is written back to the
+        store, the next run reads an even worse grid. Reading one file keeps the
+        grid a property of the store rather than of how many files it holds.
+
+        Returns ``None`` when no usable grid is available, so the caller falls
+        back to building one from the configured bbox.
+        """
+        try:
+            df = self.catalog.df
+            if df.empty:
+                return None
+            path = df.sort_values("start_date").iloc[0]["path"]
+            with xr.open_zarr(path, consolidated=False) as ds:
+                lat = ds.coords["lat"].values
+                lon = ds.coords["lon"].values
+        except Exception as e:
+            logger.warning(
+                f"[{self.var_key}] Could not read the store grid ({e}); "
+                "falling back to the configured bbox"
+            )
+            return None
+
+        for name, values in (("lat", lat), ("lon", lon)):
+            if _is_degenerate_axis(values):
+                logger.error(
+                    f"[{self.var_key}] Store grid has a degenerate {name} axis "
+                    f"({values.size} points with near-duplicate values) in "
+                    f"{Path(path).name}. Falling back to the configured bbox; "
+                    "that file was written on a unioned grid and needs "
+                    "re-converting from raw."
+                )
+                return None
+
+        return lat, lon
 
     def _get_downloaded_metadata(
         self, root_dir: Optional[Path] = None

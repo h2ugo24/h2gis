@@ -13,6 +13,7 @@ from h2mare.models import AppConfig
 from h2mare.processing.core.aviso import (
     EDDIESProcessor,
     _group_dates,
+    _is_degenerate_axis,
     find_nearest_vectorized,
     process_fsle,
 )
@@ -259,3 +260,167 @@ class TestEddiesResolveRange:
         ):
             with pytest.raises(ValueError):
                 eddies_proc._resolve_date_range(download_range)
+
+
+# ---------------------------------------------------------------------------
+# Store grid resolution
+#
+# _get_gridded_data used to read the grid from catalog.open_dataset(), which
+# with no arguments opens every file and unions their coordinate axes. Axes
+# differing only in the last floating-point bits merged into a doubled axis of
+# near-duplicate points, and because the result is written back to the store the
+# corruption compounded on every run.
+# ---------------------------------------------------------------------------
+
+
+def _canonical_axes():
+    """The store's established 0.1-degree grid."""
+    return np.arange(0.0, 5.0001, 0.1), np.arange(-10.0, 0.0001, 0.1)
+
+
+def _unioned(values):
+    """Axis as open_mfdataset would union it: each point plus a 1-ULP twin."""
+    twins = np.nextafter(values, values + 1)
+    return np.unique(np.concatenate([values, twins]))
+
+
+@pytest.fixture
+def proc_with_store(tmp_path):
+    """EDDIESProcessor whose catalog reports an existing store."""
+    download_dir = tmp_path / "downloads"
+    download_dir.mkdir()
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    with patch("h2mare.processing.core.aviso.ZarrCatalog") as MockCat:
+        cat = MockCat.return_value
+        cat.exists.return_value = True
+        cat.df = pd.DataFrame(
+            [
+                {
+                    "path": str(store_dir / "a.zarr"),
+                    "start_date": pd.Timestamp("2020-01-01"),
+                },
+                {
+                    "path": str(store_dir / "b.zarr"),
+                    "start_date": pd.Timestamp("2021-01-01"),
+                },
+            ]
+        )
+        proc = EDDIESProcessor(
+            var_key="eddies",
+            app_config=_make_config(),
+            store_root=store_dir,
+            download_root=download_dir,
+        )
+    return proc, cat
+
+
+class TestIsDegenerateAxis:
+    def test_uniform_grid_is_fine(self):
+        assert not _is_degenerate_axis(np.arange(0.0, 10.0, 0.1))
+
+    def test_native_irregular_grid_is_fine(self):
+        """A 1/12-degree grid is not exactly representable but is not degenerate."""
+        assert not _is_degenerate_axis(np.arange(0.0, 20.0, 1 / 12))
+
+    def test_unioned_axis_is_degenerate(self):
+        lat, _ = _canonical_axes()
+        assert _is_degenerate_axis(_unioned(lat))
+
+    def test_exact_duplicates_are_degenerate(self):
+        assert _is_degenerate_axis(np.array([0.0, 0.1, 0.1, 0.2]))
+
+    def test_tiny_axis_is_not_flagged(self):
+        assert not _is_degenerate_axis(np.array([0.0, 1.0]))
+
+
+class TestGridFromStore:
+    def test_does_not_open_the_whole_store(self, proc_with_store):
+        """Regression: open_dataset() unions every file's axes."""
+        proc, cat = proc_with_store
+        lat, lon = _canonical_axes()
+        with patch(
+            "h2mare.processing.core.aviso.xr.open_zarr",
+            return_value=xr.Dataset(coords={"lat": lat, "lon": lon}),
+        ):
+            proc._grid_from_store()
+
+        cat.open_dataset.assert_not_called()
+
+    def test_reads_the_earliest_file(self, proc_with_store):
+        proc, _ = proc_with_store
+        lat, lon = _canonical_axes()
+        with patch(
+            "h2mare.processing.core.aviso.xr.open_zarr",
+            return_value=xr.Dataset(coords={"lat": lat, "lon": lon}),
+        ) as mock_open:
+            proc._grid_from_store()
+
+        assert mock_open.call_args[0][0].endswith("a.zarr")
+
+    def test_returns_the_store_grid(self, proc_with_store):
+        proc, _ = proc_with_store
+        lat, lon = _canonical_axes()
+        with patch(
+            "h2mare.processing.core.aviso.xr.open_zarr",
+            return_value=xr.Dataset(coords={"lat": lat, "lon": lon}),
+        ):
+            got_lat, got_lon = proc._grid_from_store()
+
+        assert np.array_equal(got_lat, lat)
+        assert np.array_equal(got_lon, lon)
+
+    def test_degenerate_store_grid_is_rejected(self, proc_with_store):
+        """A doubled axis must not be adopted as the grid."""
+        proc, _ = proc_with_store
+        lat, lon = _canonical_axes()
+        with patch(
+            "h2mare.processing.core.aviso.xr.open_zarr",
+            return_value=xr.Dataset(coords={"lat": _unioned(lat), "lon": lon}),
+        ):
+            assert proc._grid_from_store() is None
+
+    def test_empty_catalog_returns_none(self, proc_with_store):
+        proc, cat = proc_with_store
+        cat.df = pd.DataFrame()
+
+        assert proc._grid_from_store() is None
+
+    def test_unreadable_file_returns_none(self, proc_with_store):
+        proc, _ = proc_with_store
+        with patch(
+            "h2mare.processing.core.aviso.xr.open_zarr",
+            side_effect=OSError("corrupt store"),
+        ):
+            assert proc._grid_from_store() is None
+
+
+class TestGetGriddedDataFallback:
+    def test_does_not_open_the_whole_store(self, proc_with_store):
+        """Regression, asserted through the entry point that predates the fix.
+
+        _get_gridded_data used to call catalog.open_dataset() with no arguments,
+        which opens every file and unions their coordinate axes.
+        """
+        proc, cat = proc_with_store
+        lat, lon = _canonical_axes()
+        with patch(
+            "h2mare.processing.core.aviso.xr.open_zarr",
+            return_value=xr.Dataset(coords={"lat": lat, "lon": lon}),
+        ):
+            proc._get_gridded_data(dx=0.5, dy=0.5)
+
+        cat.open_dataset.assert_not_called()
+
+    def test_falls_back_to_bbox_when_store_grid_is_degenerate(self, proc_with_store):
+        """The configured bbox wins over a corrupt store grid."""
+        proc, _ = proc_with_store
+        lat, lon = _canonical_axes()
+        with patch(
+            "h2mare.processing.core.aviso.xr.open_zarr",
+            return_value=xr.Dataset(coords={"lat": _unioned(lat), "lon": lon}),
+        ):
+            grid = proc._get_gridded_data(dx=0.5, dy=0.5)
+
+        assert not _is_degenerate_axis(grid.lat)
+        assert not _is_degenerate_axis(grid.lon)
