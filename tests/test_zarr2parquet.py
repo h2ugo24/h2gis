@@ -3,7 +3,8 @@ Unit tests for Zarr2Parquet.
 
 Covers:
 - __init__ raises ValueError when no zarr data exists
-- _resolve_date_range: all branches (explicit, first-run, incremental, up-to-date)
+- _resolve_date_range: returns a DateRange; all branches (explicit, first-run,
+  incremental, up-to-date)
 - run(): always splits by month regardless of range length
 - run(): depth filtering logic for depth-aware variables
 - sync_data(): skips when STORE_ROOT is None; copies when remote_root is given
@@ -90,13 +91,19 @@ class TestInit:
 
 
 class TestResolveDateRange:
+    def test_returns_date_range(self, tmp_path):
+        """The window is a DateRange, not a bare (start, end) tuple."""
+        z = _make_converter(tmp_path)
+        assert isinstance(z._resolve_date_range("1998-03-01", "1998-06-30"), DateRange)
+
     def test_explicit_dates_returned_unchanged(self, tmp_path):
         z = _make_converter(tmp_path)
-        start, end = z._resolve_date_range("1998-03-01", "1998-06-30")
-        assert start == pd.Timestamp("1998-03-01")
-        assert end == pd.Timestamp("1998-06-30")
+        window = z._resolve_date_range("1998-03-01", "1998-06-30")
+        assert window.start == pd.Timestamp("1998-03-01")
+        assert window.end == pd.Timestamp("1998-06-30")
 
     def test_explicit_start_after_end_raises(self, tmp_path):
+        """The argument-level message wins over DateRange's generic one."""
         z = _make_converter(tmp_path)
         with pytest.raises(ValueError, match="before end_date"):
             z._resolve_date_range("1998-12-31", "1998-01-01")
@@ -104,9 +111,9 @@ class TestResolveDateRange:
     def test_first_run_uses_full_zarr_range(self, tmp_path):
         """Empty parquet store → infer zarr_start → zarr_end."""
         z = _make_converter(tmp_path, parquet_initialized=False)
-        start, end = z._resolve_date_range(None, None)
-        assert start == pd.Timestamp("1998-01-01")
-        assert end == pd.Timestamp("1998-12-31")
+        window = z._resolve_date_range(None, None)
+        assert window.start == pd.Timestamp("1998-01-01")
+        assert window.end == pd.Timestamp("1998-12-31")
 
     def test_incremental_run_starts_after_parquet_end(self, tmp_path):
         """Existing parquet → infer parquet_end + 1 day → zarr_end."""
@@ -115,9 +122,9 @@ class TestResolveDateRange:
             parquet_initialized=True,
             parquet_end=pd.Timestamp("1998-06-30"),
         )
-        start, end = z._resolve_date_range(None, None)
-        assert start == pd.Timestamp("1998-07-01")
-        assert end == pd.Timestamp("1998-12-31")
+        window = z._resolve_date_range(None, None)
+        assert window.start == pd.Timestamp("1998-07-01")
+        assert window.end == pd.Timestamp("1998-12-31")
 
     def test_already_up_to_date_raises(self, tmp_path):
         """Inferred start beyond zarr end → nothing new to convert."""
@@ -132,9 +139,9 @@ class TestResolveDateRange:
     def test_explicit_end_only_uses_inferred_start(self, tmp_path):
         """Partial override: explicit end_date, inferred start from empty store."""
         z = _make_converter(tmp_path, parquet_initialized=False)
-        start, end = z._resolve_date_range(None, "1998-06-30")
-        assert start == pd.Timestamp("1998-01-01")  # zarr_start (empty parquet)
-        assert end == pd.Timestamp("1998-06-30")
+        window = z._resolve_date_range(None, "1998-06-30")
+        assert window.start == pd.Timestamp("1998-01-01")  # zarr_start (empty parquet)
+        assert window.end == pd.Timestamp("1998-06-30")
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +620,9 @@ class TestRunIncremental:
             patch.object(
                 z,
                 "_resolve_date_range",
-                return_value=(pd.Timestamp("2021-07-01"), pd.Timestamp("2021-12-31")),
+                return_value=DateRange(
+                    pd.Timestamp("2021-07-01"), pd.Timestamp("2021-12-31")
+                ),
             ),
             patch.object(
                 z,
