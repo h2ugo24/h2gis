@@ -253,10 +253,8 @@ class Zarr2Parquet(BaseConverter):
 
         # Mode 2 — explicit dates (or partial override).
         elif start_date is not None or end_date is not None:
-            start, end = self._resolve_date_range(start_date, end_date)
-            ok = self._convert_window(
-                DateRange(start, end), time_resolution, depth, variables
-            )
+            window = self._resolve_date_range(start_date, end_date)
+            ok = self._convert_window(window, time_resolution, depth, variables)
 
         # Mode 3 — incremental: append new dates, then backfill lagging columns.
         # Backfill groups are resolved up-front from the pre-append store metadata;
@@ -266,10 +264,8 @@ class Zarr2Parquet(BaseConverter):
             backfill_groups = self._resolve_backfill_groups()
 
             try:
-                start, end = self._resolve_date_range(None, None)
-                ok &= self._convert_window(
-                    DateRange(start, end), time_resolution, depth, None
-                )
+                window = self._resolve_date_range(None, None)
+                ok &= self._convert_window(window, time_resolution, depth, None)
             except ValueError as e:
                 logger.info(f"No new dates to append: {e}")
 
@@ -565,7 +561,7 @@ class Zarr2Parquet(BaseConverter):
         self,
         start_date: str | pd.Timestamp | None,
         end_date: str | pd.Timestamp | None,
-    ) -> tuple[pd.Timestamp, pd.Timestamp]:
+    ) -> DateRange:
         """
         Resolve the conversion window.
 
@@ -581,11 +577,13 @@ class Zarr2Parquet(BaseConverter):
         if start_date is not None and end_date is not None:
             start = pd.Timestamp(start_date)
             end = pd.Timestamp(end_date)
+            # Checked before constructing DateRange, which would otherwise raise
+            # with a generic message that does not name the offending arguments.
             if start > end:
                 raise ValueError(
                     f"start_date ({start.date()}) must be before end_date ({end.date()})"
                 )
-            return start, end
+            return DateRange(start, end)
 
         # Infer from the gap between the parquet store and the zarr store
         parquet_coverage = (
@@ -613,4 +611,4 @@ class Zarr2Parquet(BaseConverter):
             f"Inferred Parquet range for '{self.var_key}': "
             f"{start.date()} → {end.date()}"
         )
-        return start, end
+        return DateRange(start, end)
