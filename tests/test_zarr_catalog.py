@@ -173,7 +173,7 @@ class TestDatasetColumn:
         zarr_path = _write_zarr(tmp_path, ds)
         catalog = _make_catalog(tmp_path)
 
-        rows = catalog._scanner._extract_zarr_metadata(zarr_path)
+        rows = catalog._index._scanner._extract_zarr_metadata(zarr_path)
 
         assert len(rows) == 1
         assert rows[0]["dataset"] == _ENTRY["dataset_id_rep"]
@@ -202,7 +202,7 @@ class TestDatasetColumn:
         zarr.consolidate_metadata(str(zarr_path))
         catalog = _make_catalog(tmp_path)
 
-        rows = catalog._scanner._extract_zarr_metadata(zarr_path)
+        rows = catalog._index._scanner._extract_zarr_metadata(zarr_path)
 
         assert len(rows) == 2
         assert rows[0]["dataset"] == "REP_ID"
@@ -233,7 +233,7 @@ class TestDatasetColumn:
         )
         catalog = _make_catalog(tmp_path)
 
-        rows = catalog._scanner._extract_zarr_metadata(zarr_path)
+        rows = catalog._index._scanner._extract_zarr_metadata(zarr_path)
 
         assert len(rows) == 2
         assert rows[0]["dataset"] == "REP_ID"
@@ -242,7 +242,7 @@ class TestDatasetColumn:
     def test_get_paths_in_range_deduplicates(self, tmp_path):
         zarr_path = tmp_path / "dummy.zarr"
         catalog = _make_catalog(tmp_path)
-        catalog._df_cache = _two_row_df(zarr_path)
+        catalog._index._df_cache = _two_row_df(zarr_path)
 
         result = catalog.get_paths_in_range("2023-01-01", "2023-12-31")
 
@@ -251,7 +251,7 @@ class TestDatasetColumn:
     def test_map_dates_to_paths_with_split_rows(self, tmp_path):
         zarr_path = tmp_path / "dummy.zarr"
         catalog = _make_catalog(tmp_path)
-        catalog._df_cache = _two_row_df(zarr_path)
+        catalog._index._df_cache = _two_row_df(zarr_path)
 
         result = catalog.map_dates_to_paths(["2023-03-15", "2023-09-20"])
 
@@ -273,7 +273,7 @@ class TestDatasetColumn:
         catalog.catalog_path.parent.mkdir(parents=True, exist_ok=True)
         old_df.to_parquet(catalog.catalog_path, index=False)
 
-        df = catalog._load_from_disk()
+        df = catalog._index._load_from_disk()
 
         assert "dataset" in df.columns
         assert (df["dataset"] == _ENTRY["dataset_id_rep"]).all()
@@ -339,7 +339,7 @@ class TestVarsNonnullEnd:
         ds = _make_padded_ds("2026-05-01", n_days=15, n_valid=10, var="ac_amp")
         zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
         catalog = _make_catalog(tmp_path)
-        catalog._df_cache = _df_for_zarr(zarr_path, ["ac_amp"], "2026-05-15")
+        catalog._index._df_cache = _df_for_zarr(zarr_path, ["ac_amp"], "2026-05-15")
 
         result = catalog.get_vars_nonnull_end(["ac_amp"])
 
@@ -351,7 +351,9 @@ class TestVarsNonnullEnd:
         ds = _make_padded_ds("2026-05-01", n_days=15, n_valid=12, var="ac_amp")
         zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
         catalog = _make_catalog(tmp_path)
-        catalog._df_cache = _df_for_zarr(zarr_path, np.array(["ac_amp"]), "2026-05-15")
+        catalog._index._df_cache = _df_for_zarr(
+            zarr_path, np.array(["ac_amp"]), "2026-05-15"
+        )
 
         result = catalog.get_vars_nonnull_end(["ac_amp"])
 
@@ -361,7 +363,7 @@ class TestVarsNonnullEnd:
         ds = _make_padded_ds("2026-05-01", n_days=5, n_valid=5, var="ac_amp")
         zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
         catalog = _make_catalog(tmp_path)
-        catalog._df_cache = _df_for_zarr(zarr_path, ["ac_amp"], "2026-05-05")
+        catalog._index._df_cache = _df_for_zarr(zarr_path, ["ac_amp"], "2026-05-05")
 
         assert catalog.get_vars_nonnull_end(["not_a_var"]) == {}
 
@@ -369,7 +371,7 @@ class TestVarsNonnullEnd:
         # Regression: ndarray cells previously made membership checks always
         # false, so this silently returned None for disk-loaded catalogs.
         catalog = _make_catalog(tmp_path)
-        catalog._df_cache = _df_for_zarr(
+        catalog._index._df_cache = _df_for_zarr(
             tmp_path / "h2ds_2026.zarr", np.array(["ac_amp", "c_amp"]), "2026-05-15"
         )
 
@@ -405,11 +407,11 @@ class TestGetBbox:
 # ---------------------------------------------------------------------------
 # Catalog cache semantics (_df_cache / auto_refresh)
 #
-# Characterization tests: these pin the *current* behaviour of the only mutable
-# state on ZarrCatalog (``_df_cache``, written solely by refresh/df/reload).
-# They are not regression tests for a bug — they exist so the refresh/scan
-# contract stays observable if the persistence and dataset-access halves of
-# this class are ever separated.
+# Characterization tests over ZarrIndex, driven through the ZarrCatalog facade
+# so both the delegation and the underlying contract stay covered. ``_df_cache``
+# is the only mutable state involved, written solely by refresh/df/reload.
+# They are not regression tests for a bug — they pin the refresh/scan contract
+# so it stays observable as this class is split up.
 # ---------------------------------------------------------------------------
 
 
@@ -461,7 +463,7 @@ def _catalog_with_scanner(tmp_path, scanner, *, auto_refresh: bool = False):
         metadata_root=tmp_path / "metadata",
         auto_refresh=False,
     )
-    catalog._scanner = scanner
+    catalog._index._scanner = scanner
     catalog.auto_refresh = auto_refresh
     return catalog
 
@@ -485,7 +487,7 @@ class TestCacheSemantics:
         """
         scanner = _FakeScanner(changes=False)
         catalog = _catalog_with_scanner(tmp_path, scanner, auto_refresh=True)
-        catalog._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
+        catalog._index._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
 
         catalog.df
         catalog.df
@@ -496,7 +498,7 @@ class TestCacheSemantics:
     def test_refresh_uses_cache_when_no_changes(self, tmp_path):
         scanner = _FakeScanner(changes=False)
         catalog = _catalog_with_scanner(tmp_path, scanner)
-        catalog._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
+        catalog._index._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
 
         catalog.refresh()
 
@@ -505,7 +507,7 @@ class TestCacheSemantics:
     def test_refresh_force_rescans_when_no_changes(self, tmp_path):
         scanner = _FakeScanner([_record(tmp_path / "a.zarr")], changes=False)
         catalog = _catalog_with_scanner(tmp_path, scanner)
-        catalog._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
+        catalog._index._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
 
         catalog.refresh(force=True)
 
@@ -514,7 +516,7 @@ class TestCacheSemantics:
     def test_reload_clears_cache_and_resets_scanner(self, tmp_path):
         scanner = _FakeScanner([_record(tmp_path / "a.zarr")], changes=False)
         catalog = _catalog_with_scanner(tmp_path, scanner)
-        catalog._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
+        catalog._index._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
 
         catalog.reload()
 
@@ -653,7 +655,7 @@ class TestOpenDatasetRouting:
     def test_no_args_falls_back_to_time_coverage(self, routed_catalog, tmp_path):
         """With no dates at all, the full catalog extent becomes the window."""
         catalog, calls = routed_catalog
-        catalog._df_cache = pd.DataFrame(
+        catalog._index._df_cache = pd.DataFrame(
             [
                 _record(tmp_path / "a.zarr", "2020-01-01", "2020-06-30"),
                 _record(tmp_path / "b.zarr", "2020-07-01", "2020-12-31"),
@@ -668,7 +670,7 @@ class TestOpenDatasetRouting:
 
     def test_no_args_without_coverage_raises(self, routed_catalog):
         catalog, calls = routed_catalog
-        catalog._df_cache = pd.DataFrame()
+        catalog._index._df_cache = pd.DataFrame()
 
         with pytest.raises(ValueError, match="Please provide sparse"):
             catalog.open_dataset()

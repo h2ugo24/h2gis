@@ -20,10 +20,12 @@ from .xarray_helpers import (
     xr_float64_to_float32,
 )
 from .zarr_catalog import ZarrCatalog
+from .zarr_index import ZarrIndex
 from .zarr_scanner import ZarrDirectoryScanner
 
 __all__ = [
     "ZarrCatalog",
+    "ZarrIndex",
     "ZarrDirectoryScanner",
     "ParquetIndexer",
     "ParquetStore",
