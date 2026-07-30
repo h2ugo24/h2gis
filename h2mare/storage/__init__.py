@@ -21,11 +21,13 @@ from .xarray_helpers import (
 )
 from .zarr_catalog import ZarrCatalog
 from .zarr_index import ZarrIndex
+from .zarr_reader import ZarrReader
 from .zarr_scanner import ZarrDirectoryScanner
 
 __all__ = [
     "ZarrCatalog",
     "ZarrIndex",
+    "ZarrReader",
     "ZarrDirectoryScanner",
     "ParquetIndexer",
     "ParquetStore",
