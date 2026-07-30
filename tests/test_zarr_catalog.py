@@ -5,6 +5,7 @@ import json
 import msgspec
 import numpy as np
 import pandas as pd
+import pytest
 import xarray as xr
 
 from h2mare.models import AppConfig
@@ -399,3 +400,293 @@ class TestGetBbox:
         catalog = _make_catalog(tmp_path)
         catalog.var_config.bbox = BBox(-10.0, 30.0, 0.0, 40.0)
         assert catalog.get_bbox() == BBox(-10.0, 30.0, 0.0, 40.0)
+
+
+# ---------------------------------------------------------------------------
+# Catalog cache semantics (_df_cache / auto_refresh)
+#
+# Characterization tests: these pin the *current* behaviour of the only mutable
+# state on ZarrCatalog (``_df_cache``, written solely by refresh/df/reload).
+# They are not regression tests for a bug — they exist so the refresh/scan
+# contract stays observable if the persistence and dataset-access halves of
+# this class are ever separated.
+# ---------------------------------------------------------------------------
+
+
+class _FakeScanner:
+    """Counting stand-in for ZarrDirectoryScanner.
+
+    Records how often the store is scanned and how often it is interrogated
+    for changes, so tests can assert on rescan behaviour rather than on IO.
+    """
+
+    def __init__(self, records=None, changes: bool = False):
+        self._records = records if records is not None else []
+        self.changes = changes
+        self.scan_calls = 0
+        self.has_changes_calls = 0
+        self.reset_calls = 0
+
+    def scan(self):
+        self.scan_calls += 1
+        return list(self._records)
+
+    def has_changes(self) -> bool:
+        self.has_changes_calls += 1
+        return self.changes
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+
+def _record(path, start="2020-01-01", end="2020-12-31") -> dict:
+    return {
+        "path": str(path),
+        "filename": path.name,
+        "start_date": pd.Timestamp(start),
+        "end_date": pd.Timestamp(end),
+    }
+
+
+def _catalog_with_scanner(tmp_path, scanner, *, auto_refresh: bool = False):
+    """Catalog wired to *scanner*, with metadata kept inside tmp_path.
+
+    Built with auto_refresh=False so no scan happens during __init__; the flag
+    is applied afterwards, once the fake scanner is in place.
+    """
+    catalog = ZarrCatalog(
+        "sst",
+        app_config=_make_app_config(),
+        store_root=tmp_path,
+        metadata_root=tmp_path / "metadata",
+        auto_refresh=False,
+    )
+    catalog._scanner = scanner
+    catalog.auto_refresh = auto_refresh
+    return catalog
+
+
+class TestCacheSemantics:
+    def test_auto_refresh_false_scans_once(self, tmp_path):
+        """With auto_refresh=False the store is scanned once and cached."""
+        scanner = _FakeScanner([_record(tmp_path / "a.zarr")], changes=True)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+
+        catalog.df
+        catalog.df
+
+        assert scanner.scan_calls == 1
+
+    def test_auto_refresh_true_rechecks_on_every_access(self, tmp_path):
+        """With auto_refresh=True every .df access re-interrogates the store.
+
+        This is the documented cost behind the snapshot comment in
+        map_dates_to_paths — one directory stat per access, not per call site.
+        """
+        scanner = _FakeScanner(changes=False)
+        catalog = _catalog_with_scanner(tmp_path, scanner, auto_refresh=True)
+        catalog._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
+
+        catalog.df
+        catalog.df
+
+        assert scanner.has_changes_calls == 2
+        assert scanner.scan_calls == 0
+
+    def test_refresh_uses_cache_when_no_changes(self, tmp_path):
+        scanner = _FakeScanner(changes=False)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+        catalog._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
+
+        catalog.refresh()
+
+        assert scanner.scan_calls == 0
+
+    def test_refresh_force_rescans_when_no_changes(self, tmp_path):
+        scanner = _FakeScanner([_record(tmp_path / "a.zarr")], changes=False)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+        catalog._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
+
+        catalog.refresh(force=True)
+
+        assert scanner.scan_calls == 1
+
+    def test_reload_clears_cache_and_resets_scanner(self, tmp_path):
+        scanner = _FakeScanner([_record(tmp_path / "a.zarr")], changes=False)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+        catalog._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
+
+        catalog.reload()
+
+        assert scanner.reset_calls == 1
+        assert scanner.scan_calls == 1
+
+    def test_missing_catalog_file_triggers_initial_scan(self, tmp_path):
+        """No catalog parquet on disk: the store is scanned to build one."""
+        scanner = _FakeScanner([_record(tmp_path / "a.zarr")], changes=False)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+        assert not catalog.exists()
+
+        catalog.refresh()
+
+        assert scanner.scan_calls == 1
+        assert catalog.exists()
+
+    def test_stale_catalog_on_disk_triggers_rescan(self, tmp_path):
+        """A catalog that disagrees with the store directory is rebuilt.
+
+        The scanner reports no changes, so only the disk-vs-catalog filename
+        comparison can catch that b.zarr was added out of band.
+        """
+        (tmp_path / "a.zarr").mkdir()
+        (tmp_path / "b.zarr").mkdir()
+        scanner = _FakeScanner(
+            [_record(tmp_path / "a.zarr"), _record(tmp_path / "b.zarr")],
+            changes=False,
+        )
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+        # Catalog on disk knows about a.zarr only.
+        catalog.catalog_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([_record(tmp_path / "a.zarr")]).to_parquet(
+            catalog.catalog_path, index=False
+        )
+
+        df = catalog.refresh()
+
+        assert scanner.scan_calls == 1
+        assert set(df["filename"]) == {"a.zarr", "b.zarr"}
+
+    def test_fresh_catalog_on_disk_is_loaded_without_rescan(self, tmp_path):
+        """Catalog and store agree: load from parquet, do not rescan."""
+        (tmp_path / "a.zarr").mkdir()
+        scanner = _FakeScanner([_record(tmp_path / "a.zarr")], changes=False)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+        catalog.catalog_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([_record(tmp_path / "a.zarr")]).to_parquet(
+            catalog.catalog_path, index=False
+        )
+
+        catalog.refresh()
+
+        assert scanner.scan_calls == 0
+
+    def test_has_changes_delegates_to_scanner(self, tmp_path):
+        scanner = _FakeScanner(changes=True)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+
+        assert catalog.has_changes() is True
+        assert scanner.has_changes_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# open_dataset routing
+#
+# Characterization tests for the dispatch contract only: the sparse/range
+# split, the mutually-exclusive-modes guard, the no-argument fallback and
+# bbox coercion. The zarr IO inside each branch is stubbed out on purpose.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def routed_catalog(tmp_path, monkeypatch):
+    """Catalog whose two open paths are replaced by call recorders."""
+    catalog = ZarrCatalog(
+        "sst",
+        app_config=_make_app_config(),
+        store_root=tmp_path,
+        metadata_root=tmp_path / "metadata",
+        auto_refresh=False,
+    )
+    calls: dict = {}
+
+    def _sparse(**kwargs):
+        calls["mode"] = "sparse"
+        calls["kwargs"] = kwargs
+        return "sparse-ds"
+
+    def _range(**kwargs):
+        calls["mode"] = "range"
+        calls["kwargs"] = kwargs
+        return "range-ds"
+
+    monkeypatch.setattr(catalog, "_open_sparse_dates", _sparse)
+    monkeypatch.setattr(catalog, "_open_date_range", _range)
+    return catalog, calls
+
+
+class TestOpenDatasetRouting:
+    def test_dates_route_to_sparse(self, routed_catalog):
+        catalog, calls = routed_catalog
+
+        result = catalog.open_dataset(dates=["2020-01-15", "2020-06-20"])
+
+        assert result == "sparse-ds"
+        assert calls["mode"] == "sparse"
+        assert calls["kwargs"]["dates"] == ["2020-01-15", "2020-06-20"]
+
+    def test_start_end_route_to_date_range(self, routed_catalog):
+        catalog, calls = routed_catalog
+
+        result = catalog.open_dataset(start_date="2020-01-01", end_date="2020-12-31")
+
+        assert result == "range-ds"
+        assert calls["mode"] == "range"
+        assert calls["kwargs"]["start_date"] == "2020-01-01"
+        assert calls["kwargs"]["end_date"] == "2020-12-31"
+
+    def test_start_only_routes_to_date_range(self, routed_catalog):
+        catalog, calls = routed_catalog
+
+        catalog.open_dataset(start_date="2020-01-01")
+
+        assert calls["mode"] == "range"
+        assert calls["kwargs"]["end_date"] is None
+
+    def test_both_modes_raise(self, routed_catalog):
+        catalog, calls = routed_catalog
+
+        with pytest.raises(ValueError, match="Cannot use both"):
+            catalog.open_dataset(dates=["2020-01-15"], start_date="2020-01-01")
+
+        assert calls == {}
+
+    def test_no_args_falls_back_to_time_coverage(self, routed_catalog, tmp_path):
+        """With no dates at all, the full catalog extent becomes the window."""
+        catalog, calls = routed_catalog
+        catalog._df_cache = pd.DataFrame(
+            [
+                _record(tmp_path / "a.zarr", "2020-01-01", "2020-06-30"),
+                _record(tmp_path / "b.zarr", "2020-07-01", "2020-12-31"),
+            ]
+        )
+
+        catalog.open_dataset()
+
+        assert calls["mode"] == "range"
+        assert calls["kwargs"]["start_date"] == pd.Timestamp("2020-01-01")
+        assert calls["kwargs"]["end_date"] == pd.Timestamp("2020-12-31")
+
+    def test_no_args_without_coverage_raises(self, routed_catalog):
+        catalog, calls = routed_catalog
+        catalog._df_cache = pd.DataFrame()
+
+        with pytest.raises(ValueError, match="Please provide sparse"):
+            catalog.open_dataset()
+
+        assert calls == {}
+
+    def test_bbox_tuple_is_coerced(self, routed_catalog):
+        """A raw tuple is normalised to BBox before reaching the open path."""
+        catalog, calls = routed_catalog
+
+        catalog.open_dataset(dates=["2020-01-15"], bbox=(-10.0, 30.0, 0.0, 40.0))
+
+        assert calls["kwargs"]["bbox"] == BBox(-10.0, 30.0, 0.0, 40.0)
+
+    def test_bbox_instance_passes_through(self, routed_catalog):
+        catalog, calls = routed_catalog
+        bbox = BBox(-10.0, 30.0, 0.0, 40.0)
+
+        catalog.open_dataset(dates=["2020-01-15"], bbox=bbox)
+
+        assert calls["kwargs"]["bbox"] is bbox
