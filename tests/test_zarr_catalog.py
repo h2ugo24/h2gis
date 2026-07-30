@@ -1,12 +1,14 @@
 """Tests for ZarrCatalog: build_file_path, dataset column, and provenance sidecars."""
 
 import json
+from typing import Sequence
 
 import msgspec
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
+from loguru import logger
 
 from h2mare.models import AppConfig
 from h2mare.storage.zarr_catalog import ZarrCatalog
@@ -692,3 +694,276 @@ class TestOpenDatasetRouting:
         catalog.open_dataset(dates=["2020-01-15"], bbox=bbox)
 
         assert calls["kwargs"]["bbox"] is bbox
+
+
+# ---------------------------------------------------------------------------
+# open_dataset — integration
+#
+# These drive the real opening paths against real Zarr stores on disk:
+# _open_sparse_dates, _open_date_range, _preprocess_dataset, _apply_bbox and
+# _normalize_time. Nothing is mocked — the catalog scans the files it is given
+# and xr.open_mfdataset actually reads them.
+#
+# The routing tests above cover which branch runs; these cover what each branch
+# does. Together they are the safety net for moving this logic into its own
+# class.
+# ---------------------------------------------------------------------------
+
+# 2-degree grid, so a one-cell bbox pad is unambiguous in assertions.
+_LATS = [30.0, 32.0, 34.0, 36.0, 38.0, 40.0]
+_LONS = [-10.0, -8.0, -6.0, -4.0, -2.0, 0.0]
+
+
+def _grid_ds(
+    start: str,
+    n_days: int,
+    *,
+    variables: Sequence[str] = ("sst",),
+    hour: int = 0,
+    lat_descending: bool = False,
+) -> xr.Dataset:
+    """Gridded dataset on the 6x6 test grid, one value per (time, lat, lon)."""
+    times = pd.date_range(f"{start} {hour:02d}:00", periods=n_days, freq="D")
+    lats = list(reversed(_LATS)) if lat_descending else list(_LATS)
+    data = {
+        name: (
+            ["time", "lat", "lon"],
+            np.full((n_days, len(lats), len(_LONS)), float(i + 1)),
+        )
+        for i, name in enumerate(variables)
+    }
+    return xr.Dataset(
+        data,
+        coords={"time": times, "lat": lats, "lon": list(_LONS)},
+    )
+
+
+def _scanned_catalog(tmp_path, datasets: dict, *, verbose: bool = False) -> ZarrCatalog:
+    """Write *datasets* as zarr stores, then return a catalog that scanned them.
+
+    Built with auto_refresh=True and a tmp metadata root, so the catalog rows
+    come from the real scanner rather than an injected DataFrame.
+    """
+    for name, ds in datasets.items():
+        _write_zarr(tmp_path, ds, name=name)
+    return ZarrCatalog(
+        "sst",
+        app_config=_make_app_config(),
+        store_root=tmp_path,
+        metadata_root=tmp_path / "metadata",
+        auto_refresh=True,
+        verbose=verbose,
+    )
+
+
+@pytest.fixture
+def warnings_logged():
+    """Collect loguru WARNING messages (the catalog logs via loguru, not stdlib)."""
+    messages: list[str] = []
+    sink_id = logger.add(
+        lambda m: messages.append(m.record["message"]), level="WARNING"
+    )
+    yield messages
+    logger.remove(sink_id)
+
+
+@pytest.fixture
+def two_file_catalog(tmp_path):
+    """Catalog over two zarr files: 2020-01-01..01-10 and 2020-02-01..02-10."""
+    return _scanned_catalog(
+        tmp_path,
+        {
+            "sst_2020a.zarr": _grid_ds("2020-01-01", 10),
+            "sst_2020b.zarr": _grid_ds("2020-02-01", 10),
+        },
+    )
+
+
+class TestOpenDatasetIntegration:
+    def test_catalog_scanned_both_files(self, two_file_catalog):
+        """Guard for the tests below: the fixture really did index two stores."""
+        assert two_file_catalog.df["path"].nunique() == 2
+
+    # ---- date range mode ----
+
+    def test_range_spans_both_files(self, two_file_catalog):
+        ds = two_file_catalog.open_dataset(
+            start_date="2020-01-01", end_date="2020-02-10"
+        )
+        assert ds.sizes["time"] == 20
+        assert pd.Timestamp(ds.time.values[0]) == pd.Timestamp("2020-01-01")
+        assert pd.Timestamp(ds.time.values[-1]) == pd.Timestamp("2020-02-10")
+
+    def test_range_within_one_file(self, two_file_catalog):
+        ds = two_file_catalog.open_dataset(
+            start_date="2020-01-03", end_date="2020-01-05"
+        )
+        assert ds.sizes["time"] == 3
+
+    def test_range_start_before_coverage_returns_available_data(self, two_file_catalog):
+        """A too-early start opens from what exists rather than failing."""
+        ds = two_file_catalog.open_dataset(
+            start_date="2015-01-01", end_date="2020-01-05"
+        )
+        assert pd.Timestamp(ds.time.values[0]) == pd.Timestamp("2020-01-01")
+
+    def test_range_end_after_coverage_returns_available_data(self, two_file_catalog):
+        ds = two_file_catalog.open_dataset(
+            start_date="2020-02-01", end_date="2030-01-01"
+        )
+        assert pd.Timestamp(ds.time.values[-1]) == pd.Timestamp("2020-02-10")
+
+    def test_out_of_range_request_warns_about_clamping(self, tmp_path, warnings_logged):
+        """The clamp itself is only observable in the log.
+
+        ``ds.sel(time=slice(...))`` clips to what exists regardless, so asserting
+        on the returned times cannot distinguish a clamped request from an
+        unclamped one — only the warning can.
+        """
+        catalog = _scanned_catalog(
+            tmp_path, {"sst_2020.zarr": _grid_ds("2020-01-01", 10)}, verbose=True
+        )
+
+        catalog.open_dataset(start_date="2015-01-01", end_date="2030-01-01")
+
+        assert sum("not available" in m for m in warnings_logged) == 2
+
+    def test_in_range_request_does_not_warn(self, tmp_path, warnings_logged):
+        catalog = _scanned_catalog(
+            tmp_path, {"sst_2020.zarr": _grid_ds("2020-01-01", 10)}, verbose=True
+        )
+
+        catalog.open_dataset(start_date="2020-01-02", end_date="2020-01-05")
+
+        assert not any("not available" in m for m in warnings_logged)
+
+    def test_range_entirely_outside_coverage_raises(self, two_file_catalog):
+        with pytest.raises(FileNotFoundError, match="No zarr files found"):
+            two_file_catalog.open_dataset(
+                start_date="2030-01-01", end_date="2030-02-01"
+            )
+
+    def test_no_dates_opens_full_extent(self, two_file_catalog):
+        ds = two_file_catalog.open_dataset()
+        assert ds.sizes["time"] == 20
+
+    # ---- sparse dates mode ----
+
+    def test_sparse_dates_across_files(self, two_file_catalog):
+        ds = two_file_catalog.open_dataset(dates=["2020-01-05", "2020-02-03"])
+        got = [pd.Timestamp(t) for t in ds.time.values]
+        assert got == [pd.Timestamp("2020-01-05"), pd.Timestamp("2020-02-03")]
+
+    def test_sparse_dates_partially_missing_returns_the_rest(self, two_file_catalog):
+        """A date inside the store span but absent from any file is dropped."""
+        ds = two_file_catalog.open_dataset(dates=["2020-01-05", "2020-01-20"])
+        got = [pd.Timestamp(t) for t in ds.time.values]
+        assert got == [pd.Timestamp("2020-01-05")]
+
+    def test_sparse_dates_none_present_raises(self, two_file_catalog):
+        with pytest.raises(FileNotFoundError, match="No zarr files contain dates"):
+            two_file_catalog.open_dataset(dates=["1999-01-01"])
+
+    def test_sparse_empty_date_list_raises(self, two_file_catalog):
+        with pytest.raises(ValueError, match="No valid dates provided"):
+            two_file_catalog.open_dataset(dates=[])
+
+    # ---- variable selection (_preprocess_dataset) ----
+
+    def test_variables_subset_is_applied(self, tmp_path):
+        catalog = _scanned_catalog(
+            tmp_path,
+            {"multi.zarr": _grid_ds("2020-01-01", 3, variables=("sst", "chl"))},
+        )
+        ds = catalog.open_dataset(
+            start_date="2020-01-01", end_date="2020-01-03", variables=["sst"]
+        )
+        assert set(ds.data_vars) == {"sst"}
+
+    def test_variables_accepts_a_plain_string(self, tmp_path):
+        catalog = _scanned_catalog(
+            tmp_path,
+            {"multi.zarr": _grid_ds("2020-01-01", 3, variables=("sst", "chl"))},
+        )
+        ds = catalog.open_dataset(
+            start_date="2020-01-01", end_date="2020-01-03", variables="chl"
+        )
+        assert set(ds.data_vars) == {"chl"}
+
+    def test_unknown_variable_falls_back_to_all(self, tmp_path):
+        """None of the requested variables exist: warn and keep the dataset whole."""
+        catalog = _scanned_catalog(
+            tmp_path,
+            {"multi.zarr": _grid_ds("2020-01-01", 3, variables=("sst", "chl"))},
+        )
+        ds = catalog.open_dataset(
+            start_date="2020-01-01", end_date="2020-01-03", variables=["not_a_var"]
+        )
+        assert set(ds.data_vars) == {"sst", "chl"}
+
+    # ---- bbox (_apply_bbox) ----
+
+    def test_bbox_subsets_with_one_cell_padding(self, two_file_catalog):
+        """sel_padded_bbox keeps one grid cell beyond each requested edge."""
+        ds = two_file_catalog.open_dataset(
+            start_date="2020-01-01",
+            end_date="2020-01-03",
+            bbox=(-6.0, 34.0, -4.0, 36.0),
+        )
+        assert list(ds.lat.values) == [32.0, 34.0, 36.0, 38.0]
+        assert list(ds.lon.values) == [-8.0, -6.0, -4.0, -2.0]
+
+    def test_bbox_accepts_a_bbox_instance(self, two_file_catalog):
+        ds = two_file_catalog.open_dataset(
+            start_date="2020-01-01",
+            end_date="2020-01-03",
+            bbox=BBox(-6.0, 34.0, -4.0, 36.0),
+        )
+        assert list(ds.lat.values) == [32.0, 34.0, 36.0, 38.0]
+
+    def test_bbox_without_lat_lon_coords_returns_dataset_unchanged(self, tmp_path):
+        """Degenerate grid: log and pass through rather than raise."""
+        catalog = _make_catalog(tmp_path)
+        ds = xr.Dataset(
+            {"sst": (["row", "col"], np.ones((2, 2)))},
+            coords={"row": [0, 1], "col": [0, 1]},
+        )
+
+        out = catalog._apply_bbox(ds, BBox(-6.0, 34.0, -4.0, 36.0))
+
+        assert out.sizes == ds.sizes
+
+    # ---- lat ordering + time normalisation ----
+
+    def test_descending_lat_is_sorted_ascending(self, tmp_path):
+        """ERA5-style north-to-south grids are flipped so slicing works."""
+        catalog = _scanned_catalog(
+            tmp_path,
+            {"desc.zarr": _grid_ds("2020-01-01", 3, lat_descending=True)},
+        )
+        ds = catalog.open_dataset(start_date="2020-01-01", end_date="2020-01-03")
+        assert list(ds.lat.values) == sorted(_LATS)
+
+    def test_time_of_day_is_normalised_to_midnight(self, tmp_path):
+        catalog = _scanned_catalog(
+            tmp_path, {"noon.zarr": _grid_ds("2020-01-01", 3, hour=12)}
+        )
+        ds = catalog.open_dataset(start_date="2020-01-01", end_date="2020-01-03")
+        assert all(pd.Timestamp(t).hour == 0 for t in ds.time.values)
+
+    def test_normalize_time_passes_through_without_time_coord(self, tmp_path):
+        """Static fields (e.g. bathy) have no time axis and must survive intact."""
+        catalog = _make_catalog(tmp_path)
+        ds = xr.Dataset(
+            {"bathy": (["lat", "lon"], np.ones((2, 2)))},
+            coords={"lat": [30.0, 32.0], "lon": [-10.0, -8.0]},
+        )
+
+        assert catalog._normalize_time(ds) is ds
+
+    def test_range_on_empty_catalog_raises(self, tmp_path):
+        """Explicit dates against a store with no zarr files at all."""
+        catalog = _scanned_catalog(tmp_path, {})
+
+        with pytest.raises(FileNotFoundError, match="Catalog is empty"):
+            catalog.open_dataset(start_date="2020-01-01", end_date="2020-01-03")
