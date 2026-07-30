@@ -254,7 +254,13 @@ class Zarr2Parquet(BaseConverter):
         # Mode 2 — explicit dates (or partial override).
         elif start_date is not None or end_date is not None:
             window = self._resolve_date_range(start_date, end_date)
-            ok = self._convert_window(window, time_resolution, depth, variables)
+            # A partial override can resolve to nothing left to convert; that is
+            # a no-op, not a failure (_resolve_date_range logs the reason).
+            ok = (
+                True
+                if window is None
+                else self._convert_window(window, time_resolution, depth, variables)
+            )
 
         # Mode 3 — incremental: append new dates, then backfill lagging columns.
         # Backfill groups are resolved up-front from the pre-append store metadata;
@@ -263,11 +269,12 @@ class Zarr2Parquet(BaseConverter):
             ok = True
             backfill_groups = self._resolve_backfill_groups()
 
-            try:
-                window = self._resolve_date_range(None, None)
+            # A ``None`` window means there is nothing new to append; backfill
+            # still runs below. Errors from _convert_window now propagate instead
+            # of being swallowed as "nothing to append".
+            window = self._resolve_date_range(None, None)
+            if window is not None:
                 ok &= self._convert_window(window, time_resolution, depth, None)
-            except ValueError as e:
-                logger.info(f"No new dates to append: {e}")
 
             for window, cols in backfill_groups:
                 logger.info(
@@ -561,7 +568,7 @@ class Zarr2Parquet(BaseConverter):
         self,
         start_date: str | pd.Timestamp | None,
         end_date: str | pd.Timestamp | None,
-    ) -> DateRange:
+    ) -> DateRange | None:
         """
         Resolve the conversion window.
 
@@ -570,9 +577,17 @@ class Zarr2Parquet(BaseConverter):
         2. Incremental gap: ``parquet_end + 1 day`` → ``zarr_end``.
         3. First run: ``zarr_start`` → ``zarr_end`` (parquet store empty).
 
+        Mirrors :func:`h2mare.utils.date_range.resolve_date_range`: an inferred
+        range that has nothing left to convert is a clean no-op (``None``), while
+        explicitly supplied dates in the wrong order stay a caller error.
+
+        Returns:
+            The window to convert, or ``None`` when the range was inferred and
+            the Parquet store is already up to date — callers should skip rather
+            than treat it as an error.
+
         Raises:
-            ValueError: If explicit start > end, or the inferred start
-                is already past the zarr end (nothing new to convert).
+            ValueError: If both dates are supplied explicitly and start > end.
         """
         if start_date is not None and end_date is not None:
             start = pd.Timestamp(start_date)
@@ -602,10 +617,11 @@ class Zarr2Parquet(BaseConverter):
         end = pd.Timestamp(end_date) if end_date is not None else self.repo_end
 
         if start > end:
-            raise ValueError(
-                f"Parquet store is already up to date "
+            logger.info(
+                f"Parquet store for '{self.var_key}' is already up to date "
                 f"(inferred start {start.date()} > zarr end {end.date()})."
             )
+            return None
 
         logger.debug(
             f"Inferred Parquet range for '{self.var_key}': "
