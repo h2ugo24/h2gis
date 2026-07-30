@@ -1,5 +1,6 @@
 """Tests for AVISODownloader.get_rep_availability and get_nrt_availability."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import msgspec
@@ -8,7 +9,7 @@ import pytest
 
 from h2mare.downloader.aviso_downloader import AVISODownloader
 from h2mare.models import AppConfig
-from h2mare.types import DateRange
+from h2mare.types import DateRange, FTPDownloadTask
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -311,3 +312,156 @@ class TestDownloadFile:
 
         # After reconnect, adjust_ftp_path_to_dataset must navigate to the dataset dir.
         new_ftp.cwd.assert_called_with("/dataset/fsle/rep")
+
+
+# ---------------------------------------------------------------------------
+# Download manifest
+#
+# Netcdf2Zarr._write_provenance returns early when no manifest is present, so
+# without one every converted AVISO Zarr is missing `source_datasets` and the
+# catalog scanner falls back to dataset_id_rep — labelling near-real-time data
+# as delayed-time. Only CMEMSDownloader used to write one.
+# ---------------------------------------------------------------------------
+
+_EDDIES_ENTRY = {
+    "local_folder": "AVISO_Eddy_Trajectory",
+    "source_vars": ["amplitude"],
+    "dataset_id_rep": "/value-added/eddy-trajectory/delayed-time",
+    "dataset_id_nrt": "/value-added/eddy-trajectory/near-real-time",
+    "source": "aviso",
+    "archive_raw": True,
+    "pattern": r"(\d{8})_(\d{8})",
+    "trajectory_format": True,
+}
+
+
+def _eddies_app_config() -> AppConfig:
+    return msgspec.convert(
+        {
+            "variables": {"eddies": _EDDIES_ENTRY},
+            "secrets": {
+                "aviso_ftp_server": "ftp.example.com",
+                "aviso_username": "user",
+                "aviso_password": "pass",
+            },
+        },
+        AppConfig,
+    )
+
+
+def _run_download(downloader, tasks):
+    """Drive run() with the FTP layer stubbed, returning the manifest contents.
+
+    The manifest must land in ``download_dir`` — the same directory
+    ``Netcdf2Zarr._read_manifest`` looks in — not the download root.
+    """
+    with (
+        patch.object(downloader, "_create_download_tasks", return_value=tasks),
+        patch.object(downloader, "download_parallel"),
+        patch.object(
+            downloader,
+            "get_rep_availability",
+            return_value=DateRange(
+                pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-31")
+            ),
+        ),
+        patch.object(downloader, "_warn_if_rep_updated"),
+        patch(
+            "h2mare.downloader.aviso_downloader.resolve_date_range",
+            return_value=DateRange(
+                pd.Timestamp("2020-01-01"), pd.Timestamp("2020-02-29")
+            ),
+        ),
+    ):
+        downloader.run()
+    manifest_path = downloader.download_dir / "h2mare_manifest.json"
+    return manifest_path, (
+        json.loads(manifest_path.read_text()) if manifest_path.exists() else None
+    )
+
+
+class TestWriteManifest:
+    def test_manifest_is_written(self, dl):
+        """Regression: AVISO wrote no manifest, so provenance was never stamped."""
+        tasks = [
+            FTPDownloadTask(filepath="fsle_20200105.nc", source="rep"),
+            FTPDownloadTask(filepath="fsle_20200210.nc", source="nrt"),
+        ]
+
+        path, records = _run_download(dl, tasks)
+
+        assert path.exists()
+        assert records is not None
+
+    def test_manifest_records_both_datasets(self, dl):
+        tasks = [
+            FTPDownloadTask(filepath="fsle_20200105.nc", source="rep"),
+            FTPDownloadTask(filepath="fsle_20200120.nc", source="rep"),
+            FTPDownloadTask(filepath="fsle_20200210.nc", source="nrt"),
+        ]
+
+        _, records = _run_download(dl, tasks)
+
+        by_type = {r["dataset_type"]: r for r in records}
+        assert by_type["rep"]["dataset_id"] == "/dataset/fsle/rep"
+        assert by_type["nrt"]["dataset_id"] == "/dataset/fsle/nrt"
+
+    def test_spans_come_from_downloaded_filenames(self, dl):
+        """The rep span must cover its files only, not the whole request."""
+        tasks = [
+            FTPDownloadTask(filepath="fsle_20200105.nc", source="rep"),
+            FTPDownloadTask(filepath="fsle_20200120.nc", source="rep"),
+            FTPDownloadTask(filepath="fsle_20200210.nc", source="nrt"),
+        ]
+
+        _, records = _run_download(dl, tasks)
+
+        by_type = {r["dataset_type"]: r for r in records}
+        assert by_type["rep"]["start"] == "2020-01-05"
+        assert by_type["rep"]["end"] == "2020-01-20"
+        assert by_type["nrt"]["start"] == "2020-02-10"
+        assert by_type["nrt"]["end"] == "2020-02-10"
+
+    def test_nrt_only_run_records_no_rep_entry(self, dl):
+        """An incremental run downloading only NRT must not claim rep coverage."""
+        tasks = [FTPDownloadTask(filepath="fsle_20200210.nc", source="nrt")]
+
+        _, records = _run_download(dl, tasks)
+
+        assert [r["dataset_type"] for r in records] == ["nrt"]
+
+    def test_manifest_matches_schema_netcdf2zarr_reads(self, dl):
+        """_write_provenance indexes dataset_id/dataset_type/start/end."""
+        tasks = [FTPDownloadTask(filepath="fsle_20200105.nc", source="rep")]
+
+        _, records = _run_download(dl, tasks)
+
+        assert set(records[0]) == {"dataset_id", "dataset_type", "start", "end"}
+
+    def test_eddies_range_filenames_span_start_to_end(self, tmp_path):
+        """Trajectory filenames carry two dates; the span must use both."""
+        with patch.object(AVISODownloader, "connect_ftp", return_value=MagicMock()):
+            dl_eddies = AVISODownloader(
+                "eddies",
+                app_config=_eddies_app_config(),
+                store_root=tmp_path,
+                download_root=tmp_path,
+            )
+        tasks = [
+            FTPDownloadTask(filepath="Eddy_20200101_20200131.nc", source="rep"),
+            FTPDownloadTask(filepath="Eddy_20200201_20200229.nc", source="nrt"),
+        ]
+
+        _, records = _run_download(dl_eddies, tasks)
+
+        by_type = {r["dataset_type"]: r for r in records}
+        assert by_type["rep"]["start"] == "2020-01-01"
+        assert by_type["rep"]["end"] == "2020-01-31"
+        assert by_type["nrt"]["end"] == "2020-02-29"
+
+    def test_no_manifest_when_nrt_not_configured_and_no_nrt_tasks(self, dl_no_nrt):
+        tasks = [FTPDownloadTask(filepath="fsle_20200105.nc", source="rep")]
+
+        _, records = _run_download(dl_no_nrt, tasks)
+
+        assert [r["dataset_type"] for r in records] == ["rep"]

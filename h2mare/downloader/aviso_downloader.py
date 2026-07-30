@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 import warnings
@@ -248,6 +249,66 @@ class AVISODownloader(BaseDownloader):
 
         return tasks
 
+    def _task_date_range(self, paths: list[str]) -> Optional[DateRange]:
+        """Span covered by *paths*, derived from their filenames.
+
+        Handles both filename shapes: a single date (fsle) and a start/end pair
+        (eddies trajectory files).
+        """
+        starts: list[pd.Timestamp] = []
+        ends: list[pd.Timestamp] = []
+        for filepath in paths:
+            dates = self._extract_date_from_filename(filepath)
+            if isinstance(dates, tuple):
+                starts.append(dates[0])
+                ends.append(dates[1])
+            else:
+                starts.append(dates)
+                ends.append(dates)
+
+        if not starts:
+            return None
+        return DateRange(start=min(starts), end=max(ends))
+
+    def _write_manifest(self, tasks: list[FTPDownloadTask], output_dir: Path) -> None:
+        """Record which dataset covered each downloaded date range.
+
+        ``Netcdf2Zarr`` reads this manifest to stamp ``source_datasets`` onto the
+        Zarr it builds. Without it that step silently no-ops and the catalog
+        scanner falls back to ``dataset_id_rep``, labelling near-real-time data
+        as delayed-time.
+
+        Ranges come from the filenames actually downloaded rather than from the
+        requested range, so the manifest describes what is on disk.
+        """
+        records = []
+        for source, dataset_id in (
+            ("rep", self.var_config.dataset_id_rep),
+            ("nrt", self.var_config.dataset_id_nrt),
+        ):
+            if dataset_id is None:
+                continue
+            span = self._task_date_range(
+                [t.filepath for t in tasks if t.source == source]
+            )
+            if span is None:
+                continue
+            records.append(
+                {
+                    "dataset_id": dataset_id,
+                    "dataset_type": source,
+                    "start": span.start.strftime("%Y-%m-%d"),
+                    "end": span.end.strftime("%Y-%m-%d"),
+                }
+            )
+
+        if not records:
+            return
+
+        manifest_path = output_dir / "h2mare_manifest.json"
+        manifest_path.write_text(json.dumps(records, indent=2))
+        logger.debug(f"Wrote download manifest to {manifest_path}")
+
     # ==================== Download Execution ====================
     def download_file(self, path: str, output_dir: Optional[Path] = None) -> None:
         """Download individual files from FTP, with retry and automatic reconnection."""
@@ -457,6 +518,7 @@ class AVISODownloader(BaseDownloader):
 
         # Disconnect FTP
         # self.ftp.quit()
+        self._write_manifest(tasks, base_dir)
         logger.success(
             f"Download complete: {len(rep_paths)} REP + {len(nrt_paths)} NRT file(s) "
             f"in {time.perf_counter() - t0:.1f}s"
