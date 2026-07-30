@@ -126,15 +126,18 @@ class TestResolveDateRange:
         assert window.start == pd.Timestamp("1998-07-01")
         assert window.end == pd.Timestamp("1998-12-31")
 
-    def test_already_up_to_date_raises(self, tmp_path):
-        """Inferred start beyond zarr end → nothing new to convert."""
+    def test_already_up_to_date_returns_none(self, tmp_path):
+        """Inferred start beyond zarr end → nothing to convert, a clean no-op.
+
+        Mirrors utils.date_range.resolve_date_range: inferred ranges signal
+        'nothing to do' with None; only explicit dates raise.
+        """
         z = _make_converter(
             tmp_path,
             parquet_initialized=True,
             parquet_end=pd.Timestamp("1998-12-31"),
         )
-        with pytest.raises(ValueError, match="up to date"):
-            z._resolve_date_range(None, None)
+        assert z._resolve_date_range(None, None) is None
 
     def test_explicit_end_only_uses_inferred_start(self, tmp_path):
         """Partial override: explicit end_date, inferred start from empty store."""
@@ -192,6 +195,24 @@ class TestRun:
         z.zarr_repo.open_dataset.side_effect = RuntimeError("zarr read error")
 
         assert z.run("1998-01-01", "1998-03-31") is False
+
+    def test_partial_override_with_nothing_left_is_a_noop(self, tmp_path):
+        """Explicit end_date already covered by the store: skip, do not fail.
+
+        Mode 2 used to let the 'already up to date' ValueError escape run(),
+        which PipelineManager counted as a failed pipeline.
+        """
+        z = _make_converter(
+            tmp_path,
+            parquet_initialized=True,
+            parquet_end=pd.Timestamp("1998-12-31"),  # == zarr end
+        )
+
+        with patch.object(z, "_convert_window", return_value=True) as mock_conv:
+            result = z.run(end_date=pd.Timestamp("1998-12-31"))
+
+        assert result is True
+        mock_conv.assert_not_called()
 
     def test_returns_false_when_any_chunk_fails(self, tmp_path):
         """run() returns False even when only one of several chunks fails."""
@@ -642,17 +663,22 @@ class TestRunIncremental:
         assert second.args[3] == ["sst", "sst_fdist"]
 
     def test_backfill_runs_even_when_nothing_to_append(self, tmp_path):
-        """An 'up to date' append still lets backfill proceed."""
-        z = _make_converter(tmp_path)
+        """An 'up to date' append still lets backfill proceed.
+
+        The store is primed so the real resolver returns None — the append is
+        skipped through the production code path, not a patched exception.
+        """
+        z = _make_converter(
+            tmp_path,
+            parquet_initialized=True,
+            parquet_end=pd.Timestamp("1998-12-31"),  # == zarr end
+        )
 
         backfill_window = DateRange(
             pd.Timestamp("2021-04-01"), pd.Timestamp("2021-06-30")
         )
         with (
             patch.object(z, "_convert_window", return_value=True) as mock_conv,
-            patch.object(
-                z, "_resolve_date_range", side_effect=ValueError("up to date")
-            ),
             patch.object(
                 z,
                 "_resolve_backfill_groups",
@@ -663,3 +689,38 @@ class TestRunIncremental:
 
         assert result is True
         assert mock_conv.call_count == 1  # only the backfill
+        assert mock_conv.call_args_list[0].args[0] == backfill_window
+
+    def test_nothing_to_append_and_no_backfill_is_a_clean_noop(self, tmp_path):
+        """Fully up-to-date store: no conversion, and run() still succeeds."""
+        z = _make_converter(
+            tmp_path,
+            parquet_initialized=True,
+            parquet_end=pd.Timestamp("1998-12-31"),  # == zarr end
+        )
+
+        with (
+            patch.object(z, "_convert_window", return_value=True) as mock_conv,
+            patch.object(z, "_resolve_backfill_groups", return_value=[]),
+        ):
+            result = z.run()
+
+        assert result is True
+        mock_conv.assert_not_called()
+
+    def test_convert_window_error_is_not_swallowed(self, tmp_path):
+        """A real failure must not be reported as 'nothing to append'.
+
+        The append call used to sit inside a ``except ValueError`` that logged
+        every failure as a benign no-op and left the return value True.
+        """
+        z = _make_converter(tmp_path, parquet_initialized=False)
+
+        with (
+            patch.object(
+                z, "_convert_window", side_effect=ValueError("invalid split value")
+            ),
+            patch.object(z, "_resolve_backfill_groups", return_value=[]),
+        ):
+            with pytest.raises(ValueError, match="invalid split value"):
+                z.run()
