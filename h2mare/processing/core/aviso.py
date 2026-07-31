@@ -224,7 +224,14 @@ class EDDIESProcessor:
         records = self._get_downloaded_metadata()
         requested_ranges = self._resolve_all_ranges(records, start_date, end_date)
 
-        # Determine the full set of years to process across all records
+        if not requested_ranges:
+            logger.info(
+                f"[{self.var_key}] No downloaded file overlaps the requested range "
+                "— nothing to convert"
+            )
+            return
+
+        # Determine the full set of years to process across the relevant records
         all_dates = pd.date_range(
             min(r.start for r in requested_ranges.values()),
             max(r.end for r in requested_ranges.values()),
@@ -237,7 +244,11 @@ class EDDIESProcessor:
             for record in records:
                 eddy_type, _, path = record
                 eddy_type_str = EDDY_TYPE_MAP[eddy_type]
-                year_range = requested_ranges[eddy_type]
+                year_range = requested_ranges.get(path)
+
+                # Files outside the requested range carry no window at all
+                if year_range is None:
+                    continue
 
                 # Skip if this record doesn't cover this year
                 sel_dates = period_dates[
@@ -450,21 +461,43 @@ class EDDIESProcessor:
         records: list[tuple[str, DateRange, Path]],
         start_date: Optional[DateLike],
         end_date: Optional[DateLike],
-    ) -> dict[str, DateRange]:
-        """Resolve requested date ranges for all records upfront."""
-        return {
-            eddy_type: self._resolve_date_range(download_range, start_date, end_date)
-            for eddy_type, download_range, _ in records
-        }
+    ) -> dict[Path, DateRange]:
+        """
+        Per-file conversion window, dropping files the request does not touch.
+
+        Keyed by path rather than eddy type. A store holds several files per
+        type — rep long/short/untracked, nrt, and any other product version
+        sitting in the same tree — so keying by type collapses them and every
+        record ends up processed against whichever file resolved last.
+
+        Files whose own span does not overlap the request are omitted rather
+        than aborting the run: a directory legitimately holds files outside the
+        requested window, and the caller asked for a window, not for every file
+        to be relevant.
+        """
+        resolved: dict[Path, DateRange] = {}
+        for _, download_range, path in records:
+            window = self._resolve_date_range(download_range, start_date, end_date)
+            if window is None:
+                logger.debug(
+                    f"[{self.var_key}] {path.name} ({download_range}) does not "
+                    "overlap the requested range — skipping"
+                )
+                continue
+            resolved[path] = window
+        return resolved
 
     def _resolve_date_range(
         self,
         download_range: DateRange,
         start_date: Optional[DateLike] = None,
         end_date: Optional[DateLike] = None,
-    ) -> DateRange:
+    ) -> Optional[DateRange]:
         """
-        Check if input date ranges overlap with downloaded file range.
+        Overlap between the requested range and one downloaded file's own range.
+
+        Returns ``None`` when they do not overlap, or when the store is already
+        up to date.
 
         Args:
             path: path for file to check dates in file name
@@ -478,14 +511,9 @@ class EDDIESProcessor:
         requested_range = resolve_date_range(self.var_key, start, end)
         if requested_range is None:
             return None
-        overlap = requested_range.intersection(download_range)
-
-        if overlap:
-            return overlap
-        else:
-            raise ValueError(
-                f"Requested range {requested_range} does not overlap with available datasets"
-            )
+        # None rather than raising: a raw directory may legitimately hold files
+        # outside the requested window, and one of them must not abort the run.
+        return requested_range.intersection(download_range)
 
     def _prepare_raw_dataset(self, path: Path, dates: DateRange) -> xr.Dataset:
         """Preprocess original dataframe to subset by geo_extent with +10deg for distance calculations and by time range"""
