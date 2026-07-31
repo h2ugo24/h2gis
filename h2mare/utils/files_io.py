@@ -5,6 +5,7 @@ Input/Output Help functions
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import time
@@ -83,6 +84,32 @@ def safe_rmtree(path: Path, retries=10, delay=0.5) -> None:
     raise RuntimeError(
         f"Failed to remove {path} after {retries} attempts"
     ) from last_err
+
+
+def filter_raw_files(paths: list[Path], var_config) -> list[Path]:
+    """
+    Keep only the raw files a variable's ``raw_include`` regex admits.
+
+    A download directory can hold files the pipeline must not read. AVISO ships
+    META3.2 eddy trajectories as long/short/untracked variants side by side, and
+    only the long ones belong in the store — the untracked files do not even
+    carry a ``track`` variable, so converting one fails deep inside the
+    processor rather than being skipped.
+
+    Returns *paths* unchanged when the variable sets no ``raw_include``.
+    """
+    pattern = getattr(var_config, "raw_include", None)
+    if not pattern:
+        return paths
+
+    regex = re.compile(pattern)
+    kept = [p for p in paths if regex.search(p.name)]
+    dropped = len(paths) - len(kept)
+    if dropped:
+        logger.debug(
+            f"raw_include={pattern!r} excluded {dropped} raw file(s), kept {len(kept)}"
+        )
+    return kept
 
 
 def safe_move_files(
