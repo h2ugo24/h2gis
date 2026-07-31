@@ -3,10 +3,12 @@ Compute and save Ekman day-of-year (DOY) mean and monthly 90th percentile
 climatology from the 1998-2017 baseline period.
 
 Outputs (saved to $STORE_ROOT/Climatology/):
-    - cds_ekman-doy-mean_80W-10E-0-70N_1998-2017.nc
-    - cds_ekman-montly-90thquantile_80W-10E-0-70N_1998-2017.nc
+    - cds_ekman-doy-mean_80W-10E-0N-70N_1998-2017.nc
+    - cds_ekman-monthly-90thquantile_80W-10E-0N-70N_1998-2017.nc
 
-Run this script once before ekman_derived_vars.py.
+Run once before converting `atm-instante`: `add_engineered_ekman`
+(h2mare/processing/core/cds.py) reads both files from CLIMATOLOGY_DIR on every
+conversion and raises if they are missing.
 """
 
 import warnings

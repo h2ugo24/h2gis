@@ -110,8 +110,8 @@ def backfill_provenance(catalog: "ZarrCatalog", rep_end_date: DateLike) -> int:
 
     Files that already carry ``source_datasets`` are skipped, so this never
     overwrites existing provenance — including provenance that has since gone
-    stale because the source republished part of the nrt period as rep.
-    ``scripts/repair_aviso_provenance.py`` reports that case for AVISO stores.
+    stale because the source republished part of the nrt period as rep. Fixing
+    a stale file means re-converting it from raw, not calling this.
 
     Args:
         catalog: The variable's ZarrCatalog.
