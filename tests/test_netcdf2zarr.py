@@ -12,7 +12,7 @@ import xarray as xr
 
 from h2mare.format_converters.netcdf2zarr import Netcdf2Zarr
 from h2mare.models import AppConfig
-from h2mare.types import TimeResolution
+from h2mare.types import DateRange, TimeResolution
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -373,3 +373,94 @@ class TestProcessDataset:
         ):
             result = n2z.process_dataset(ds)
         assert "sst" in result
+
+
+# ---------------------------------------------------------------------------
+# run() date window
+#
+# Re-converting one period from raw files already on disk needs a window:
+# without it the only way to redo a period was `h2mare run`, which downloads.
+# ---------------------------------------------------------------------------
+
+
+class TestRunWindow:
+    def test_window_restricts_the_periods_converted(self, tmp_path):
+        """Only files inside the window are grouped for conversion."""
+        converter = _make_converter(tmp_path)
+        series = pd.Series(
+            ["a.nc", "b.nc", "c.nc"],
+            index=pd.DatetimeIndex(["2020-06-01", "2021-06-01", "2022-06-01"]),
+        )
+
+        with patch.object(converter, "_get_file_date_series", return_value=series):
+            groups = converter._group_map(
+                TimeResolution.YEAR,
+                window=DateRange(
+                    pd.Timestamp("2021-01-01"), pd.Timestamp("2021-12-31")
+                ),
+            )
+
+        assert list(groups) == [2021]
+
+    def test_no_window_converts_everything(self, tmp_path):
+        converter = _make_converter(tmp_path)
+        series = pd.Series(
+            ["a.nc", "b.nc"],
+            index=pd.DatetimeIndex(["2020-06-01", "2021-06-01"]),
+        )
+
+        with patch.object(converter, "_get_file_date_series", return_value=series):
+            groups = converter._group_map(TimeResolution.YEAR)
+
+        assert sorted(groups) == [2020, 2021]
+
+    def test_window_matching_nothing_returns_no_groups(self, tmp_path):
+        converter = _make_converter(tmp_path)
+        series = pd.Series(["a.nc"], index=pd.DatetimeIndex(["2020-06-01"]))
+
+        with patch.object(converter, "_get_file_date_series", return_value=series):
+            groups = converter._group_map(
+                TimeResolution.YEAR,
+                window=DateRange(
+                    pd.Timestamp("2030-01-01"), pd.Timestamp("2030-12-31")
+                ),
+            )
+
+        assert groups == {}
+
+    def test_run_passes_the_window_through(self, tmp_path):
+        converter = _make_converter(tmp_path)
+
+        with (
+            patch.object(converter, "_group_map", return_value={}) as mock_group,
+            patch("h2mare.format_converters.netcdf2zarr.recover_zarr_store"),
+        ):
+            converter.run("2021-01-01", "2021-12-31")
+
+        window = mock_group.call_args.kwargs["window"]
+        assert window.start == pd.Timestamp("2021-01-01")
+        assert window.end == pd.Timestamp("2021-12-31")
+
+    def test_run_without_dates_passes_no_window(self, tmp_path):
+        converter = _make_converter(tmp_path)
+
+        with (
+            patch.object(converter, "_group_map", return_value={}) as mock_group,
+            patch("h2mare.format_converters.netcdf2zarr.recover_zarr_store"),
+        ):
+            converter.run()
+
+        assert mock_group.call_args.kwargs["window"] is None
+
+    def test_trajectory_vars_forward_dates_to_the_processor(self, tmp_path):
+        """Regression: eddies ignored the window because run() took no dates."""
+        converter = _make_converter(tmp_path)
+        converter.var_config.trajectory_format = True
+
+        with (
+            patch.object(converter, "_process_eddies") as mock_eddies,
+            patch("h2mare.format_converters.netcdf2zarr.recover_zarr_store"),
+        ):
+            converter.run("2026-04-21", "2026-07-13")
+
+        assert mock_eddies.call_args[0] == ("2026-04-21", "2026-07-13")

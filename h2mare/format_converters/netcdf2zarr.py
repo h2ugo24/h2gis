@@ -23,7 +23,7 @@ from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import chunk_dataset, rename_dims, snap_grid_coords
 from h2mare.storage.zarr_catalog import ZarrCatalog
-from h2mare.types import TimeResolution
+from h2mare.types import DateLike, DateRange, TimeResolution
 from h2mare.utils.files_io import safe_move_files, safe_rmtree
 from h2mare.utils.paths import resolve_download_path
 from h2mare.validators import validate_time_resolution, validate_var_key
@@ -149,11 +149,35 @@ class Netcdf2Zarr(BaseConverter):
         self.catalog = ZarrCatalog(self.var_key, store_root=store_root)
         self.store_root = self.catalog.store_root
 
-    def run(self) -> bool:
+    def run(
+        self,
+        start_date: DateLike | None = None,
+        end_date: DateLike | None = None,
+    ) -> bool:
+        """
+        Convert downloaded raw files to Zarr.
+
+        Args:
+            start_date: Restrict the conversion to this window. Both dates must
+                be given together; when omitted every downloaded file is
+                converted, which is the default resume behaviour.
+            end_date: End of the conversion window.
+
+        Restricting the window is what makes it possible to re-convert one
+        period from raw files already on disk, without re-downloading.
+        """
         t0 = time.perf_counter()
         logger.info(
             f"Initializing Netcdf -> Zarr conversion for variable key: {self.var_key.upper()}"
         )
+
+        window = (
+            DateRange(pd.to_datetime(start_date), pd.to_datetime(end_date))
+            if start_date is not None and end_date is not None
+            else None
+        )
+        if window is not None:
+            logger.info(f"Restricting conversion to {window}")
 
         # Reconcile any zarr write interrupted by a hard kill before gap
         # detection reads the store, so a half-written store is not trusted and
@@ -163,14 +187,14 @@ class Netcdf2Zarr(BaseConverter):
         # Trajectory-format variables (e.g. eddies) require spatial binning
         # before zarr storage — bypass the standard open_mfdataset pipeline.
         if self.var_config.trajectory_format:
-            self._process_eddies()
+            self._process_eddies(start_date, end_date)
             self.catalog.refresh(force=True)
             logger.success(
                 f"Conversion complete (trajectory) in {time.perf_counter() - t0:.1f}s"
             )
             return True
 
-        file_groups = self._group_map(groupby=self.time_resolution)
+        file_groups = self._group_map(groupby=self.time_resolution, window=window)
 
         for period, paths in file_groups.items():
             self._process_period(period, paths)
@@ -186,7 +210,7 @@ class Netcdf2Zarr(BaseConverter):
     # ========= DATA PREPARATION FUNCTIONS =========
 
     def _group_map(
-        self, groupby: TimeResolution
+        self, groupby: TimeResolution, window: Optional[DateRange] = None
     ) -> dict[int | tuple[int, int], list[Path]]:
         """
         Group paths of nc files by period i.e groupby str.
@@ -209,6 +233,16 @@ class Netcdf2Zarr(BaseConverter):
         file_map = self._get_file_date_series()
         if file_map.empty:
             return {}
+
+        if window is not None:
+            file_map = file_map[
+                (file_map.index >= window.start) & (file_map.index <= window.end)
+            ]
+            if file_map.empty:
+                logger.warning(
+                    f"[{self.var_key}] No downloaded files fall within {window}"
+                )
+                return {}
 
         if groupby == TimeResolution.YEAR:
             groups = file_map.groupby(file_map.index.year)  # type: ignore
@@ -369,7 +403,11 @@ class Netcdf2Zarr(BaseConverter):
         logger.debug(f"Wrote provenance to zarr attrs: {zarr_path.name}")
 
     # ========= PROCESSING FUNCTIONS =========
-    def _process_eddies(self):
+    def _process_eddies(
+        self,
+        start_date: DateLike | None = None,
+        end_date: DateLike | None = None,
+    ) -> None:
         import h2mare.processing.core.aviso as aviso
 
         try:
@@ -379,7 +417,7 @@ class Netcdf2Zarr(BaseConverter):
                 time_resolution=self.time_resolution,
                 date_format=self.date_format,
             )
-            ed_processor.run()
+            ed_processor.run(start_date, end_date)
             self._stage_eddies_to_store(self.download_root)
         except Exception as e:
             raise RuntimeError(
