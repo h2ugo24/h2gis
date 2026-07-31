@@ -1,0 +1,372 @@
+"""
+Reading Zarr data for one variable's store.
+
+Resolves which files to open through a :class:`~h2mare.storage.zarr_index.ZarrIndex`,
+then opens them with xarray, applying variable selection, spatial subsetting and
+time normalisation. Holds no state of its own — the catalog bookkeeping and its
+cache live entirely in the index.
+"""
+
+from __future__ import annotations
+
+from typing import Sequence
+
+import pandas as pd
+import xarray as xr
+from loguru import logger
+
+from h2mare.storage.zarr_index import ZarrIndex
+from h2mare.types import BBox, DateLike, DateRange
+from h2mare.utils.datetime_utils import normalize_dates
+from h2mare.utils.spatial import sel_padded_bbox
+
+
+class ZarrReader:
+    """Opens Zarr datasets for the store catalogued by *index*."""
+
+    def __init__(self, index: ZarrIndex) -> None:
+        self._index = index
+
+    # ---- index queries the opening paths rely on -------------------------
+    # Named to match the index so the opening logic reads the same either way.
+
+    @property
+    def var_key(self) -> str:
+        return self._index.var_key
+
+    @property
+    def df(self) -> pd.DataFrame:
+        return self._index.df
+
+    def _log(self, level: str, msg: str) -> None:
+        self._index._log(level, msg)
+
+    def get_time_coverage(self) -> DateRange | None:
+        return self._index.get_time_coverage()
+
+    def get_paths_in_range(self, start_date: DateLike, end_date: DateLike) -> list[str]:
+        return self._index.get_paths_in_range(start_date, end_date)
+
+    def map_dates_to_paths(self, dates):
+        return self._index.map_dates_to_paths(dates)
+
+    # ---- opening paths ---------------------------------------------------
+
+    def open_dataset(
+        self,
+        dates: DateLike | Sequence[DateLike] | None = None,
+        start_date: DateLike | None = None,
+        end_date: DateLike | None = None,
+        bbox: BBox | Sequence[float] | None = None,
+        variables: str | Sequence[str] | None = None,
+        chunks: dict | str | None = "auto",
+    ) -> xr.Dataset:
+        """
+        Open zarr dataset(s) with flexible date and spatial selection.
+
+        Supports two modes:
+        1. Sparse dates: Provide `dates` for specific dates
+        2. Date range: Provide `start_date` and/or `end_date`
+
+        Args:
+            dates: Specific dates to select (sparse mode)
+            start_date: Start of date range (range mode)
+            end_date: End of date range (range mode)
+            bbox: Bounding box [xmin, ymin, xmax, ymax]
+            variables: Variables to select (None = all)
+            chunks: Chunking strategy for dask ('auto' or dict)
+
+        Returns:
+            Lazy xarray Dataset, or None if no data found
+
+        Raises:
+            ValueError: If neither dates nor start_date/end_date provided,
+                       or if bbox format is invalid
+
+        Example:
+            >>> # Sparse dates
+            >>> ds = catalog.open_dataset(dates=['2020-01-15', '2020-06-20'])
+            >>>
+            >>> # Date range
+            >>> ds = catalog.open_dataset(
+            ...     start_date='2020-01-01',
+            ...     end_date='2020-12-31',
+            ...     bbox=(-180, -90, 180, 90),
+            ...     variables=['mld']
+            ... )
+        """
+        # Validate inputs
+        if dates is None and start_date is None and end_date is None:
+            date_range = self.get_time_coverage()
+            if date_range:
+                start_date, end_date = date_range.start, date_range.end
+            else:
+                raise ValueError(
+                    "Please provide sparse 'dates' or 'start_date/end_date' range"
+                )
+
+        if dates is not None and (start_date is not None or end_date is not None):
+            raise ValueError(
+                "Cannot use both 'dates' and 'start_date'/'end_date'. "
+                "Use one mode or the other."
+            )
+
+        if bbox is not None:
+            bbox = bbox if isinstance(bbox, BBox) else BBox.from_tuple(bbox)
+
+        # Route to appropriate method
+        if dates is not None:
+            return self._open_sparse_dates(
+                dates=dates,
+                bbox=bbox,
+                variables=variables,
+                chunks=chunks,
+            )
+        else:
+            return self._open_date_range(
+                start_date=start_date,
+                end_date=end_date,
+                bbox=bbox,
+                variables=variables,
+                chunks=chunks,
+            )
+
+    def _open_sparse_dates(
+        self,
+        dates: DateLike | Sequence[DateLike],
+        bbox: BBox | None,
+        variables: str | Sequence[str] | None,
+        chunks: dict | str | None,
+    ) -> xr.Dataset:
+        """Open dataset for specific sparse dates."""
+        date_list = normalize_dates(dates)
+        if not date_list:
+            raise ValueError("No valid dates provided")
+
+        # Get file paths
+        path_mapping = self.map_dates_to_paths(date_list)
+
+        if not path_mapping:
+            raise FileNotFoundError(f"No zarr files contain dates: {date_list}")
+
+        paths = list(path_mapping.keys())
+
+        # Open datasets
+        try:
+            ds = xr.open_mfdataset(
+                paths,
+                engine="zarr",
+                combine="by_coords",
+                parallel=True,
+                data_vars="minimal",
+                coords="minimal",  # type: ignore[arg-type]
+                compat="override",
+                chunks=chunks,
+                preprocess=lambda d: self._preprocess_dataset(d, bbox, variables),
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to open zarr files: {e}") from e
+
+        # Normalize time coordinates
+        ds = self._normalize_time(ds)
+
+        # Select only requested dates
+        requested_dates = pd.DatetimeIndex(date_list).normalize()
+        available_dates = pd.DatetimeIndex(ds.time.values).normalize()
+
+        valid_dates = requested_dates.intersection(available_dates)
+
+        if len(valid_dates) == 0:
+            raise FileNotFoundError(
+                f"None of the requested dates found in dataset. "
+                f"Requested: {requested_dates.tolist()}, "
+                f"Available: {available_dates.tolist()}"
+            )
+
+        if len(valid_dates) < len(requested_dates):
+            missing = requested_dates.difference(available_dates)
+            self._log("warning", f"Missing dates: {missing.tolist()}")
+
+        return ds.sel(time=valid_dates.tolist())
+
+    def _open_date_range(
+        self,
+        start_date: DateLike | None,
+        end_date: DateLike | None,
+        bbox: BBox | None,
+        variables: str | Sequence[str] | None,
+        chunks: dict | str | None,
+    ) -> xr.Dataset:
+        """Open dataset for continuous date range."""
+
+        # Get catalog
+        df = self.df
+
+        if df.empty:
+            raise FileNotFoundError("Catalog is empty")
+
+        # Default to full range if not specified
+        start: pd.Timestamp = (
+            df["start_date"].min()
+            if start_date is None
+            else pd.to_datetime(start_date).normalize()
+        )
+        end: pd.Timestamp = (
+            df["end_date"].max()
+            if end_date is None
+            else pd.to_datetime(end_date).normalize()
+        )
+
+        if pd.isna(start) or pd.isna(end):
+            raise ValueError(
+                "Date range contains NaT — check catalog date columns for missing values"
+            )
+
+        # Warn if requested range extends beyond what the catalog covers
+        available_start = pd.Timestamp(df["start_date"].min()).normalize()
+        available_end = pd.Timestamp(df["end_date"].max()).normalize()
+
+        if start_date is not None and start < available_start:
+            self._log(
+                "warning",
+                f"[{self.var_key}] Requested start {start.date()} not available — "
+                f"opening from {available_start.date()}",
+            )
+            start = available_start
+
+        if end_date is not None and end > available_end:
+            self._log(
+                "warning",
+                f"[{self.var_key}] Requested end {end.date()} not available — "
+                f"opening until {available_end.date()}",
+            )
+            end = available_end
+
+        # Get overlapping paths
+        paths = self.get_paths_in_range(start, end)
+
+        if not paths:
+            raise FileNotFoundError(
+                f"No zarr files found for range: {start.date()} to {end.date()}"
+            )
+
+        # Open datasets
+        try:
+            ds = xr.open_mfdataset(
+                paths,
+                engine="zarr",
+                combine="by_coords",
+                parallel=True,
+                data_vars="minimal",
+                coords="minimal",  # type: ignore[arg-type]
+                compat="override",
+                chunks=chunks,
+                preprocess=lambda d: self._preprocess_dataset(d, bbox, variables),
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to open zarr files: {e}") from e
+
+        # Normalize time
+        ds = self._normalize_time(ds)
+
+        # Select time range
+        return ds.sel(time=slice(start, end))
+
+    def _normalize_time(self, ds: xr.Dataset) -> xr.Dataset:
+        """
+        Normalize time coordinates to midnight (00:00:00).
+
+        Args:
+            ds: Dataset with time coordinate
+
+        Returns:
+            Dataset with normalized time
+        """
+        if "time" not in ds.coords:
+            return ds
+
+        normalized_time = pd.to_datetime(ds["time"].values).normalize()
+        return ds.assign_coords(time=normalized_time)
+
+    def _preprocess_dataset(
+        self,
+        ds: xr.Dataset,
+        bbox: BBox | None,
+        variables: str | Sequence[str] | None,
+    ) -> xr.Dataset:
+        """
+        Preprocess dataset: apply bbox and variable selection.
+
+        This runs BEFORE datasets are combined in open_mfdataset.
+
+        Args:
+            ds: Input dataset
+            bbox: Bounding box to apply
+            variables: Variables to select
+
+        Returns:
+            Preprocessed dataset
+        """
+        # Select variables
+        if variables is not None:
+            var_list = [variables] if isinstance(variables, str) else list(variables)
+            # Only select variables that exist
+            available = set(ds.data_vars.keys())
+            to_select = [v for v in var_list if v in available]
+
+            if not to_select:
+                self._log(
+                    "warning",
+                    f"None of requested variables found. "
+                    f"Requested: {var_list}, Available: {list(available)}",
+                )
+            else:
+                ds = ds[to_select]
+
+        # Ensure lat is monotonically increasing (ERA5 comes north→south)
+        if "lat" in ds.coords and ds.lat.values[0] > ds.lat.values[-1]:
+            ds = ds.sortby("lat")
+
+        # Apply spatial subset
+        if bbox is not None:
+            ds = self._apply_bbox(ds, bbox)
+
+        return ds
+
+    def _apply_bbox(
+        self,
+        ds: xr.Dataset,
+        bbox: BBox,
+    ) -> xr.Dataset:
+        """
+        Apply bounding box selection.
+
+        Args:
+            ds: Input dataset
+            bbox: [xmin, ymin, xmax, ymax]
+
+        Returns:
+            Spatially subset dataset
+
+        Raises:
+            ValueError: If bbox format is invalid
+        """
+        # Determine coordinate names (support lat/lon or y/x)
+        lat_coord = "lat" if "lat" in ds.coords else "y"
+        lon_coord = "lon" if "lon" in ds.coords else "x"
+
+        if lat_coord not in ds.coords or lon_coord not in ds.coords:
+            self._log(
+                "warning",
+                f"Cannot apply bbox: missing coordinates. "
+                f"Available: {list(ds.coords.keys())}",
+            )
+            return ds
+
+        try:
+            return sel_padded_bbox(
+                ds, bbox.to_tuple(), lat_coord=lat_coord, lon_coord=lon_coord
+            )
+        except Exception as e:
+            logger.error(f"Failed to apply bbox: {e}")
+            return ds

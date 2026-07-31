@@ -4,6 +4,7 @@ Processes AVISO data, namely FSLE and EDDY TRAJECTORY ATLAS
 
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import re
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from scipy.spatial import cKDTree  # type: ignore
 
 from h2mare.config import AppConfig, get_settings
 from h2mare.models import KeyVarConfigEntry
+from h2mare.storage.provenance import write_provenance_for_window
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import (
     chunk_dataset,
@@ -31,6 +33,7 @@ from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import BBox, DateLike, DateRange, TimeResolution
 from h2mare.utils.date_range import resolve_date_range
 from h2mare.utils.datetime_utils import normalize_date
+from h2mare.utils.files_io import filter_raw_files
 from h2mare.utils.paths import resolve_download_path, resolve_store_path
 from h2mare.utils.spatial import GridBuilder, haversine_min_distance_kdtree
 from h2mare.validators import validate_time_resolution, validate_var_key
@@ -133,6 +136,41 @@ def _group_dates(
                 yield (int(year), int(month)), dates[mask]
 
 
+def _raw_source(path: Path) -> Optional[str]:
+    """
+    Whether a raw file is reprocessed or near-real-time, from its location.
+
+    The downloader stages each stream into a ``rep``/``nrt`` subfolder and the
+    store keeps that layout, so the directory is the marker. Returns ``None``
+    for a file sitting outside either — a legacy flat layout, or a product
+    version dropped in by hand.
+    """
+    parts = {part.lower() for part in path.parts}
+    if "nrt" in parts:
+        return "nrt"
+    if "rep" in parts:
+        return "rep"
+    return None
+
+
+def _is_degenerate_axis(values: NDArray[np.float64], tol: float = 1e-6) -> bool:
+    """
+    True when a coordinate axis carries near-duplicate points.
+
+    That is the signature of an axis produced by unioning two grids that differ
+    only in floating-point representation: the smallest gap collapses to ~1e-16
+    of the nominal spacing. Native product grids are not perfectly uniform
+    either (1/12°, 1/24°, 15″ are not exactly representable), so the test is a
+    ratio against the median step rather than strict uniformity.
+    """
+    if values.size < 3:
+        return False
+    steps = np.abs(np.diff(values))
+    if (steps <= 0).any():
+        return True
+    return bool(steps.min() / np.median(steps) < tol)
+
+
 class EDDIESProcessor:
     def __init__(
         self,
@@ -204,7 +242,14 @@ class EDDIESProcessor:
         records = self._get_downloaded_metadata()
         requested_ranges = self._resolve_all_ranges(records, start_date, end_date)
 
-        # Determine the full set of years to process across all records
+        if not requested_ranges:
+            logger.info(
+                f"[{self.var_key}] No downloaded file overlaps the requested range "
+                "— nothing to convert"
+            )
+            return
+
+        # Determine the full set of years to process across the relevant records
         all_dates = pd.date_range(
             min(r.start for r in requested_ranges.values()),
             max(r.end for r in requested_ranges.values()),
@@ -217,7 +262,11 @@ class EDDIESProcessor:
             for record in records:
                 eddy_type, _, path = record
                 eddy_type_str = EDDY_TYPE_MAP[eddy_type]
-                year_range = requested_ranges[eddy_type]
+                year_range = requested_ranges.get(path)
+
+                # Files outside the requested range carry no window at all
+                if year_range is None:
+                    continue
 
                 # Skip if this record doesn't cover this year
                 sel_dates = period_dates[
@@ -249,6 +298,11 @@ class EDDIESProcessor:
                     ds_merged, self.date_format
                 )
                 write_append_zarr(self.var_key, ds_merged, path)
+                written = DateRange(
+                    pd.to_datetime(ds_merged.time.min().values),
+                    pd.to_datetime(ds_merged.time.max().values),
+                )
+                self._write_provenance(path, written)
                 del ds_list, ds_merged
 
         # logger.success("Completed!")
@@ -281,17 +335,105 @@ class EDDIESProcessor:
                 sea_mask,
             )
 
-        if self.catalog.exists():
-            with self.catalog.open_dataset() as ds:
-                lat = ds.coords["lat"].values
-                lon = ds.coords["lon"].values
-        else:
+        grid = self._grid_from_store() if self.catalog.exists() else None
+        if grid is None:
             base_grid = GridBuilder(self.bbox, dx=dx, dy=dy).generate_grid()
             lat = base_grid.coords["lat"].values
             lon = base_grid.coords["lon"].values
+        else:
+            lat, lon = grid
 
         latlon_arr, sea_mask = create_base_grid(lat, lon)
         return GridData(lat, lon, latlon_arr, sea_mask)
+
+    def _read_manifest(self) -> list[dict]:
+        """Read the download manifest written by AVISODownloader, or [] if absent."""
+        manifest_path = self.download_root / "h2mare_manifest.json"
+        if not manifest_path.exists():
+            return []
+        try:
+            return json.loads(manifest_path.read_text())
+        except Exception as e:
+            logger.warning(f"Could not read download manifest: {e}")
+            return []
+
+    def _write_provenance(self, zarr_path: Path, written: DateRange) -> None:
+        """
+        Record which dataset covered *written* on the Zarr just produced.
+
+        The generic converter path in Netcdf2Zarr never runs for eddies —
+        ``_process_eddies`` delegates here and this class writes its own Zarr —
+        so without this every eddies file lacks ``source_datasets`` and the
+        catalog scanner falls back to ``dataset_id_rep``, labelling
+        near-real-time data as delayed-time.
+        """
+        manifest = self._read_manifest()
+        if not manifest:
+            logger.debug(
+                f"[{self.var_key}] No download manifest in {self.download_root}; "
+                "skipping provenance for this period"
+            )
+            return
+
+        try:
+            records = write_provenance_for_window(zarr_path, manifest, written)
+        except Exception as e:
+            logger.warning(f"Could not write provenance for {zarr_path.name}: {e}")
+            return
+
+        if records:
+            logger.debug(
+                f"[{self.var_key}] Wrote provenance to {zarr_path.name}: "
+                + ", ".join(
+                    f"{r['dataset_type']} {r['start_date']}..{r['end_date']}"
+                    for r in records
+                )
+            )
+
+    def _grid_from_store(
+        self,
+    ) -> Optional[tuple[NDArray[np.float64], NDArray[np.float64]]]:
+        """
+        Read the store's established grid from a single canonical Zarr file.
+
+        Deliberately *not* ``catalog.open_dataset()``: with no arguments that
+        opens every file at once, and ``combine="by_coords"`` then takes the
+        union of their coordinate axes. Axes that differ only in the last
+        floating-point bits therefore merge into a doubled axis full of
+        near-duplicate points — and because the result is written back to the
+        store, the next run reads an even worse grid. Reading one file keeps the
+        grid a property of the store rather than of how many files it holds.
+
+        Returns ``None`` when no usable grid is available, so the caller falls
+        back to building one from the configured bbox.
+        """
+        try:
+            df = self.catalog.df
+            if df.empty:
+                return None
+            path = df.sort_values("start_date").iloc[0]["path"]
+            with xr.open_zarr(path, consolidated=False) as ds:
+                lat = ds.coords["lat"].values
+                lon = ds.coords["lon"].values
+        except Exception as e:
+            logger.warning(
+                f"[{self.var_key}] Could not read the store grid ({e}); "
+                "falling back to the configured bbox"
+            )
+            return None
+
+        for name, values in (("lat", lat), ("lon", lon)):
+            if _is_degenerate_axis(values):
+                logger.error(
+                    f"[{self.var_key}] Store grid has a degenerate {name} axis "
+                    f"({values.size} points with near-duplicate values) in "
+                    f"{Path(path).name}. Falling back to the configured bbox; "
+                    "that file was written on a unioned grid and needs "
+                    "re-converting from raw."
+                )
+                return None
+
+        return lat, lon
 
     def _get_downloaded_metadata(
         self, root_dir: Optional[Path] = None
@@ -313,7 +455,7 @@ class EDDIESProcessor:
             list: tuple (eddy type, Daterange, file path)
         """
         root_dir = root_dir or self.download_root
-        files = list(root_dir.rglob("*.nc"))
+        files = filter_raw_files(list(root_dir.rglob("*.nc")), self.var_config)
 
         records = []
         for f in files:
@@ -337,21 +479,96 @@ class EDDIESProcessor:
         records: list[tuple[str, DateRange, Path]],
         start_date: Optional[DateLike],
         end_date: Optional[DateLike],
-    ) -> dict[str, DateRange]:
-        """Resolve requested date ranges for all records upfront."""
-        return {
-            eddy_type: self._resolve_date_range(download_range, start_date, end_date)
-            for eddy_type, download_range, _ in records
-        }
+    ) -> dict[Path, DateRange]:
+        """
+        Per-file conversion window, dropping files the request does not touch.
+
+        Keyed by path rather than eddy type. A store holds several files per
+        type — rep long/short/untracked, nrt, and any other product version
+        sitting in the same tree — so keying by type collapses them and every
+        record ends up processed against whichever file resolved last.
+
+        Files whose own span does not overlap the request are omitted rather
+        than aborting the run: a directory legitimately holds files outside the
+        requested window, and the caller asked for a window, not for every file
+        to be relevant.
+        """
+        resolved: dict[Path, DateRange] = {}
+        eddy_type_of: dict[Path, str] = {}
+        for eddy_type, download_range, path in records:
+            window = self._resolve_date_range(download_range, start_date, end_date)
+            if window is None:
+                logger.debug(
+                    f"[{self.var_key}] {path.name} ({download_range}) does not "
+                    "overlap the requested range — skipping"
+                )
+                continue
+            resolved[path] = window
+            eddy_type_of[path] = eddy_type
+
+        return self._prefer_rep(resolved, eddy_type_of)
+
+    def _prefer_rep(
+        self, resolved: dict[Path, DateRange], eddy_type_of: dict[Path, str]
+    ) -> dict[Path, DateRange]:
+        """
+        Clip near-real-time windows to start after the reprocessed data ends.
+
+        rep and nrt overlap on the server — AVISO's nrt trajectory file spans
+        2018 to today while META3.2 delayed-time runs to 2022 — and the
+        reprocessed product is the better one where both exist. The downloader
+        already applies this (`nrt_start = rep_avail.end + 1 day`), but a
+        conversion reads whatever files are on disk, so without the same rule
+        both sources contribute to the overlap and ``xr.merge`` either combines
+        two versions of the same period or raises on the cells where they
+        disagree.
+
+        Applied per eddy type, since anticyclonic and cyclonic are independent
+        streams. Files with no rep/nrt directory in their path are left alone,
+        which keeps legacy flat layouts working.
+        """
+        rep_end: dict[str, pd.Timestamp] = {}
+        for path, window in resolved.items():
+            if _raw_source(path) == "rep":
+                key = eddy_type_of[path]
+                rep_end[key] = max(rep_end.get(key, window.end), window.end)
+
+        if not rep_end:
+            return resolved
+
+        out: dict[Path, DateRange] = {}
+        for path, window in resolved.items():
+            end = rep_end.get(eddy_type_of[path])
+            if _raw_source(path) != "nrt" or end is None:
+                out[path] = window
+                continue
+
+            start = max(window.start, pd.Timestamp(end) + pd.Timedelta(days=1))
+            if start > window.end:
+                logger.debug(
+                    f"[{self.var_key}] {path.name} fully covered by reprocessed "
+                    f"data (rep ends {pd.Timestamp(end).date()}) — skipping"
+                )
+                continue
+            if start != window.start:
+                logger.info(
+                    f"[{self.var_key}] {path.name}: deferring to reprocessed data, "
+                    f"converting from {start.date()} instead of {window.start.date()}"
+                )
+            out[path] = DateRange(start, window.end)
+        return out
 
     def _resolve_date_range(
         self,
         download_range: DateRange,
         start_date: Optional[DateLike] = None,
         end_date: Optional[DateLike] = None,
-    ) -> DateRange:
+    ) -> Optional[DateRange]:
         """
-        Check if input date ranges overlap with downloaded file range.
+        Overlap between the requested range and one downloaded file's own range.
+
+        Returns ``None`` when they do not overlap, or when the store is already
+        up to date.
 
         Args:
             path: path for file to check dates in file name
@@ -365,18 +582,22 @@ class EDDIESProcessor:
         requested_range = resolve_date_range(self.var_key, start, end)
         if requested_range is None:
             return None
-        overlap = requested_range.intersection(download_range)
-
-        if overlap:
-            return overlap
-        else:
-            raise ValueError(
-                f"Requested range {requested_range} does not overlap with available datasets"
-            )
+        # None rather than raising: a raw directory may legitimately hold files
+        # outside the requested window, and one of them must not abort the run.
+        return requested_range.intersection(download_range)
 
     def _prepare_raw_dataset(self, path: Path, dates: DateRange) -> xr.Dataset:
         """Preprocess original dataframe to subset by geo_extent with +10deg for distance calculations and by time range"""
         with xr.open_dataset(path) as ds:
+            missing = [v for v in self.var_config.source_vars if v not in ds.variables]
+            if missing:
+                # e.g. AVISO's "untracked" eddy files carry no `track` variable.
+                # Without this the failure is a bare KeyError several frames down.
+                raise ValueError(
+                    f"{path.name} is missing source_vars {missing} — it is not a "
+                    f"'{self.var_key}' file the pipeline can read. Narrow the "
+                    "selection with the variable's `raw_include` in config.yaml."
+                )
             ds = ds[self.var_config.source_vars]
             ds["longitude"] = ds["longitude"] - 360
             ds["time"] = ds["time"].dt.floor("D")

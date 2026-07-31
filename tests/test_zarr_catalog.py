@@ -1,11 +1,14 @@
 """Tests for ZarrCatalog: build_file_path, dataset column, and provenance sidecars."""
 
 import json
+from typing import Sequence
 
 import msgspec
 import numpy as np
 import pandas as pd
+import pytest
 import xarray as xr
+from loguru import logger
 
 from h2mare.models import AppConfig
 from h2mare.storage.zarr_catalog import ZarrCatalog
@@ -172,7 +175,7 @@ class TestDatasetColumn:
         zarr_path = _write_zarr(tmp_path, ds)
         catalog = _make_catalog(tmp_path)
 
-        rows = catalog._scanner._extract_zarr_metadata(zarr_path)
+        rows = catalog._index._scanner._extract_zarr_metadata(zarr_path)
 
         assert len(rows) == 1
         assert rows[0]["dataset"] == _ENTRY["dataset_id_rep"]
@@ -201,7 +204,7 @@ class TestDatasetColumn:
         zarr.consolidate_metadata(str(zarr_path))
         catalog = _make_catalog(tmp_path)
 
-        rows = catalog._scanner._extract_zarr_metadata(zarr_path)
+        rows = catalog._index._scanner._extract_zarr_metadata(zarr_path)
 
         assert len(rows) == 2
         assert rows[0]["dataset"] == "REP_ID"
@@ -232,7 +235,7 @@ class TestDatasetColumn:
         )
         catalog = _make_catalog(tmp_path)
 
-        rows = catalog._scanner._extract_zarr_metadata(zarr_path)
+        rows = catalog._index._scanner._extract_zarr_metadata(zarr_path)
 
         assert len(rows) == 2
         assert rows[0]["dataset"] == "REP_ID"
@@ -241,7 +244,7 @@ class TestDatasetColumn:
     def test_get_paths_in_range_deduplicates(self, tmp_path):
         zarr_path = tmp_path / "dummy.zarr"
         catalog = _make_catalog(tmp_path)
-        catalog._df_cache = _two_row_df(zarr_path)
+        catalog._index._df_cache = _two_row_df(zarr_path)
 
         result = catalog.get_paths_in_range("2023-01-01", "2023-12-31")
 
@@ -250,7 +253,7 @@ class TestDatasetColumn:
     def test_map_dates_to_paths_with_split_rows(self, tmp_path):
         zarr_path = tmp_path / "dummy.zarr"
         catalog = _make_catalog(tmp_path)
-        catalog._df_cache = _two_row_df(zarr_path)
+        catalog._index._df_cache = _two_row_df(zarr_path)
 
         result = catalog.map_dates_to_paths(["2023-03-15", "2023-09-20"])
 
@@ -272,7 +275,7 @@ class TestDatasetColumn:
         catalog.catalog_path.parent.mkdir(parents=True, exist_ok=True)
         old_df.to_parquet(catalog.catalog_path, index=False)
 
-        df = catalog._load_from_disk()
+        df = catalog._index._load_from_disk()
 
         assert "dataset" in df.columns
         assert (df["dataset"] == _ENTRY["dataset_id_rep"]).all()
@@ -338,7 +341,7 @@ class TestVarsNonnullEnd:
         ds = _make_padded_ds("2026-05-01", n_days=15, n_valid=10, var="ac_amp")
         zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
         catalog = _make_catalog(tmp_path)
-        catalog._df_cache = _df_for_zarr(zarr_path, ["ac_amp"], "2026-05-15")
+        catalog._index._df_cache = _df_for_zarr(zarr_path, ["ac_amp"], "2026-05-15")
 
         result = catalog.get_vars_nonnull_end(["ac_amp"])
 
@@ -350,7 +353,9 @@ class TestVarsNonnullEnd:
         ds = _make_padded_ds("2026-05-01", n_days=15, n_valid=12, var="ac_amp")
         zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
         catalog = _make_catalog(tmp_path)
-        catalog._df_cache = _df_for_zarr(zarr_path, np.array(["ac_amp"]), "2026-05-15")
+        catalog._index._df_cache = _df_for_zarr(
+            zarr_path, np.array(["ac_amp"]), "2026-05-15"
+        )
 
         result = catalog.get_vars_nonnull_end(["ac_amp"])
 
@@ -360,7 +365,7 @@ class TestVarsNonnullEnd:
         ds = _make_padded_ds("2026-05-01", n_days=5, n_valid=5, var="ac_amp")
         zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
         catalog = _make_catalog(tmp_path)
-        catalog._df_cache = _df_for_zarr(zarr_path, ["ac_amp"], "2026-05-05")
+        catalog._index._df_cache = _df_for_zarr(zarr_path, ["ac_amp"], "2026-05-05")
 
         assert catalog.get_vars_nonnull_end(["not_a_var"]) == {}
 
@@ -368,7 +373,7 @@ class TestVarsNonnullEnd:
         # Regression: ndarray cells previously made membership checks always
         # false, so this silently returned None for disk-loaded catalogs.
         catalog = _make_catalog(tmp_path)
-        catalog._df_cache = _df_for_zarr(
+        catalog._index._df_cache = _df_for_zarr(
             tmp_path / "h2ds_2026.zarr", np.array(["ac_amp", "c_amp"]), "2026-05-15"
         )
 
@@ -399,3 +404,566 @@ class TestGetBbox:
         catalog = _make_catalog(tmp_path)
         catalog.var_config.bbox = BBox(-10.0, 30.0, 0.0, 40.0)
         assert catalog.get_bbox() == BBox(-10.0, 30.0, 0.0, 40.0)
+
+
+# ---------------------------------------------------------------------------
+# Catalog cache semantics (_df_cache / auto_refresh)
+#
+# Characterization tests over ZarrIndex, driven through the ZarrCatalog facade
+# so both the delegation and the underlying contract stay covered. ``_df_cache``
+# is the only mutable state involved, written solely by refresh/df/reload.
+# They are not regression tests for a bug — they pin the refresh/scan contract
+# so it stays observable as this class is split up.
+# ---------------------------------------------------------------------------
+
+
+class _FakeScanner:
+    """Counting stand-in for ZarrDirectoryScanner.
+
+    Records how often the store is scanned and how often it is interrogated
+    for changes, so tests can assert on rescan behaviour rather than on IO.
+    """
+
+    def __init__(self, records=None, changes: bool = False):
+        self._records = records if records is not None else []
+        self.changes = changes
+        self.scan_calls = 0
+        self.has_changes_calls = 0
+        self.reset_calls = 0
+
+    def scan(self):
+        self.scan_calls += 1
+        return list(self._records)
+
+    def has_changes(self) -> bool:
+        self.has_changes_calls += 1
+        return self.changes
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+
+def _record(path, start="2020-01-01", end="2020-12-31") -> dict:
+    return {
+        "path": str(path),
+        "filename": path.name,
+        "start_date": pd.Timestamp(start),
+        "end_date": pd.Timestamp(end),
+    }
+
+
+def _catalog_with_scanner(tmp_path, scanner, *, auto_refresh: bool = False):
+    """Catalog wired to *scanner*, with metadata kept inside tmp_path.
+
+    Built with auto_refresh=False so no scan happens during __init__; the flag
+    is applied afterwards, once the fake scanner is in place.
+    """
+    catalog = ZarrCatalog(
+        "sst",
+        app_config=_make_app_config(),
+        store_root=tmp_path,
+        metadata_root=tmp_path / "metadata",
+        auto_refresh=False,
+    )
+    catalog._index._scanner = scanner
+    catalog.auto_refresh = auto_refresh
+    return catalog
+
+
+class TestCacheSemantics:
+    def test_auto_refresh_false_scans_once(self, tmp_path):
+        """With auto_refresh=False the store is scanned once and cached."""
+        scanner = _FakeScanner([_record(tmp_path / "a.zarr")], changes=True)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+
+        catalog.df
+        catalog.df
+
+        assert scanner.scan_calls == 1
+
+    def test_auto_refresh_true_rechecks_on_every_access(self, tmp_path):
+        """With auto_refresh=True every .df access re-interrogates the store.
+
+        This is the documented cost behind the snapshot comment in
+        map_dates_to_paths — one directory stat per access, not per call site.
+        """
+        scanner = _FakeScanner(changes=False)
+        catalog = _catalog_with_scanner(tmp_path, scanner, auto_refresh=True)
+        catalog._index._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
+
+        catalog.df
+        catalog.df
+
+        assert scanner.has_changes_calls == 2
+        assert scanner.scan_calls == 0
+
+    def test_refresh_uses_cache_when_no_changes(self, tmp_path):
+        scanner = _FakeScanner(changes=False)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+        catalog._index._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
+
+        catalog.refresh()
+
+        assert scanner.scan_calls == 0
+
+    def test_refresh_force_rescans_when_no_changes(self, tmp_path):
+        scanner = _FakeScanner([_record(tmp_path / "a.zarr")], changes=False)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+        catalog._index._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
+
+        catalog.refresh(force=True)
+
+        assert scanner.scan_calls == 1
+
+    def test_reload_clears_cache_and_resets_scanner(self, tmp_path):
+        scanner = _FakeScanner([_record(tmp_path / "a.zarr")], changes=False)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+        catalog._index._df_cache = pd.DataFrame([_record(tmp_path / "a.zarr")])
+
+        catalog.reload()
+
+        assert scanner.reset_calls == 1
+        assert scanner.scan_calls == 1
+
+    def test_missing_catalog_file_triggers_initial_scan(self, tmp_path):
+        """No catalog parquet on disk: the store is scanned to build one."""
+        scanner = _FakeScanner([_record(tmp_path / "a.zarr")], changes=False)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+        assert not catalog.exists()
+
+        catalog.refresh()
+
+        assert scanner.scan_calls == 1
+        assert catalog.exists()
+
+    def test_stale_catalog_on_disk_triggers_rescan(self, tmp_path):
+        """A catalog that disagrees with the store directory is rebuilt.
+
+        The scanner reports no changes, so only the disk-vs-catalog filename
+        comparison can catch that b.zarr was added out of band.
+        """
+        (tmp_path / "a.zarr").mkdir()
+        (tmp_path / "b.zarr").mkdir()
+        scanner = _FakeScanner(
+            [_record(tmp_path / "a.zarr"), _record(tmp_path / "b.zarr")],
+            changes=False,
+        )
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+        # Catalog on disk knows about a.zarr only.
+        catalog.catalog_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([_record(tmp_path / "a.zarr")]).to_parquet(
+            catalog.catalog_path, index=False
+        )
+
+        df = catalog.refresh()
+
+        assert scanner.scan_calls == 1
+        assert set(df["filename"]) == {"a.zarr", "b.zarr"}
+
+    def test_fresh_catalog_on_disk_is_loaded_without_rescan(self, tmp_path):
+        """Catalog and store agree: load from parquet, do not rescan."""
+        (tmp_path / "a.zarr").mkdir()
+        scanner = _FakeScanner([_record(tmp_path / "a.zarr")], changes=False)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+        catalog.catalog_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([_record(tmp_path / "a.zarr")]).to_parquet(
+            catalog.catalog_path, index=False
+        )
+
+        catalog.refresh()
+
+        assert scanner.scan_calls == 0
+
+    def test_has_changes_delegates_to_scanner(self, tmp_path):
+        scanner = _FakeScanner(changes=True)
+        catalog = _catalog_with_scanner(tmp_path, scanner)
+
+        assert catalog.has_changes() is True
+        assert scanner.has_changes_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# open_dataset routing
+#
+# Characterization tests for the dispatch contract only: the sparse/range
+# split, the mutually-exclusive-modes guard, the no-argument fallback and
+# bbox coercion. The zarr IO inside each branch is stubbed out on purpose.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def routed_catalog(tmp_path, monkeypatch):
+    """Catalog whose two open paths are replaced by call recorders."""
+    catalog = ZarrCatalog(
+        "sst",
+        app_config=_make_app_config(),
+        store_root=tmp_path,
+        metadata_root=tmp_path / "metadata",
+        auto_refresh=False,
+    )
+    calls: dict = {}
+
+    def _sparse(**kwargs):
+        calls["mode"] = "sparse"
+        calls["kwargs"] = kwargs
+        return "sparse-ds"
+
+    def _range(**kwargs):
+        calls["mode"] = "range"
+        calls["kwargs"] = kwargs
+        return "range-ds"
+
+    monkeypatch.setattr(catalog._reader, "_open_sparse_dates", _sparse)
+    monkeypatch.setattr(catalog._reader, "_open_date_range", _range)
+    return catalog, calls
+
+
+class TestOpenDatasetRouting:
+    def test_dates_route_to_sparse(self, routed_catalog):
+        catalog, calls = routed_catalog
+
+        result = catalog.open_dataset(dates=["2020-01-15", "2020-06-20"])
+
+        assert result == "sparse-ds"
+        assert calls["mode"] == "sparse"
+        assert calls["kwargs"]["dates"] == ["2020-01-15", "2020-06-20"]
+
+    def test_start_end_route_to_date_range(self, routed_catalog):
+        catalog, calls = routed_catalog
+
+        result = catalog.open_dataset(start_date="2020-01-01", end_date="2020-12-31")
+
+        assert result == "range-ds"
+        assert calls["mode"] == "range"
+        assert calls["kwargs"]["start_date"] == "2020-01-01"
+        assert calls["kwargs"]["end_date"] == "2020-12-31"
+
+    def test_start_only_routes_to_date_range(self, routed_catalog):
+        catalog, calls = routed_catalog
+
+        catalog.open_dataset(start_date="2020-01-01")
+
+        assert calls["mode"] == "range"
+        assert calls["kwargs"]["end_date"] is None
+
+    def test_both_modes_raise(self, routed_catalog):
+        catalog, calls = routed_catalog
+
+        with pytest.raises(ValueError, match="Cannot use both"):
+            catalog.open_dataset(dates=["2020-01-15"], start_date="2020-01-01")
+
+        assert calls == {}
+
+    def test_no_args_falls_back_to_time_coverage(self, routed_catalog, tmp_path):
+        """With no dates at all, the full catalog extent becomes the window."""
+        catalog, calls = routed_catalog
+        catalog._index._df_cache = pd.DataFrame(
+            [
+                _record(tmp_path / "a.zarr", "2020-01-01", "2020-06-30"),
+                _record(tmp_path / "b.zarr", "2020-07-01", "2020-12-31"),
+            ]
+        )
+
+        catalog.open_dataset()
+
+        assert calls["mode"] == "range"
+        assert calls["kwargs"]["start_date"] == pd.Timestamp("2020-01-01")
+        assert calls["kwargs"]["end_date"] == pd.Timestamp("2020-12-31")
+
+    def test_no_args_without_coverage_raises(self, routed_catalog):
+        catalog, calls = routed_catalog
+        catalog._index._df_cache = pd.DataFrame()
+
+        with pytest.raises(ValueError, match="Please provide sparse"):
+            catalog.open_dataset()
+
+        assert calls == {}
+
+    def test_bbox_tuple_is_coerced(self, routed_catalog):
+        """A raw tuple is normalised to BBox before reaching the open path."""
+        catalog, calls = routed_catalog
+
+        catalog.open_dataset(dates=["2020-01-15"], bbox=(-10.0, 30.0, 0.0, 40.0))
+
+        assert calls["kwargs"]["bbox"] == BBox(-10.0, 30.0, 0.0, 40.0)
+
+    def test_bbox_instance_passes_through(self, routed_catalog):
+        catalog, calls = routed_catalog
+        bbox = BBox(-10.0, 30.0, 0.0, 40.0)
+
+        catalog.open_dataset(dates=["2020-01-15"], bbox=bbox)
+
+        assert calls["kwargs"]["bbox"] is bbox
+
+
+# ---------------------------------------------------------------------------
+# open_dataset — integration
+#
+# These drive the real opening paths against real Zarr stores on disk:
+# _open_sparse_dates, _open_date_range, _preprocess_dataset, _apply_bbox and
+# _normalize_time. Nothing is mocked — the catalog scans the files it is given
+# and xr.open_mfdataset actually reads them.
+#
+# The routing tests above cover which branch runs; these cover what each branch
+# does. Together they are the safety net for moving this logic into its own
+# class.
+# ---------------------------------------------------------------------------
+
+# 2-degree grid, so a one-cell bbox pad is unambiguous in assertions.
+_LATS = [30.0, 32.0, 34.0, 36.0, 38.0, 40.0]
+_LONS = [-10.0, -8.0, -6.0, -4.0, -2.0, 0.0]
+
+
+def _grid_ds(
+    start: str,
+    n_days: int,
+    *,
+    variables: Sequence[str] = ("sst",),
+    hour: int = 0,
+    lat_descending: bool = False,
+) -> xr.Dataset:
+    """Gridded dataset on the 6x6 test grid, one value per (time, lat, lon)."""
+    times = pd.date_range(f"{start} {hour:02d}:00", periods=n_days, freq="D")
+    lats = list(reversed(_LATS)) if lat_descending else list(_LATS)
+    data = {
+        name: (
+            ["time", "lat", "lon"],
+            np.full((n_days, len(lats), len(_LONS)), float(i + 1)),
+        )
+        for i, name in enumerate(variables)
+    }
+    return xr.Dataset(
+        data,
+        coords={"time": times, "lat": lats, "lon": list(_LONS)},
+    )
+
+
+def _scanned_catalog(tmp_path, datasets: dict, *, verbose: bool = False) -> ZarrCatalog:
+    """Write *datasets* as zarr stores, then return a catalog that scanned them.
+
+    Built with auto_refresh=True and a tmp metadata root, so the catalog rows
+    come from the real scanner rather than an injected DataFrame.
+    """
+    for name, ds in datasets.items():
+        _write_zarr(tmp_path, ds, name=name)
+    return ZarrCatalog(
+        "sst",
+        app_config=_make_app_config(),
+        store_root=tmp_path,
+        metadata_root=tmp_path / "metadata",
+        auto_refresh=True,
+        verbose=verbose,
+    )
+
+
+@pytest.fixture
+def warnings_logged():
+    """Collect loguru WARNING messages (the catalog logs via loguru, not stdlib)."""
+    messages: list[str] = []
+    sink_id = logger.add(
+        lambda m: messages.append(m.record["message"]), level="WARNING"
+    )
+    yield messages
+    logger.remove(sink_id)
+
+
+@pytest.fixture
+def two_file_catalog(tmp_path):
+    """Catalog over two zarr files: 2020-01-01..01-10 and 2020-02-01..02-10."""
+    return _scanned_catalog(
+        tmp_path,
+        {
+            "sst_2020a.zarr": _grid_ds("2020-01-01", 10),
+            "sst_2020b.zarr": _grid_ds("2020-02-01", 10),
+        },
+    )
+
+
+class TestOpenDatasetIntegration:
+    def test_catalog_scanned_both_files(self, two_file_catalog):
+        """Guard for the tests below: the fixture really did index two stores."""
+        assert two_file_catalog.df["path"].nunique() == 2
+
+    # ---- date range mode ----
+
+    def test_range_spans_both_files(self, two_file_catalog):
+        ds = two_file_catalog.open_dataset(
+            start_date="2020-01-01", end_date="2020-02-10"
+        )
+        assert ds.sizes["time"] == 20
+        assert pd.Timestamp(ds.time.values[0]) == pd.Timestamp("2020-01-01")
+        assert pd.Timestamp(ds.time.values[-1]) == pd.Timestamp("2020-02-10")
+
+    def test_range_within_one_file(self, two_file_catalog):
+        ds = two_file_catalog.open_dataset(
+            start_date="2020-01-03", end_date="2020-01-05"
+        )
+        assert ds.sizes["time"] == 3
+
+    def test_range_start_before_coverage_returns_available_data(self, two_file_catalog):
+        """A too-early start opens from what exists rather than failing."""
+        ds = two_file_catalog.open_dataset(
+            start_date="2015-01-01", end_date="2020-01-05"
+        )
+        assert pd.Timestamp(ds.time.values[0]) == pd.Timestamp("2020-01-01")
+
+    def test_range_end_after_coverage_returns_available_data(self, two_file_catalog):
+        ds = two_file_catalog.open_dataset(
+            start_date="2020-02-01", end_date="2030-01-01"
+        )
+        assert pd.Timestamp(ds.time.values[-1]) == pd.Timestamp("2020-02-10")
+
+    def test_out_of_range_request_warns_about_clamping(self, tmp_path, warnings_logged):
+        """The clamp itself is only observable in the log.
+
+        ``ds.sel(time=slice(...))`` clips to what exists regardless, so asserting
+        on the returned times cannot distinguish a clamped request from an
+        unclamped one — only the warning can.
+        """
+        catalog = _scanned_catalog(
+            tmp_path, {"sst_2020.zarr": _grid_ds("2020-01-01", 10)}, verbose=True
+        )
+
+        catalog.open_dataset(start_date="2015-01-01", end_date="2030-01-01")
+
+        assert sum("not available" in m for m in warnings_logged) == 2
+
+    def test_in_range_request_does_not_warn(self, tmp_path, warnings_logged):
+        catalog = _scanned_catalog(
+            tmp_path, {"sst_2020.zarr": _grid_ds("2020-01-01", 10)}, verbose=True
+        )
+
+        catalog.open_dataset(start_date="2020-01-02", end_date="2020-01-05")
+
+        assert not any("not available" in m for m in warnings_logged)
+
+    def test_range_entirely_outside_coverage_raises(self, two_file_catalog):
+        with pytest.raises(FileNotFoundError, match="No zarr files found"):
+            two_file_catalog.open_dataset(
+                start_date="2030-01-01", end_date="2030-02-01"
+            )
+
+    def test_no_dates_opens_full_extent(self, two_file_catalog):
+        ds = two_file_catalog.open_dataset()
+        assert ds.sizes["time"] == 20
+
+    # ---- sparse dates mode ----
+
+    def test_sparse_dates_across_files(self, two_file_catalog):
+        ds = two_file_catalog.open_dataset(dates=["2020-01-05", "2020-02-03"])
+        got = [pd.Timestamp(t) for t in ds.time.values]
+        assert got == [pd.Timestamp("2020-01-05"), pd.Timestamp("2020-02-03")]
+
+    def test_sparse_dates_partially_missing_returns_the_rest(self, two_file_catalog):
+        """A date inside the store span but absent from any file is dropped."""
+        ds = two_file_catalog.open_dataset(dates=["2020-01-05", "2020-01-20"])
+        got = [pd.Timestamp(t) for t in ds.time.values]
+        assert got == [pd.Timestamp("2020-01-05")]
+
+    def test_sparse_dates_none_present_raises(self, two_file_catalog):
+        with pytest.raises(FileNotFoundError, match="No zarr files contain dates"):
+            two_file_catalog.open_dataset(dates=["1999-01-01"])
+
+    def test_sparse_empty_date_list_raises(self, two_file_catalog):
+        with pytest.raises(ValueError, match="No valid dates provided"):
+            two_file_catalog.open_dataset(dates=[])
+
+    # ---- variable selection (_preprocess_dataset) ----
+
+    def test_variables_subset_is_applied(self, tmp_path):
+        catalog = _scanned_catalog(
+            tmp_path,
+            {"multi.zarr": _grid_ds("2020-01-01", 3, variables=("sst", "chl"))},
+        )
+        ds = catalog.open_dataset(
+            start_date="2020-01-01", end_date="2020-01-03", variables=["sst"]
+        )
+        assert set(ds.data_vars) == {"sst"}
+
+    def test_variables_accepts_a_plain_string(self, tmp_path):
+        catalog = _scanned_catalog(
+            tmp_path,
+            {"multi.zarr": _grid_ds("2020-01-01", 3, variables=("sst", "chl"))},
+        )
+        ds = catalog.open_dataset(
+            start_date="2020-01-01", end_date="2020-01-03", variables="chl"
+        )
+        assert set(ds.data_vars) == {"chl"}
+
+    def test_unknown_variable_falls_back_to_all(self, tmp_path):
+        """None of the requested variables exist: warn and keep the dataset whole."""
+        catalog = _scanned_catalog(
+            tmp_path,
+            {"multi.zarr": _grid_ds("2020-01-01", 3, variables=("sst", "chl"))},
+        )
+        ds = catalog.open_dataset(
+            start_date="2020-01-01", end_date="2020-01-03", variables=["not_a_var"]
+        )
+        assert set(ds.data_vars) == {"sst", "chl"}
+
+    # ---- bbox (_apply_bbox) ----
+
+    def test_bbox_subsets_with_one_cell_padding(self, two_file_catalog):
+        """sel_padded_bbox keeps one grid cell beyond each requested edge."""
+        ds = two_file_catalog.open_dataset(
+            start_date="2020-01-01",
+            end_date="2020-01-03",
+            bbox=(-6.0, 34.0, -4.0, 36.0),
+        )
+        assert list(ds.lat.values) == [32.0, 34.0, 36.0, 38.0]
+        assert list(ds.lon.values) == [-8.0, -6.0, -4.0, -2.0]
+
+    def test_bbox_accepts_a_bbox_instance(self, two_file_catalog):
+        ds = two_file_catalog.open_dataset(
+            start_date="2020-01-01",
+            end_date="2020-01-03",
+            bbox=BBox(-6.0, 34.0, -4.0, 36.0),
+        )
+        assert list(ds.lat.values) == [32.0, 34.0, 36.0, 38.0]
+
+    def test_bbox_without_lat_lon_coords_returns_dataset_unchanged(self, tmp_path):
+        """Degenerate grid: log and pass through rather than raise."""
+        catalog = _make_catalog(tmp_path)
+        ds = xr.Dataset(
+            {"sst": (["row", "col"], np.ones((2, 2)))},
+            coords={"row": [0, 1], "col": [0, 1]},
+        )
+
+        out = catalog._reader._apply_bbox(ds, BBox(-6.0, 34.0, -4.0, 36.0))
+
+        assert out.sizes == ds.sizes
+
+    # ---- lat ordering + time normalisation ----
+
+    def test_descending_lat_is_sorted_ascending(self, tmp_path):
+        """ERA5-style north-to-south grids are flipped so slicing works."""
+        catalog = _scanned_catalog(
+            tmp_path,
+            {"desc.zarr": _grid_ds("2020-01-01", 3, lat_descending=True)},
+        )
+        ds = catalog.open_dataset(start_date="2020-01-01", end_date="2020-01-03")
+        assert list(ds.lat.values) == sorted(_LATS)
+
+    def test_time_of_day_is_normalised_to_midnight(self, tmp_path):
+        catalog = _scanned_catalog(
+            tmp_path, {"noon.zarr": _grid_ds("2020-01-01", 3, hour=12)}
+        )
+        ds = catalog.open_dataset(start_date="2020-01-01", end_date="2020-01-03")
+        assert all(pd.Timestamp(t).hour == 0 for t in ds.time.values)
+
+    def test_normalize_time_passes_through_without_time_coord(self, tmp_path):
+        """Static fields (e.g. bathy) have no time axis and must survive intact."""
+        catalog = _make_catalog(tmp_path)
+        ds = xr.Dataset(
+            {"bathy": (["lat", "lon"], np.ones((2, 2)))},
+            coords={"lat": [30.0, 32.0], "lon": [-10.0, -8.0]},
+        )
+
+        assert catalog._reader._normalize_time(ds) is ds
+
+    def test_range_on_empty_catalog_raises(self, tmp_path):
+        """Explicit dates against a store with no zarr files at all."""
+        catalog = _scanned_catalog(tmp_path, {})
+
+        with pytest.raises(FileNotFoundError, match="Catalog is empty"):
+            catalog.open_dataset(start_date="2020-01-01", end_date="2020-01-03")

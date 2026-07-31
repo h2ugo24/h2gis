@@ -18,6 +18,9 @@ dist/
 # MkDocs build output
 site/
 
+# Knowledge-graph output (generated, rebuildable)
+graphify-out/
+
 # vscode
 .vscode/
 
@@ -33,6 +36,3 @@ site/
 
 # Scripts (work in progress)
 scripts/masked_spatial_maps.py
-
-# Local-only Task Scheduler wrapper (machine-specific)
-scripts/run_pipeline.bat

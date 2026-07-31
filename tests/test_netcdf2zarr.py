@@ -12,7 +12,7 @@ import xarray as xr
 
 from h2mare.format_converters.netcdf2zarr import Netcdf2Zarr
 from h2mare.models import AppConfig
-from h2mare.types import TimeResolution
+from h2mare.types import DateRange, TimeResolution
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -373,3 +373,209 @@ class TestProcessDataset:
         ):
             result = n2z.process_dataset(ds)
         assert "sst" in result
+
+
+# ---------------------------------------------------------------------------
+# run() date window
+#
+# Re-converting one period from raw files already on disk needs a window:
+# without it the only way to redo a period was `h2mare run`, which downloads.
+# ---------------------------------------------------------------------------
+
+
+class TestRunWindow:
+    def test_window_restricts_the_periods_converted(self, tmp_path):
+        """Only files inside the window are grouped for conversion."""
+        converter = _make_converter(tmp_path)
+        series = pd.Series(
+            ["a.nc", "b.nc", "c.nc"],
+            index=pd.DatetimeIndex(["2020-06-01", "2021-06-01", "2022-06-01"]),
+        )
+
+        with patch.object(converter, "_get_file_date_series", return_value=series):
+            groups = converter._group_map(
+                TimeResolution.YEAR,
+                window=DateRange(
+                    pd.Timestamp("2021-01-01"), pd.Timestamp("2021-12-31")
+                ),
+            )
+
+        assert list(groups) == [2021]
+
+    def test_no_window_converts_everything(self, tmp_path):
+        converter = _make_converter(tmp_path)
+        series = pd.Series(
+            ["a.nc", "b.nc"],
+            index=pd.DatetimeIndex(["2020-06-01", "2021-06-01"]),
+        )
+
+        with patch.object(converter, "_get_file_date_series", return_value=series):
+            groups = converter._group_map(TimeResolution.YEAR)
+
+        assert sorted(groups) == [2020, 2021]
+
+    def test_window_matching_nothing_returns_no_groups(self, tmp_path):
+        converter = _make_converter(tmp_path)
+        series = pd.Series(["a.nc"], index=pd.DatetimeIndex(["2020-06-01"]))
+
+        with patch.object(converter, "_get_file_date_series", return_value=series):
+            groups = converter._group_map(
+                TimeResolution.YEAR,
+                window=DateRange(
+                    pd.Timestamp("2030-01-01"), pd.Timestamp("2030-12-31")
+                ),
+            )
+
+        assert groups == {}
+
+    def test_run_passes_the_window_through(self, tmp_path):
+        converter = _make_converter(tmp_path)
+
+        with (
+            patch.object(converter, "_group_map", return_value={}) as mock_group,
+            patch("h2mare.format_converters.netcdf2zarr.recover_zarr_store"),
+        ):
+            converter.run("2021-01-01", "2021-12-31")
+
+        window = mock_group.call_args.kwargs["window"]
+        assert window.start == pd.Timestamp("2021-01-01")
+        assert window.end == pd.Timestamp("2021-12-31")
+
+    def test_run_without_dates_passes_no_window(self, tmp_path):
+        converter = _make_converter(tmp_path)
+
+        with (
+            patch.object(converter, "_group_map", return_value={}) as mock_group,
+            patch("h2mare.format_converters.netcdf2zarr.recover_zarr_store"),
+        ):
+            converter.run()
+
+        assert mock_group.call_args.kwargs["window"] is None
+
+    def test_trajectory_vars_forward_dates_to_the_processor(self, tmp_path):
+        """Regression: eddies ignored the window because run() took no dates."""
+        converter = _make_converter(tmp_path)
+        converter.var_config.trajectory_format = True
+
+        with (
+            patch.object(converter, "_process_eddies") as mock_eddies,
+            patch("h2mare.format_converters.netcdf2zarr.recover_zarr_store"),
+        ):
+            converter.run("2026-04-21", "2026-07-13")
+
+        assert mock_eddies.call_args[0] == ("2026-04-21", "2026-07-13")
+
+
+# ---------------------------------------------------------------------------
+# Raw staging safety
+#
+# _stage_eddies_to_store moves freshly downloaded raw files into the store.
+# Pointing `convert --in-dir` at an archive_raw store makes download_root and
+# store_root the same directory, at which point every move is a move onto
+# itself — and safe_move_files unlinks the destination before moving, so the
+# source is deleted outright.
+# ---------------------------------------------------------------------------
+
+
+class TestStagingSafety:
+    def _store_with_raw(self, tmp_path):
+        """A store laid out the way archive_raw leaves it."""
+        store = tmp_path / "store"
+        (store / "rep").mkdir(parents=True)
+        (store / "nrt").mkdir(parents=True)
+        (store / "rep" / "rep_a_19930101_20220209.nc").write_text("rep")
+        (store / "nrt" / "nrt_a_20180101_20260713.nc").write_text("nrt")
+        return store
+
+    def test_no_staging_when_raw_already_lives_in_the_store(self, tmp_path):
+        """Regression: this deleted the raw files instead of moving them."""
+        store = self._store_with_raw(tmp_path)
+        converter = _make_converter(tmp_path)
+        converter.store_root = store
+
+        converter._stage_eddies_to_store(store)
+
+        assert (store / "rep" / "rep_a_19930101_20220209.nc").exists()
+        assert (store / "nrt" / "nrt_a_20180101_20260713.nc").exists()
+
+    def test_staging_still_moves_from_a_separate_download_root(self, tmp_path):
+        store = tmp_path / "store"
+        (store).mkdir()
+        downloads = tmp_path / "downloads"
+        (downloads / "nrt").mkdir(parents=True)
+        (downloads / "nrt" / "new_20180101_20260713.nc").write_text("new")
+
+        converter = _make_converter(tmp_path)
+        converter.store_root = store
+
+        converter._stage_eddies_to_store(downloads)
+
+        assert (store / "nrt" / "new_20180101_20260713.nc").exists()
+        assert not (downloads / "nrt" / "new_20180101_20260713.nc").exists()
+
+    def test_stale_nrt_is_replaced_but_incoming_survives(self, tmp_path):
+        """The new snapshot lands before anything is deleted."""
+        store = tmp_path / "store"
+        (store / "nrt").mkdir(parents=True)
+        (store / "nrt" / "old_20180101_20250101.nc").write_text("old")
+        downloads = tmp_path / "downloads"
+        (downloads / "nrt").mkdir(parents=True)
+        (downloads / "nrt" / "new_20180101_20260713.nc").write_text("new")
+
+        converter = _make_converter(tmp_path)
+        converter.store_root = store
+
+        converter._stage_eddies_to_store(downloads)
+
+        assert (store / "nrt" / "new_20180101_20260713.nc").exists()
+        assert not (store / "nrt" / "old_20180101_20250101.nc").exists()
+
+    def test_failed_move_leaves_the_existing_snapshot_intact(self, tmp_path):
+        """A move that dies part way must not have already cleared the store.
+
+        Clearing the destination first meant a failure left neither the old
+        snapshot nor the new one.
+        """
+        store = tmp_path / "store"
+        (store / "nrt").mkdir(parents=True)
+        (store / "nrt" / "old_20180101_20250101.nc").write_text("old")
+        downloads = tmp_path / "downloads"
+        (downloads / "nrt").mkdir(parents=True)
+        (downloads / "nrt" / "new_20180101_20260713.nc").write_text("new")
+
+        converter = _make_converter(tmp_path)
+        converter.store_root = store
+
+        with patch(
+            "h2mare.format_converters.netcdf2zarr.safe_move_files",
+            side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError):
+                converter._stage_eddies_to_store(downloads)
+
+        assert (store / "nrt" / "old_20180101_20250101.nc").exists()
+
+    def test_windowed_conversion_does_not_stage(self, tmp_path):
+        """Staging is download cleanup; a re-conversion must not move raw files."""
+        converter = _make_converter(tmp_path)
+        converter.var_config.trajectory_format = True
+
+        with (
+            patch("h2mare.processing.core.aviso.EDDIESProcessor"),
+            patch.object(converter, "_stage_eddies_to_store") as mock_stage,
+        ):
+            converter._process_eddies("2026-04-21", "2026-07-13")
+
+        mock_stage.assert_not_called()
+
+    def test_full_conversion_still_stages(self, tmp_path):
+        converter = _make_converter(tmp_path)
+        converter.var_config.trajectory_format = True
+
+        with (
+            patch("h2mare.processing.core.aviso.EDDIESProcessor"),
+            patch.object(converter, "_stage_eddies_to_store") as mock_stage,
+        ):
+            converter._process_eddies()
+
+        mock_stage.assert_called_once()

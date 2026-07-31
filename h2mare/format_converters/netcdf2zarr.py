@@ -23,8 +23,8 @@ from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import chunk_dataset, rename_dims, snap_grid_coords
 from h2mare.storage.zarr_catalog import ZarrCatalog
-from h2mare.types import TimeResolution
-from h2mare.utils.files_io import safe_move_files, safe_rmtree
+from h2mare.types import DateLike, DateRange, TimeResolution
+from h2mare.utils.files_io import filter_raw_files, safe_move_files, safe_rmtree
 from h2mare.utils.paths import resolve_download_path
 from h2mare.validators import validate_time_resolution, validate_var_key
 
@@ -149,11 +149,35 @@ class Netcdf2Zarr(BaseConverter):
         self.catalog = ZarrCatalog(self.var_key, store_root=store_root)
         self.store_root = self.catalog.store_root
 
-    def run(self) -> bool:
+    def run(
+        self,
+        start_date: DateLike | None = None,
+        end_date: DateLike | None = None,
+    ) -> bool:
+        """
+        Convert downloaded raw files to Zarr.
+
+        Args:
+            start_date: Restrict the conversion to this window. Both dates must
+                be given together; when omitted every downloaded file is
+                converted, which is the default resume behaviour.
+            end_date: End of the conversion window.
+
+        Restricting the window is what makes it possible to re-convert one
+        period from raw files already on disk, without re-downloading.
+        """
         t0 = time.perf_counter()
         logger.info(
             f"Initializing Netcdf -> Zarr conversion for variable key: {self.var_key.upper()}"
         )
+
+        window = (
+            DateRange(pd.to_datetime(start_date), pd.to_datetime(end_date))
+            if start_date is not None and end_date is not None
+            else None
+        )
+        if window is not None:
+            logger.info(f"Restricting conversion to {window}")
 
         # Reconcile any zarr write interrupted by a hard kill before gap
         # detection reads the store, so a half-written store is not trusted and
@@ -163,14 +187,14 @@ class Netcdf2Zarr(BaseConverter):
         # Trajectory-format variables (e.g. eddies) require spatial binning
         # before zarr storage — bypass the standard open_mfdataset pipeline.
         if self.var_config.trajectory_format:
-            self._process_eddies()
+            self._process_eddies(start_date, end_date)
             self.catalog.refresh(force=True)
             logger.success(
                 f"Conversion complete (trajectory) in {time.perf_counter() - t0:.1f}s"
             )
             return True
 
-        file_groups = self._group_map(groupby=self.time_resolution)
+        file_groups = self._group_map(groupby=self.time_resolution, window=window)
 
         for period, paths in file_groups.items():
             self._process_period(period, paths)
@@ -186,7 +210,7 @@ class Netcdf2Zarr(BaseConverter):
     # ========= DATA PREPARATION FUNCTIONS =========
 
     def _group_map(
-        self, groupby: TimeResolution
+        self, groupby: TimeResolution, window: Optional[DateRange] = None
     ) -> dict[int | tuple[int, int], list[Path]]:
         """
         Group paths of nc files by period i.e groupby str.
@@ -209,6 +233,16 @@ class Netcdf2Zarr(BaseConverter):
         file_map = self._get_file_date_series()
         if file_map.empty:
             return {}
+
+        if window is not None:
+            file_map = file_map[
+                (file_map.index >= window.start) & (file_map.index <= window.end)
+            ]
+            if file_map.empty:
+                logger.warning(
+                    f"[{self.var_key}] No downloaded files fall within {window}"
+                )
+                return {}
 
         if groupby == TimeResolution.YEAR:
             groups = file_map.groupby(file_map.index.year)  # type: ignore
@@ -251,6 +285,13 @@ class Netcdf2Zarr(BaseConverter):
         if not files:
             raise FileNotFoundError(
                 f"No downloaded NetCDF/GRIB files found in {self.download_root!s}"
+            )
+
+        files = filter_raw_files(files, self.var_config)
+        if not files:
+            raise FileNotFoundError(
+                f"No downloaded files in {self.download_root!s} match "
+                f"raw_include={self.var_config.raw_include!r}"
             )
         return sorted(files)
 
@@ -369,7 +410,11 @@ class Netcdf2Zarr(BaseConverter):
         logger.debug(f"Wrote provenance to zarr attrs: {zarr_path.name}")
 
     # ========= PROCESSING FUNCTIONS =========
-    def _process_eddies(self):
+    def _process_eddies(
+        self,
+        start_date: DateLike | None = None,
+        end_date: DateLike | None = None,
+    ) -> None:
         import h2mare.processing.core.aviso as aviso
 
         try:
@@ -379,8 +424,17 @@ class Netcdf2Zarr(BaseConverter):
                 time_resolution=self.time_resolution,
                 date_format=self.date_format,
             )
-            ed_processor.run()
-            self._stage_eddies_to_store(self.download_root)
+            ed_processor.run(start_date, end_date)
+            # Staging is download cleanup: it files freshly downloaded raw data
+            # into the store. A windowed convert re-reads files that are
+            # already wherever they belong, so there is nothing to file away.
+            if start_date is None and end_date is None:
+                self._stage_eddies_to_store(self.download_root)
+            else:
+                logger.debug(
+                    f"[{self.var_key}] Windowed conversion — leaving raw files "
+                    "where they are"
+                )
         except Exception as e:
             raise RuntimeError(
                 f"Failed processing data for var_key {self.var_key}"
@@ -399,7 +453,20 @@ class Netcdf2Zarr(BaseConverter):
 
         Falls back to a flat move to ``store_root`` when no rep/nrt subfolders
         are present (backward compatibility).
+
+        Does nothing when the raw files already live in the store, i.e. when
+        ``download_root`` and ``store_root`` are the same directory — which is
+        the case whenever ``convert --in-dir`` is pointed at an ``archive_raw``
+        store. Staging there would move every file onto itself. The generic
+        path guards this the same way in ``_archive_raw_files``.
         """
+        if download_root.resolve() == self.store_root.resolve():
+            logger.debug(
+                f"[{self.var_key}] Raw files already in the store "
+                f"({self.store_root}) — nothing to stage"
+            )
+            return
+
         rep_src = download_root / "rep"
         nrt_src = download_root / "nrt"
 
@@ -412,13 +479,22 @@ class Netcdf2Zarr(BaseConverter):
 
             if nrt_src.exists():
                 nrt_dst = self.store_root / "nrt"
-                if nrt_dst.exists():
-                    for old_file in nrt_dst.glob("*.nc"):
-                        old_file.unlink()
-                    logger.info(f"Cleared stale NRT eddies files from {nrt_dst}")
                 nrt_dst.mkdir(parents=True, exist_ok=True)
+
+                # Move the new snapshot in first, then drop whatever it did not
+                # replace. Clearing the destination up front means a move that
+                # fails half way leaves neither copy.
+                incoming = {p.name for p in nrt_src.glob("*.nc")}
                 safe_move_files(list(nrt_src.glob("*.nc")), nrt_dst)
                 logger.info(f"Moved new NRT eddies files to {nrt_dst}")
+
+                stale = [p for p in nrt_dst.glob("*.nc") if p.name not in incoming]
+                for old_file in stale:
+                    old_file.unlink()
+                if stale:
+                    logger.info(
+                        f"Cleared {len(stale)} stale NRT eddies file(s) from {nrt_dst}"
+                    )
         else:
             # No subfolders — flat move (legacy layout)
             paths = list(download_root.rglob("*.nc"))

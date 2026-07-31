@@ -49,6 +49,13 @@ class KeyVarConfigEntry(msgspec.Struct):
     # Set False (default) when the pattern yields a single date
     # (e.g. AVISO FSLE: "_20210115_").
     filename_date_range: bool = False
+    # Regex matched (via re.search) against each raw filename; only matching
+    # files are converted. Use when a download directory holds files the
+    # pipeline must not read — AVISO ships META3.2 eddy trajectories as
+    # long/short/untracked variants alongside each other, and only the long
+    # ones belong in the store (the untracked files have no `track` variable at
+    # all). None (default) converts every file the date pattern matches.
+    raw_include: Optional[str] = None
     # Bounding box [xmin, ymin, xmax, ymax] for spatial subsetting.
     bbox: Optional[tuple[float, float, float, float]] = None
     # Depth range [min_depth, max_depth] for 3-D variables (e.g. o2, thetao).

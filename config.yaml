@@ -124,6 +124,10 @@ variables:
       ]
     dataset_id_rep: /value-added/eddy-trajectory/delayed-time/META3.2_DT_allsat
     dataset_id_nrt: /value-added/eddy-trajectory/near-real-time
+    # META3.2 ships long/short/untracked variants side by side; only the long
+    # trajectories belong in the store. The nrt files match too (no variant
+    # suffix means the whole file is long-lived tracks).
+    raw_include: "_long_|_nrt_"
     source: aviso
     pattern: (\d{8})_(\d{8})
     bbox: [-80, 0, 10, 70]

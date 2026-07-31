@@ -18,7 +18,7 @@ h2mare/
   ├── downloader/           # Source fetchers (CMEMS, AVISO, CDS) selected via registry.py → data/raw/downloads/
   ├── format_converters/    # netcdf2zarr (regrid → 0.25°/daily), zarr2parquet, parquet2csv, zarr_map_export
   ├── processing/           # Per-var preprocessing; compiler.py merges → h2ds; core/ holds source transforms
-  ├── storage/              # zarr_catalog (resume index); parquet_store (write) / _indexer (API) / _catalog (read)
+  ├── storage/              # zarr_catalog (facade) / _index (resume index) / _reader (open_dataset); parquet_store (write) / _indexer (API) / _catalog (read)
   └── utils/                # date_range, spatial (grids/masks), labels, logging, paths
 ```
 
@@ -60,7 +60,7 @@ uv run h2mare run                                                        # all v
 uv run h2mare run -v sst --start-date 2021-01-01 --end-date 2021-12-31   # explicit range
 
 # Standalone pipeline steps
-uv run h2mare convert                                                    # convert downloaded raw data to zarr
+uv run h2mare convert -v sst                                             # convert downloaded raw data to zarr (-v required)
 uv run h2mare compile                                                    # merge Zarr stores; dates inferred
 uv run h2mare parquet                                                    # Zarr → Parquet; dates inferred
 uv run h2mare catalog sst                                                # inspect ZarrCatalog metadata

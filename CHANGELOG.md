@@ -5,6 +5,167 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-31
+
+### Added
+
+- `raw_include` config field — a regex restricting which raw files a variable
+  converts. Needed for AVISO eddies, whose download directory holds `long`,
+  `short` and `untracked` META3.2 trajectory variants side by side when only
+  the long ones belong in the store.
+- `h2mare convert` accepts `--start-date` / `--end-date`, so a single period
+  can be re-converted from raw files already on disk without re-downloading.
+
+### Changed
+
+- `ZarrCatalog` is now a facade over two extracted collaborators, `ZarrIndex`
+  (resume index) and `ZarrReader` (dataset opening). Its public API is
+  unchanged.
+
+### Fixed
+
+- AVISO downloads write a `h2mare_manifest.json`, and the eddies converter —
+  which bypasses the generic `Netcdf2Zarr` path — now stamps `source_datasets`
+  from it. Previously no provenance was written at all, so `ZarrCatalog` fell
+  back to `dataset_id_rep` and labelled near-real-time data as delayed-time,
+  producing rep/nrt ranges that overlapped in `h2mare catalog` even though the
+  FTP directories are disjoint.
+- The eddies grid is read from a single canonical Zarr file instead of a union
+  across the whole store. Combining files whose axes differ only in the last
+  floating-point bits produced a doubled axis of near-duplicate points, and
+  writing that back made each run read a worse grid than the last.
+- Eddies conversion prefers the reprocessed dataset over near-real-time where
+  both cover a date, and resolves its conversion window per file rather than
+  per eddy type.
+- Raw staging no longer deletes the files it is meant to move.
+
+### Removed
+
+- `scripts/rechunk_stores.py` and `scripts/profile_extract_chunking.py` (both
+  added in 0.3.0), and `scripts/ekman_derived_vars.py`. All three were one-time
+  repairs for data written by older code, and the defects they fixed are now
+  prevented at write time: `chunk_dataset` tiles spatial dims on write, and
+  `add_engineered_ekman` computes the Ekman derived variables during
+  conversion. Two further repair tools added since v0.5.0
+  (`repair_aviso_provenance.py`, `standardize_zarr_filenames.py`) were removed
+  in the same window and so never appeared in a release.
+- The Task Scheduler wrapper's `.gitignore` entry; the wrapper now lives in the
+  runtime root (`H2MARE_ROOT/scripts/`) beside the config and data it drives,
+  rather than in the checkout.
+
+## [0.5.0] - 2026-06-18
+
+### Breaking
+
+- `Extractor(...)` requires an `index_col`. The positional `__row_id__` key it
+  used to generate existed only on the Extractor's side, so merging results
+  back onto the caller's dataframe relied on implicit positional alignment,
+  which breaks silently under any filter, sort or dedup. New module-level
+  `ensure_row_id` establishes the key on the frame the caller keeps.
+- `archive_raw` is a required config field on every variable, controlling
+  whether raw NetCDF/GRIB files are kept or deleted after conversion. The
+  decision was previously hardcoded by source provider inside the converter.
+
+### Added
+
+- `convert_parquet_to_zarr` and a `h2mare parquet2zarr` command — the inverse
+  of `convert_zarr_to_parquet`, pivoting long-format Parquet rows back to
+  gridded per-period Zarr.
+- A `"map"` chunk layout on `chunk_dataset` (alongside the `"timeseries"`
+  default) plus `export_map_zarr`, which rewrites a per-period store into a
+  map-chunked sibling (`h2ds` → `h2ds_map`) for interactive fields. See
+  `docs/api/map_export.md`.
+- Standalone plot helpers `plot_interactive_map` and `plot_records_on_field`,
+  with a new `docs/api/plotting.md` covering them and the previously
+  undocumented `plot_maps` / `plot_snapshot` / `animate_vars`.
+- `Extractor.extract_from_dataset`, for extracting from an arbitrary in-memory
+  xarray dataset.
+
+### Changed
+
+- `parquet2csv` is now `convert_parquet_to_csv`, matching the
+  `convert_<src>_to_<dst>` convention. The old name remains as a deprecated
+  alias.
+- `pattern` is optional and its capture-group contract with
+  `filename_date_range` is documented and validated at config load, turning a
+  mid-pipeline "not enough values to unpack" into a clear error.
+- `subset` is documented and warned about as CMEMS-only, and dropped from the
+  variables where it was a silent no-op.
+
+### Fixed
+
+- Pipeline write paths are crash-consistent and resumable. They were atomic
+  against exceptions but not against a hard kill, which could strand temp or
+  backup state that nothing reconciled — letting a resumed run trust a partial
+  store, drop history, or read orphaned temp files. New `storage/recovery.py`
+  reconciles orphaned `*.zarr.bak` / `*.zarr.tmp` and stranded `.tmp_write_*`
+  partitions before gap detection reads the store.
+- CMEMS re-downloads pass `overwrite=True`, so a re-triggered fetch replaces a
+  corrupt or partially written file instead of leaving a `filename_(1).nc`
+  duplicate for the convert-step glob.
+- All config-free converters are exported from the `format_converters` package
+  root, not just `convert_parquet_to_zarr`.
+- A circular import between `h2mare.utils.plot` and `h2mare.storage`.
+- SHP geometry survives a checkpoint resume as usable shapely objects rather
+  than WKB bytes, and is dropped from CSV output where it was dead weight.
+
+## [0.4.0] - 2026-06-12
+
+### Fixed
+
+Several of these caused silent data loss in the Parquet and Zarr write paths;
+anyone running 0.3.x or earlier should upgrade.
+
+- A partial-window Parquet merge wiped the column outside the window. Any
+  backfill smaller than a partition erased that column's other days in it.
+  Incoming data now wins only where it actually has rows, and stored values
+  survive everywhere else.
+- Appending into an existing Parquet partition destroyed its rows. pyarrow's
+  default `part-{i}.parquet` basename restarts at 0 on every write, so combined
+  with `overwrite_or_ignore` an append silently overwrote `part-0`. Writes now
+  use a per-write unique basename prefix.
+- A compile for a subset of variables (`h2mare run -v ssh`) wiped every other
+  variable over the appended range, because `xr.concat` NaN-fills variables
+  missing from the incoming dataset.
+- An explicit compile of a window inside the stored range dropped every date
+  after that window.
+- Parquet backfill missed holes hidden behind non-null islands, leaving a gap
+  permanently unreachable once a later append jumped the window past it.
+- Grid labels are snapped to a canonical 4 dp grid. A source reprocessing its
+  product can shift the grid by sub-1e-4 float noise (CMEMS seapodym moved
+  longitudes ~1.5e-5°), which unioned rather than aligned the axes on merge —
+  doubling the axis and NaN-filling each block at the other's phantom cells.
+- Time-less variables (`bathy`, `bathy_std`) no longer raise `MergeError` on
+  Zarr append.
+- Three latent bugs from a codebase audit: `ZarrCatalog.get_bbox` returning
+  `None` for an already-`BBox` config value, CLI date validation rejecting
+  single-day ranges, and `ParquetStore` misreporting coverage for a partition
+  split across multiple files.
+- `ParquetStore.__init__` no longer prompts via `input()`, which stalled any
+  interactive run that reached it.
+- Post-run cleanup prunes nested empty download subfolders, which previously
+  survived for eddies' rep/nrt staging dirs and multi-level `local_folder`
+  paths.
+
+### Performance
+
+- Clean trailing Zarr appends write only the new chunks via
+  `to_zarr(append_dim=...)` instead of rewriting the whole file, with a
+  fallback to the rewrite path on any precondition or verification miss.
+- Parquet overlap resolution joins one partition at a time rather than
+  materializing every affected partition in a single outer join — the
+  peak-memory bottleneck on wide backfills.
+- Redundant store scans removed across the catalog and Parquet layers.
+- The 15s bathymetry layer is written as a spatially tiled Zarr, so a geometry
+  reads only the overlapping tiles.
+
+### Changed
+
+- The one-time `backfill_provenance` migration moved out of `ZarrCatalog` into
+  `storage/provenance.py`; the method delegates, so the public API is
+  unchanged.
+- Pipeline log messages deduplicated and clarified.
+
 ## [0.3.0] - 2026-06-07
 
 ### Changed

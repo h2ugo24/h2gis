@@ -12,8 +12,10 @@ CLI (h2mare/cli/main.py)
         ├── Downloader (CMEMSDownloader | AVISODownloader | CDSDownloader)
         │     └── DOWNLOADER_REGISTRY  (downloader/registry.py)
         ├── Netcdf2Zarr : BaseConverter
-        │     └── ZarrCatalog
-        │           └── ZarrDirectoryScanner  (filesystem I/O + metadata)
+        │     └── ZarrCatalog  (facade)
+        │           ├── ZarrIndex   (catalog persistence + queries)
+        │           │     └── ZarrDirectoryScanner  (filesystem I/O + metadata)
+        │           └── ZarrReader  (open_dataset: bbox, variables, time)
         └── Compiler
 
 Zarr2Parquet : BaseConverter         (uses ParquetIndexer)
@@ -66,16 +68,22 @@ The `h2ds` store is chunked for **extraction** (time-contiguous: long time block
 
 ---
 
-## ZarrCatalog / ZarrDirectoryScanner
+## ZarrCatalog and its collaborators
 
-`ZarrCatalog` (`storage/zarr_catalog.py`) maintains a Parquet metadata index for each variable key and owns the query and dataset-opening interface. It holds a `ZarrDirectoryScanner` instance that handles all filesystem I/O.
+`ZarrCatalog` (`storage/zarr_catalog.py`) is the entry point for a variable's Zarr store. It builds store paths and composes two halves: a `ZarrIndex` that answers "which files, covering what", and a `ZarrReader` that turns an answer into an open dataset. The index in turn delegates filesystem I/O to a `ZarrDirectoryScanner`. This mirrors the `ParquetIndexer` facade on the Parquet side.
 
 | Class | Module | Responsibility |
 |---|---|---|
 | `ZarrDirectoryScanner` | `storage/zarr_scanner.py` | Filesystem I/O — mtime snapshots, change detection, zarr metadata extraction |
-| `ZarrCatalog` | `storage/zarr_catalog.py` | Catalog persistence, range queries, `open_dataset` |
+| `ZarrIndex` | `storage/zarr_index.py` | Catalog persistence and refresh lifecycle, path and coverage queries |
+| `ZarrReader` | `storage/zarr_reader.py` | `open_dataset` — sparse/range dispatch, variable selection, bbox subsetting, time normalisation |
+| `ZarrCatalog` | `storage/zarr_catalog.py` | Facade — `build_file_path`, `summary`, delegation to the index and reader |
 
-`ZarrCatalog` tracks per-variable:
+The dependency runs one way: `ZarrReader` reads the index, and the index knows nothing about the reader. `ZarrReader` holds no state of its own.
+
+`ZarrIndex` owns the catalog DataFrame (`_df_cache`) and is the only writer of the catalog Parquet file. Note the cost of `auto_refresh=True`: every `.df` access re-stats the store directory, so callers reading the catalog in a loop should snapshot `.df` once rather than accessing it per iteration.
+
+The catalog tracks per-variable:
 
 - File paths, modification times, and scan timestamps
 - Temporal coverage (`start_date`, `end_date`) and provenance per source dataset
