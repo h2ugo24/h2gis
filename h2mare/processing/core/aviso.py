@@ -4,6 +4,7 @@ Processes AVISO data, namely FSLE and EDDY TRAJECTORY ATLAS
 
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import re
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from scipy.spatial import cKDTree  # type: ignore
 
 from h2mare.config import AppConfig, get_settings
 from h2mare.models import KeyVarConfigEntry
+from h2mare.storage.provenance import write_provenance_for_window
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import (
     chunk_dataset,
@@ -267,6 +269,11 @@ class EDDIESProcessor:
                     ds_merged, self.date_format
                 )
                 write_append_zarr(self.var_key, ds_merged, path)
+                written = DateRange(
+                    pd.to_datetime(ds_merged.time.min().values),
+                    pd.to_datetime(ds_merged.time.max().values),
+                )
+                self._write_provenance(path, written)
                 del ds_list, ds_merged
 
         # logger.success("Completed!")
@@ -309,6 +316,50 @@ class EDDIESProcessor:
 
         latlon_arr, sea_mask = create_base_grid(lat, lon)
         return GridData(lat, lon, latlon_arr, sea_mask)
+
+    def _read_manifest(self) -> list[dict]:
+        """Read the download manifest written by AVISODownloader, or [] if absent."""
+        manifest_path = self.download_root / "h2mare_manifest.json"
+        if not manifest_path.exists():
+            return []
+        try:
+            return json.loads(manifest_path.read_text())
+        except Exception as e:
+            logger.warning(f"Could not read download manifest: {e}")
+            return []
+
+    def _write_provenance(self, zarr_path: Path, written: DateRange) -> None:
+        """
+        Record which dataset covered *written* on the Zarr just produced.
+
+        The generic converter path in Netcdf2Zarr never runs for eddies —
+        ``_process_eddies`` delegates here and this class writes its own Zarr —
+        so without this every eddies file lacks ``source_datasets`` and the
+        catalog scanner falls back to ``dataset_id_rep``, labelling
+        near-real-time data as delayed-time.
+        """
+        manifest = self._read_manifest()
+        if not manifest:
+            logger.debug(
+                f"[{self.var_key}] No download manifest in {self.download_root}; "
+                "skipping provenance for this period"
+            )
+            return
+
+        try:
+            records = write_provenance_for_window(zarr_path, manifest, written)
+        except Exception as e:
+            logger.warning(f"Could not write provenance for {zarr_path.name}: {e}")
+            return
+
+        if records:
+            logger.debug(
+                f"[{self.var_key}] Wrote provenance to {zarr_path.name}: "
+                + ", ".join(
+                    f"{r['dataset_type']} {r['start_date']}..{r['end_date']}"
+                    for r in records
+                )
+            )
 
     def _grid_from_store(
         self,
