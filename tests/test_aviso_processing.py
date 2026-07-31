@@ -503,3 +503,100 @@ class TestGetGriddedDataFallback:
 
         assert not _is_degenerate_axis(grid.lat)
         assert not _is_degenerate_axis(grid.lon)
+
+
+# ---------------------------------------------------------------------------
+# rep beats nrt in the overlap
+#
+# AVISO's nrt trajectory file spans 2018 to today while META3.2 delayed-time
+# runs to 2022, so the two overlap by four years. The downloader already starts
+# nrt the day after rep ends; a conversion reads whatever is on disk, so it
+# needs the same rule or both sources land in the overlap.
+# ---------------------------------------------------------------------------
+
+
+class TestPreferRep:
+    def _records(self, tmp_path):
+        rep_dir = tmp_path / "rep"
+        nrt_dir = tmp_path / "nrt"
+        rep_dir.mkdir(exist_ok=True)
+        nrt_dir.mkdir(exist_ok=True)
+        return [
+            ("cyclonic", DateRange("1993-01-01", "2022-02-09"), rep_dir / "rep_c.nc"),
+            ("cyclonic", DateRange("2018-01-01", "2026-07-13"), nrt_dir / "nrt_c.nc"),
+        ]
+
+    def _resolve(self, proc, records, requested):
+        with patch(
+            "h2mare.processing.core.aviso.resolve_date_range", return_value=requested
+        ):
+            return proc._resolve_all_ranges(records, None, None)
+
+    def test_nrt_starts_after_rep_ends(self, eddies_proc, tmp_path):
+        records = self._records(tmp_path)
+
+        out = self._resolve(eddies_proc, records, DateRange("2020-01-01", "2026-07-13"))
+
+        nrt = out[tmp_path / "nrt" / "nrt_c.nc"]
+        assert pd.Timestamp(nrt.start) == pd.Timestamp("2022-02-10")
+        assert pd.Timestamp(nrt.end) == pd.Timestamp("2026-07-13")
+
+    def test_rep_window_is_untouched(self, eddies_proc, tmp_path):
+        records = self._records(tmp_path)
+
+        out = self._resolve(eddies_proc, records, DateRange("2020-01-01", "2026-07-13"))
+
+        rep = out[tmp_path / "rep" / "rep_c.nc"]
+        assert pd.Timestamp(rep.start) == pd.Timestamp("2020-01-01")
+        assert pd.Timestamp(rep.end) == pd.Timestamp("2022-02-09")
+
+    def test_request_fully_inside_rep_drops_nrt(self, eddies_proc, tmp_path):
+        """Regression: nrt used to contribute to a window rep already covers."""
+        records = self._records(tmp_path)
+
+        out = self._resolve(eddies_proc, records, DateRange("2019-01-01", "2019-12-31"))
+
+        assert tmp_path / "nrt" / "nrt_c.nc" not in out
+        assert tmp_path / "rep" / "rep_c.nc" in out
+
+    def test_request_after_rep_leaves_nrt_alone(self, eddies_proc, tmp_path):
+        records = self._records(tmp_path)
+
+        out = self._resolve(eddies_proc, records, DateRange("2026-04-21", "2026-07-13"))
+
+        nrt = out[tmp_path / "nrt" / "nrt_c.nc"]
+        assert pd.Timestamp(nrt.start) == pd.Timestamp("2026-04-21")
+        assert tmp_path / "rep" / "rep_c.nc" not in out
+
+    def test_clipping_is_per_eddy_type(self, eddies_proc, tmp_path):
+        """An anticyclonic rep file must not clip the cyclonic nrt window."""
+        rep_dir, nrt_dir = tmp_path / "rep", tmp_path / "nrt"
+        rep_dir.mkdir(exist_ok=True)
+        nrt_dir.mkdir(exist_ok=True)
+        records = [
+            (
+                "anticyclonic",
+                DateRange("1993-01-01", "2022-02-09"),
+                rep_dir / "rep_ac.nc",
+            ),
+            ("cyclonic", DateRange("2018-01-01", "2026-07-13"), nrt_dir / "nrt_c.nc"),
+        ]
+
+        out = self._resolve(eddies_proc, records, DateRange("2020-01-01", "2026-07-13"))
+
+        nrt = out[nrt_dir / "nrt_c.nc"]
+        assert pd.Timestamp(nrt.start) == pd.Timestamp("2020-01-01")
+
+    def test_flat_layout_is_left_alone(self, eddies_proc, tmp_path):
+        """No rep/nrt directory means no way to tell — do not guess."""
+        records = [
+            ("cyclonic", DateRange("1993-01-01", "2022-02-09"), tmp_path / "a_c.nc"),
+            ("cyclonic", DateRange("2018-01-01", "2026-07-13"), tmp_path / "b_c.nc"),
+        ]
+
+        out = self._resolve(eddies_proc, records, DateRange("2020-01-01", "2026-07-13"))
+
+        assert len(out) == 2
+        assert pd.Timestamp(out[tmp_path / "b_c.nc"].start) == pd.Timestamp(
+            "2020-01-01"
+        )
