@@ -1,6 +1,7 @@
 """Tests for utils/files_io.py — file I/O utilities."""
 
 import zipfile
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -8,6 +9,7 @@ import xarray as xr
 
 from h2mare.utils.files_io import (
     clean_era_dataset,
+    filter_raw_files,
     move_files,
     prune_empty_dirs,
     safe_move_files,
@@ -227,3 +229,63 @@ class TestPruneEmptyDirs:
 
     def test_missing_root_returns_zero(self, tmp_path):
         assert prune_empty_dirs(tmp_path / "nope") == 0
+
+
+# ---------------------------------------------------------------------------
+# raw_include
+#
+# A download directory can hold files the pipeline must not read. AVISO ships
+# META3.2 eddy trajectories as long/short/untracked variants side by side: only
+# the long ones belong in the store, and the untracked files carry no `track`
+# variable at all.
+# ---------------------------------------------------------------------------
+
+_EDDY_FILES = [
+    "META3.2_DT_allsat_Anticyclonic_long_19930101_20220209.nc",
+    "META3.2_DT_allsat_Anticyclonic_short_19930101_20220209.nc",
+    "META3.2_DT_allsat_Anticyclonic_untracked_19930101_20220209.nc",
+    "META3.2_DT_allsat_Cyclonic_long_19930101_20220209.nc",
+    "META4_DT_allsat_cyclonic_19930101_20230908.nc",
+    "Eddy_trajectory_nrt_3.2exp_cyclonic_20180101_20260713.nc",
+]
+
+
+class _Cfg:
+    def __init__(self, raw_include=None):
+        self.raw_include = raw_include
+
+
+class TestFilterRawFiles:
+    def _paths(self):
+        return [Path(n) for n in _EDDY_FILES]
+
+    def test_no_pattern_keeps_everything(self):
+        assert len(filter_raw_files(self._paths(), _Cfg())) == len(_EDDY_FILES)
+
+    def test_config_without_the_field_keeps_everything(self):
+        """Variables predating raw_include must be unaffected."""
+
+        class Old:
+            pass
+
+        assert len(filter_raw_files(self._paths(), Old())) == len(_EDDY_FILES)
+
+    def test_keeps_only_long_and_nrt(self):
+        kept = {p.name for p in filter_raw_files(self._paths(), _Cfg("_long_|_nrt_"))}
+        assert kept == {
+            "META3.2_DT_allsat_Anticyclonic_long_19930101_20220209.nc",
+            "META3.2_DT_allsat_Cyclonic_long_19930101_20220209.nc",
+            "Eddy_trajectory_nrt_3.2exp_cyclonic_20180101_20260713.nc",
+        }
+
+    def test_untracked_is_excluded(self):
+        """The file with no `track` variable must never reach the processor."""
+        kept = {p.name for p in filter_raw_files(self._paths(), _Cfg("_long_|_nrt_"))}
+        assert not any("untracked" in n for n in kept)
+
+    def test_other_product_versions_are_excluded(self):
+        kept = {p.name for p in filter_raw_files(self._paths(), _Cfg("_long_|_nrt_"))}
+        assert not any(n.startswith("META4") for n in kept)
+
+    def test_pattern_matching_nothing_returns_empty(self):
+        assert filter_raw_files(self._paths(), _Cfg("_nosuchvariant_")) == []

@@ -33,6 +33,7 @@ from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import BBox, DateLike, DateRange, TimeResolution
 from h2mare.utils.date_range import resolve_date_range
 from h2mare.utils.datetime_utils import normalize_date
+from h2mare.utils.files_io import filter_raw_files
 from h2mare.utils.paths import resolve_download_path, resolve_store_path
 from h2mare.utils.spatial import GridBuilder, haversine_min_distance_kdtree
 from h2mare.validators import validate_time_resolution, validate_var_key
@@ -437,7 +438,7 @@ class EDDIESProcessor:
             list: tuple (eddy type, Daterange, file path)
         """
         root_dir = root_dir or self.download_root
-        files = list(root_dir.rglob("*.nc"))
+        files = filter_raw_files(list(root_dir.rglob("*.nc")), self.var_config)
 
         records = []
         for f in files:
@@ -518,6 +519,15 @@ class EDDIESProcessor:
     def _prepare_raw_dataset(self, path: Path, dates: DateRange) -> xr.Dataset:
         """Preprocess original dataframe to subset by geo_extent with +10deg for distance calculations and by time range"""
         with xr.open_dataset(path) as ds:
+            missing = [v for v in self.var_config.source_vars if v not in ds.variables]
+            if missing:
+                # e.g. AVISO's "untracked" eddy files carry no `track` variable.
+                # Without this the failure is a bare KeyError several frames down.
+                raise ValueError(
+                    f"{path.name} is missing source_vars {missing} — it is not a "
+                    f"'{self.var_key}' file the pipeline can read. Narrow the "
+                    "selection with the variable's `raw_include` in config.yaml."
+                )
             ds = ds[self.var_config.source_vars]
             ds["longitude"] = ds["longitude"] - 360
             ds["time"] = ds["time"].dt.floor("D")

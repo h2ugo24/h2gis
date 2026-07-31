@@ -24,7 +24,7 @@ from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import chunk_dataset, rename_dims, snap_grid_coords
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import DateLike, DateRange, TimeResolution
-from h2mare.utils.files_io import safe_move_files, safe_rmtree
+from h2mare.utils.files_io import filter_raw_files, safe_move_files, safe_rmtree
 from h2mare.utils.paths import resolve_download_path
 from h2mare.validators import validate_time_resolution, validate_var_key
 
@@ -285,6 +285,13 @@ class Netcdf2Zarr(BaseConverter):
         if not files:
             raise FileNotFoundError(
                 f"No downloaded NetCDF/GRIB files found in {self.download_root!s}"
+            )
+
+        files = filter_raw_files(files, self.var_config)
+        if not files:
+            raise FileNotFoundError(
+                f"No downloaded files in {self.download_root!s} match "
+                f"raw_include={self.var_config.raw_include!r}"
             )
         return sorted(files)
 
