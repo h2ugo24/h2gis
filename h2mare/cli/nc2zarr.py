@@ -33,6 +33,7 @@ Notes
 from pathlib import Path
 from typing import List, Optional
 
+import pandas as pd
 import typer
 from loguru import logger
 
@@ -65,8 +66,39 @@ def convert(
             "Defaults to DOWNLOADS_DIR from .env."
         ),
     ),
+    start_date: Optional[str] = typer.Option(
+        None,
+        "--start-date",
+        help=(
+            "Restrict the conversion to this window (YYYY-MM-DD). Must be given "
+            "with --end-date. Without it, every downloaded raw file is converted."
+        ),
+    ),
+    end_date: Optional[str] = typer.Option(
+        None,
+        "--end-date",
+        help="End of the conversion window (YYYY-MM-DD). Must be given with --start-date.",
+    ),
 ) -> None:
-    """Convert downloaded raw NetCDF/GRIB files to Zarr for one or more variables."""
+    """Convert downloaded raw NetCDF/GRIB files to Zarr for one or more variables.
+
+    Pass --start-date/--end-date to re-convert a single period from raw files
+    already on disk, without re-downloading.
+    """
+
+    # Same pairing/ordering rules as `h2mare run`, so the two commands agree.
+    if bool(start_date) ^ bool(end_date):
+        typer.echo(
+            "Error: --start-date and --end-date must be provided together.", err=True
+        )
+        raise typer.Exit(code=1)
+
+    if start_date and end_date and pd.Timestamp(start_date) > pd.Timestamp(end_date):
+        typer.echo(
+            f"Error: --start-date ({start_date}) must not be after --end-date ({end_date}).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
     base_dir = input_root if input_root is not None else get_settings().DOWNLOADS_DIR
 
@@ -79,7 +111,7 @@ def convert(
         in_dir = base_dir / var_config.local_folder
         with logger.contextualize(var=var):
             logger.info(f"Converting '{var}' from {in_dir}")
-            Netcdf2Zarr(var, download_root=in_dir).run()
+            Netcdf2Zarr(var, download_root=in_dir).run(start_date, end_date)
 
 
 if __name__ == "__main__":

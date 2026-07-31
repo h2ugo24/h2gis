@@ -59,6 +59,35 @@ class TestSafeMoveFiles:
         safe_move_files(src / "data.nc", dst)
         assert (dst / "data.nc").read_text() == "new"
 
+    def test_file_already_at_destination_is_left_alone(self, tmp_path):
+        """Regression: a same-path move deleted the file.
+
+        The retry loop unlinks the destination before moving, so when source
+        and destination resolve to the same file the unlink destroys it and the
+        move then has nothing to move. Callers hit this whenever a store is
+        both the download root and the destination.
+        """
+        d = tmp_path / "data"
+        d.mkdir()
+        f = d / "raw.nc"
+        f.write_text("payload")
+
+        safe_move_files(f, d)
+
+        assert f.exists()
+        assert f.read_text() == "payload"
+
+    def test_same_path_via_a_relative_route_is_also_left_alone(self, tmp_path):
+        """The check resolves paths, so `dst/../dst` counts as the same place."""
+        d = tmp_path / "data"
+        d.mkdir()
+        f = d / "raw.nc"
+        f.write_text("payload")
+
+        safe_move_files(f, d / ".." / "data")
+
+        assert f.exists()
+
     def test_moves_list_of_files(self, tmp_path):
         src = tmp_path / "src"
         src.mkdir()

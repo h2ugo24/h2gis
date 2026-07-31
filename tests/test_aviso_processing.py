@@ -250,7 +250,12 @@ class TestEddiesResolveRange:
         assert pd.Timestamp(result.start) == pd.Timestamp("2020-06-01")
         assert pd.Timestamp(result.end) == pd.Timestamp("2021-12-31")
 
-    def test_raises_when_no_overlap(self, eddies_proc):
+    def test_returns_none_when_no_overlap(self, eddies_proc):
+        """A file outside the requested window is skipped, not fatal.
+
+        It used to raise, which meant one irrelevant file in the raw directory
+        (a rep file when asking for an nrt window, say) aborted the whole run.
+        """
         download_range = DateRange("2000-01-01", "2005-12-31")
         requested = DateRange("2020-01-01", "2020-12-31")
 
@@ -258,8 +263,82 @@ class TestEddiesResolveRange:
             "h2mare.processing.core.aviso.resolve_date_range",
             return_value=requested,
         ):
-            with pytest.raises(ValueError):
-                eddies_proc._resolve_date_range(download_range)
+            assert eddies_proc._resolve_date_range(download_range) is None
+
+
+class TestEddiesResolveAllRanges:
+    """Windows are resolved per file, not per eddy type."""
+
+    def _records(self, tmp_path):
+        # Same shape as a real store: several files per type, spanning
+        # different periods — rep variants, nrt, and an unused product version.
+        return [
+            (
+                "anticyclonic",
+                DateRange("1993-01-01", "2022-02-09"),
+                tmp_path / "META3.2_DT_allsat_Anticyclonic_long.nc",
+            ),
+            (
+                "anticyclonic",
+                DateRange("2018-01-01", "2026-07-13"),
+                tmp_path / "Eddy_trajectory_nrt_anticyclonic.nc",
+            ),
+            (
+                "cyclonic",
+                DateRange("2018-01-01", "2026-07-13"),
+                tmp_path / "Eddy_trajectory_nrt_cyclonic.nc",
+            ),
+        ]
+
+    def test_keyed_by_path_not_eddy_type(self, eddies_proc, tmp_path):
+        """Regression: two anticyclonic files collapsed into one entry."""
+        records = self._records(tmp_path)
+
+        with patch(
+            "h2mare.processing.core.aviso.resolve_date_range",
+            return_value=DateRange("1993-01-01", "2026-07-13"),
+        ):
+            resolved = eddies_proc._resolve_all_ranges(records, None, None)
+
+        assert set(resolved) == {path for _, _, path in records}
+
+    def test_non_overlapping_files_are_dropped(self, eddies_proc, tmp_path):
+        """Asking for an nrt window must not abort on the rep files present."""
+        records = self._records(tmp_path)
+
+        with patch(
+            "h2mare.processing.core.aviso.resolve_date_range",
+            return_value=DateRange("2026-04-21", "2026-07-13"),
+        ):
+            resolved = eddies_proc._resolve_all_ranges(records, None, None)
+
+        assert set(resolved) == {
+            tmp_path / "Eddy_trajectory_nrt_anticyclonic.nc",
+            tmp_path / "Eddy_trajectory_nrt_cyclonic.nc",
+        }
+
+    def test_windows_are_clipped_per_file(self, eddies_proc, tmp_path):
+        records = self._records(tmp_path)
+
+        with patch(
+            "h2mare.processing.core.aviso.resolve_date_range",
+            return_value=DateRange("2020-01-01", "2026-07-13"),
+        ):
+            resolved = eddies_proc._resolve_all_ranges(records, None, None)
+
+        rep = resolved[tmp_path / "META3.2_DT_allsat_Anticyclonic_long.nc"]
+        nrt = resolved[tmp_path / "Eddy_trajectory_nrt_anticyclonic.nc"]
+        assert pd.Timestamp(rep.end) == pd.Timestamp("2022-02-09")
+        assert pd.Timestamp(nrt.end) == pd.Timestamp("2026-07-13")
+
+    def test_no_overlap_at_all_yields_empty(self, eddies_proc, tmp_path):
+        records = self._records(tmp_path)
+
+        with patch(
+            "h2mare.processing.core.aviso.resolve_date_range",
+            return_value=DateRange("1900-01-01", "1900-12-31"),
+        ):
+            assert eddies_proc._resolve_all_ranges(records, None, None) == {}
 
 
 # ---------------------------------------------------------------------------
