@@ -101,6 +101,13 @@ def safe_move_files(
     for path in paths:
         dest_path = dest_dir / path.name
 
+        # A file already at its destination must be left alone. The retry loop
+        # below unlinks dest_path before moving, so without this a same-path
+        # move deletes the source outright rather than failing harmlessly.
+        if path.resolve() == dest_path.resolve():
+            logger.debug(f"Already at destination, not moving: {path}")
+            continue
+
         last_err = None
 
         for i in range(retries):

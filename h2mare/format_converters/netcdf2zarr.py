@@ -418,7 +418,16 @@ class Netcdf2Zarr(BaseConverter):
                 date_format=self.date_format,
             )
             ed_processor.run(start_date, end_date)
-            self._stage_eddies_to_store(self.download_root)
+            # Staging is download cleanup: it files freshly downloaded raw data
+            # into the store. A windowed convert re-reads files that are
+            # already wherever they belong, so there is nothing to file away.
+            if start_date is None and end_date is None:
+                self._stage_eddies_to_store(self.download_root)
+            else:
+                logger.debug(
+                    f"[{self.var_key}] Windowed conversion — leaving raw files "
+                    "where they are"
+                )
         except Exception as e:
             raise RuntimeError(
                 f"Failed processing data for var_key {self.var_key}"
@@ -437,7 +446,20 @@ class Netcdf2Zarr(BaseConverter):
 
         Falls back to a flat move to ``store_root`` when no rep/nrt subfolders
         are present (backward compatibility).
+
+        Does nothing when the raw files already live in the store, i.e. when
+        ``download_root`` and ``store_root`` are the same directory — which is
+        the case whenever ``convert --in-dir`` is pointed at an ``archive_raw``
+        store. Staging there would move every file onto itself. The generic
+        path guards this the same way in ``_archive_raw_files``.
         """
+        if download_root.resolve() == self.store_root.resolve():
+            logger.debug(
+                f"[{self.var_key}] Raw files already in the store "
+                f"({self.store_root}) — nothing to stage"
+            )
+            return
+
         rep_src = download_root / "rep"
         nrt_src = download_root / "nrt"
 
@@ -450,13 +472,22 @@ class Netcdf2Zarr(BaseConverter):
 
             if nrt_src.exists():
                 nrt_dst = self.store_root / "nrt"
-                if nrt_dst.exists():
-                    for old_file in nrt_dst.glob("*.nc"):
-                        old_file.unlink()
-                    logger.info(f"Cleared stale NRT eddies files from {nrt_dst}")
                 nrt_dst.mkdir(parents=True, exist_ok=True)
+
+                # Move the new snapshot in first, then drop whatever it did not
+                # replace. Clearing the destination up front means a move that
+                # fails half way leaves neither copy.
+                incoming = {p.name for p in nrt_src.glob("*.nc")}
                 safe_move_files(list(nrt_src.glob("*.nc")), nrt_dst)
                 logger.info(f"Moved new NRT eddies files to {nrt_dst}")
+
+                stale = [p for p in nrt_dst.glob("*.nc") if p.name not in incoming]
+                for old_file in stale:
+                    old_file.unlink()
+                if stale:
+                    logger.info(
+                        f"Cleared {len(stale)} stale NRT eddies file(s) from {nrt_dst}"
+                    )
         else:
             # No subfolders — flat move (legacy layout)
             paths = list(download_root.rglob("*.nc"))
