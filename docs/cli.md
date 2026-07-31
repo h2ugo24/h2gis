@@ -106,8 +106,14 @@ uv run h2mare convert [OPTIONS]
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `-v, --vars` | text (repeatable) | all keys | Variable key(s) to convert |
+| `-v, --vars` | text (repeatable) | **required** | Variable key(s) to convert |
 | `--in-dir` | path | `DOWNLOADS_DIR` | Override the input directory containing raw files |
+| `--start-date` | text | all raw files | Restrict the conversion to this window (`YYYY-MM-DD`). Must be given with `--end-date` |
+| `--end-date` | text | all raw files | End of the conversion window (`YYYY-MM-DD`). Must be given with `--start-date` |
+
+Unlike `run`, `compile` and `parquet`, `-v` is required here — `convert` never
+defaults to all configured variables. Omitting the dates converts every
+downloaded raw file the variable's `pattern` (and `raw_include`) matches.
 
 **Examples**
 
@@ -117,6 +123,9 @@ uv run h2mare convert -v sst -v ssh
 
 # Convert from a custom input directory
 uv run h2mare convert -v sst --in-dir /data/raw/CMEMS_SST
+
+# Re-convert a single period from raw files already on disk
+uv run h2mare convert -v eddies --start-date 2024-01-01 --end-date 2024-12-31
 ```
 
 ---

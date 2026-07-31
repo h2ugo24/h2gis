@@ -60,7 +60,7 @@ uv run h2mare run                                                        # all v
 uv run h2mare run -v sst --start-date 2021-01-01 --end-date 2021-12-31   # explicit range
 
 # Standalone pipeline steps
-uv run h2mare convert                                                    # convert downloaded raw data to zarr
+uv run h2mare convert -v sst                                             # convert downloaded raw data to zarr (-v required)
 uv run h2mare compile                                                    # merge Zarr stores; dates inferred
 uv run h2mare parquet                                                    # Zarr → Parquet; dates inferred
 uv run h2mare catalog sst                                                # inspect ZarrCatalog metadata
