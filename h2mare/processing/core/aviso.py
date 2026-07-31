@@ -136,6 +136,23 @@ def _group_dates(
                 yield (int(year), int(month)), dates[mask]
 
 
+def _raw_source(path: Path) -> Optional[str]:
+    """
+    Whether a raw file is reprocessed or near-real-time, from its location.
+
+    The downloader stages each stream into a ``rep``/``nrt`` subfolder and the
+    store keeps that layout, so the directory is the marker. Returns ``None``
+    for a file sitting outside either — a legacy flat layout, or a product
+    version dropped in by hand.
+    """
+    parts = {part.lower() for part in path.parts}
+    if "nrt" in parts:
+        return "nrt"
+    if "rep" in parts:
+        return "rep"
+    return None
+
+
 def _is_degenerate_axis(values: NDArray[np.float64], tol: float = 1e-6) -> bool:
     """
     True when a coordinate axis carries near-duplicate points.
@@ -477,7 +494,8 @@ class EDDIESProcessor:
         to be relevant.
         """
         resolved: dict[Path, DateRange] = {}
-        for _, download_range, path in records:
+        eddy_type_of: dict[Path, str] = {}
+        for eddy_type, download_range, path in records:
             window = self._resolve_date_range(download_range, start_date, end_date)
             if window is None:
                 logger.debug(
@@ -486,7 +504,59 @@ class EDDIESProcessor:
                 )
                 continue
             resolved[path] = window
-        return resolved
+            eddy_type_of[path] = eddy_type
+
+        return self._prefer_rep(resolved, eddy_type_of)
+
+    def _prefer_rep(
+        self, resolved: dict[Path, DateRange], eddy_type_of: dict[Path, str]
+    ) -> dict[Path, DateRange]:
+        """
+        Clip near-real-time windows to start after the reprocessed data ends.
+
+        rep and nrt overlap on the server — AVISO's nrt trajectory file spans
+        2018 to today while META3.2 delayed-time runs to 2022 — and the
+        reprocessed product is the better one where both exist. The downloader
+        already applies this (`nrt_start = rep_avail.end + 1 day`), but a
+        conversion reads whatever files are on disk, so without the same rule
+        both sources contribute to the overlap and ``xr.merge`` either combines
+        two versions of the same period or raises on the cells where they
+        disagree.
+
+        Applied per eddy type, since anticyclonic and cyclonic are independent
+        streams. Files with no rep/nrt directory in their path are left alone,
+        which keeps legacy flat layouts working.
+        """
+        rep_end: dict[str, pd.Timestamp] = {}
+        for path, window in resolved.items():
+            if _raw_source(path) == "rep":
+                key = eddy_type_of[path]
+                rep_end[key] = max(rep_end.get(key, window.end), window.end)
+
+        if not rep_end:
+            return resolved
+
+        out: dict[Path, DateRange] = {}
+        for path, window in resolved.items():
+            end = rep_end.get(eddy_type_of[path])
+            if _raw_source(path) != "nrt" or end is None:
+                out[path] = window
+                continue
+
+            start = max(window.start, pd.Timestamp(end) + pd.Timedelta(days=1))
+            if start > window.end:
+                logger.debug(
+                    f"[{self.var_key}] {path.name} fully covered by reprocessed "
+                    f"data (rep ends {pd.Timestamp(end).date()}) — skipping"
+                )
+                continue
+            if start != window.start:
+                logger.info(
+                    f"[{self.var_key}] {path.name}: deferring to reprocessed data, "
+                    f"converting from {start.date()} instead of {window.start.date()}"
+                )
+            out[path] = DateRange(start, window.end)
+        return out
 
     def _resolve_date_range(
         self,
