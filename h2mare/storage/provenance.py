@@ -29,7 +29,15 @@ def backfill_provenance(catalog: "ZarrCatalog", rep_end_date: DateLike) -> int:
       rep_end_date / rep_end_date + 1 day.
 
     Call once after upgrading. The rep end date is obtainable without
-    re-downloading data via CMEMSDownloader(var_key).get_rep_availability().end.
+    re-downloading data from the downloader for that variable's source —
+    ``get_rep_availability().end`` on either CMEMSDownloader or AVISODownloader.
+    Use the one matching ``var_config.source``; for AVISO variables the value
+    comes from the FTP directory listing, not the CMEMS API.
+
+    Files that already carry ``source_datasets`` are skipped, so this never
+    overwrites existing provenance — including provenance that has since gone
+    stale because the source republished part of the nrt period as rep.
+    ``scripts/repair_aviso_provenance.py`` reports that case for AVISO stores.
 
     Args:
         catalog: The variable's ZarrCatalog.
@@ -46,6 +54,11 @@ def backfill_provenance(catalog: "ZarrCatalog", rep_end_date: DateLike) -> int:
         rep_end = CMEMSDownloader("sst").get_rep_availability().end
         n = ZarrCatalog("sst").backfill_provenance(rep_end)
         print(f"Written {n} sidecars")
+
+        # AVISO variables (fsle, eddies) use their own downloader:
+        from h2mare.downloader.aviso_downloader import AVISODownloader
+
+        rep_end = AVISODownloader("fsle").get_rep_availability().end
     """
     rep_end = pd.to_datetime(rep_end_date).normalize()
     nrt_start = rep_end + pd.Timedelta(days=1)
