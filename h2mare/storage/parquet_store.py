@@ -80,8 +80,10 @@ class ParquetStore:
         self.partition_cols = set(self._partition_by)
         self.physical_schema = None
         self.physical_cols: set[str] = set()
-        # Last "missing variables" set warned about, to avoid re-logging the same
-        # gap on every chunk of a multi-chunk write (e.g. lagging biology vars).
+        # Everything already warned about as missing (group names when
+        # column_groups is set, else column names), so the same gap is not
+        # re-logged on every chunk of a multi-chunk write, nor on every window
+        # of a multi-window run (e.g. lagging biology vars). Grows only.
         self._missing_warned: set[str] = set()
 
         # Reconcile any partition write interrupted by a hard kill before reading
@@ -273,27 +275,42 @@ class ParquetStore:
         self.physical_schema = dict(polars_float64_to_float32(physical_df).schema)
         self.physical_cols = set(self.physical_schema.keys())
 
-    def _format_missing(self, missing: set[str]) -> str:
+    def _warn_missing(self, missing: set[str]) -> None:
         """
-        Render the "missing columns" warning at the caller's granularity.
+        Warn about columns absent from an incoming write — once per producer.
 
-        Without *column_groups* the store has no vocabulary beyond column names,
-        so it lists them. With it, columns are reported as the groups that own
-        them — for the pipeline, the var_keys: one lagging source contributes
-        all of its compiled columns at once, so naming every column repeats a
-        single fact up to a dozen times and buries which source is actually
-        behind. The groups are also what a reader can act on: they map to a
-        variable in config, to a downloader, and to the backfill that will fill
-        the nulls in on a later run.
+        Columns are reported at the granularity the caller declared. Without
+        *column_groups* the store has no vocabulary beyond column names, so it
+        lists them. With it, columns are reported as the groups that own them —
+        for the pipeline, the var_keys: one lagging source contributes all of
+        its compiled columns at once, so naming every column repeats a single
+        fact up to a dozen times and buries which source is actually behind.
+        The groups are also what a reader can act on: they map to a variable in
+        config, to a downloader, and to the backfill that fills the nulls in on
+        a later run.
+
+        Only names never reported in this process are warned about, and the
+        report set only ever grows. Comparing the whole set for equality
+        instead re-fired on every change: a *shrinking* set (a source catching
+        up mid-write) warned again despite carrying no new bad news, and under
+        grouping two writes missing different columns of one producer named it
+        twice. Both are the same gap seen twice, and a run touching several
+        windows sees them constantly.
         """
+        groups = {self.column_groups.get(col, col) for col in missing}
+        unreported = groups - self._missing_warned
+        if not unreported:
+            return
+        self._missing_warned |= groups
+
+        names = sorted(unreported)
         if not self.column_groups:
-            return f"Missing variables in new data, written as null: {sorted(missing)}"
-
-        groups = sorted({self.column_groups.get(col, col) for col in missing})
-        return (
-            f"Lagging behind the write window, written as null: {groups} — "
-            "backfilled automatically once their source catches up."
-        )
+            logger.warning(f"Missing variables in new data, written as null: {names}")
+        else:
+            logger.warning(
+                f"Lagging behind the write window, written as null: {names} — "
+                "backfilled automatically once their source catches up."
+            )
 
     def _align_to_schema(
         self, df: pl.DataFrame, include_partitions: bool = True
@@ -312,9 +329,7 @@ class ParquetStore:
 
         missing = (physical_cols - self.partition_cols) - set(df_physical.columns)
         if missing:
-            if missing != self._missing_warned:
-                logger.warning(self._format_missing(missing))
-                self._missing_warned = set(missing)
+            self._warn_missing(missing)
             df_physical = df_physical.with_columns(
                 [
                     pl.lit(None).cast(self.physical_schema[col]).alias(col)  # type: ignore

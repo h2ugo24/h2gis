@@ -140,6 +140,48 @@ class TestMissingColumnWarning:
         assert "['chl']" in msgs[0]
         assert "chl_fdist" not in msgs[0]
 
+    def test_shrinking_gap_does_not_warn_again(self, tmp_path):
+        """Regression: the warned set was compared for equality, so a source
+        partly catching up (fewer columns missing than last time) re-fired the
+        warning — the same gap, reported again as if it were news."""
+        store = _store(tmp_path)
+        _write_one(
+            store,
+            [date(2021, 6, 1)],
+            variables={"sst": 20.0, "chl": 1.0, "fsle_max": 0.1},
+        )
+
+        first = self._warnings_for(store, [date(2021, 7, 1)], {"sst": 20.0})
+        # fsle_max caught up; chl is still behind — nothing new to say.
+        second = self._warnings_for(
+            store, [date(2021, 8, 1)], {"sst": 20.0, "fsle_max": 0.1}
+        )
+
+        assert len(first) == 1
+        assert second == []
+
+    def test_producer_is_not_named_twice_for_different_columns(self, tmp_path):
+        """Regression: deduping on columns let one producer be reported once per
+        column it owns — writes missing 'chl' then 'chl_fdist' each warned,
+        both rendering as ['chl']."""
+        store = _store(tmp_path, column_groups={"chl": "chl", "chl_fdist": "chl"})
+        _write_one(
+            store,
+            [date(2021, 6, 1)],
+            variables={"sst": 20.0, "chl": 1.0, "chl_fdist": 0.5},
+        )
+
+        first = self._warnings_for(
+            store, [date(2021, 7, 1)], {"sst": 20.0, "chl_fdist": 0.5}
+        )
+        second = self._warnings_for(
+            store, [date(2021, 8, 1)], {"sst": 20.0, "chl": 1.0}
+        )
+
+        assert len(first) == 1
+        assert "['chl']" in first[0]
+        assert second == []
+
 
 class TestAtomicPartitionWrite:
     def test_creates_partition_directory(self, tmp_path, jan_df):
