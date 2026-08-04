@@ -6,6 +6,7 @@ import pandas as pd
 import polars as pl
 import pytest
 from conftest import make_grid_df
+from loguru import logger
 
 from h2mare.storage.parquet_store import ParquetStore
 
@@ -96,6 +97,90 @@ class TestPartitionHelpers:
 # ---------------------------------------------------------------------------
 # atomic_partition_write
 # ---------------------------------------------------------------------------
+
+
+class TestMissingColumnWarning:
+    """
+    A write missing some of the store's columns warns at the granularity of
+    whatever *produces* those columns, when the caller declares it.
+    """
+
+    def _warnings_for(self, store, dates, variables) -> list[str]:
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="WARNING", format="{message}")
+        try:
+            store.add_data(make_grid_df(dates, variables=variables))
+        finally:
+            logger.remove(sink)
+        return messages
+
+    def test_lists_column_names_without_groups(self, tmp_path):
+        """No column_groups: the store has no vocabulary but column names."""
+        store = _store(tmp_path)
+        _write_one(store, [date(2021, 6, 1)], variables={"sst": 20.0, "chl": 1.0})
+
+        msgs = self._warnings_for(store, [date(2021, 7, 1)], {"sst": 20.0})
+
+        assert len(msgs) == 1
+        assert "['chl']" in msgs[0]
+
+    def test_names_the_producer_not_each_of_its_columns(self, tmp_path):
+        """Regression: one lagging source used to print every column it owns —
+        nine names for seapodym — which buried *which* source was behind."""
+        store = _store(tmp_path, column_groups={"chl": "chl", "chl_fdist": "chl"})
+        _write_one(
+            store,
+            [date(2021, 6, 1)],
+            variables={"sst": 20.0, "chl": 1.0, "chl_fdist": 0.5},
+        )
+
+        msgs = self._warnings_for(store, [date(2021, 7, 1)], {"sst": 20.0})
+
+        assert len(msgs) == 1
+        assert "['chl']" in msgs[0]
+        assert "chl_fdist" not in msgs[0]
+
+    def test_shrinking_gap_does_not_warn_again(self, tmp_path):
+        """Regression: the warned set was compared for equality, so a source
+        partly catching up (fewer columns missing than last time) re-fired the
+        warning — the same gap, reported again as if it were news."""
+        store = _store(tmp_path)
+        _write_one(
+            store,
+            [date(2021, 6, 1)],
+            variables={"sst": 20.0, "chl": 1.0, "fsle_max": 0.1},
+        )
+
+        first = self._warnings_for(store, [date(2021, 7, 1)], {"sst": 20.0})
+        # fsle_max caught up; chl is still behind — nothing new to say.
+        second = self._warnings_for(
+            store, [date(2021, 8, 1)], {"sst": 20.0, "fsle_max": 0.1}
+        )
+
+        assert len(first) == 1
+        assert second == []
+
+    def test_producer_is_not_named_twice_for_different_columns(self, tmp_path):
+        """Regression: deduping on columns let one producer be reported once per
+        column it owns — writes missing 'chl' then 'chl_fdist' each warned,
+        both rendering as ['chl']."""
+        store = _store(tmp_path, column_groups={"chl": "chl", "chl_fdist": "chl"})
+        _write_one(
+            store,
+            [date(2021, 6, 1)],
+            variables={"sst": 20.0, "chl": 1.0, "chl_fdist": 0.5},
+        )
+
+        first = self._warnings_for(
+            store, [date(2021, 7, 1)], {"sst": 20.0, "chl_fdist": 0.5}
+        )
+        second = self._warnings_for(
+            store, [date(2021, 8, 1)], {"sst": 20.0, "chl": 1.0}
+        )
+
+        assert len(first) == 1
+        assert "['chl']" in first[0]
+        assert second == []
 
 
 class TestAtomicPartitionWrite:
