@@ -186,7 +186,9 @@ class Zarr2Parquet(BaseConverter):
         # Derive a stable dataset folder name from the zarr filename by stripping
         # the trailing date label (_YYYY, _YYYY-MM, or _YYYY-MM-DD).
         self.parquet_root = Path(parquet_root) / self._derive_folder_name()
-        self.indexer = ParquetIndexer(self.parquet_root)
+        self.indexer = ParquetIndexer(
+            self.parquet_root, column_groups=self._column_groups()
+        )
 
     # -------------------------------------------------------------------------
     # Public API
@@ -234,21 +236,19 @@ class Zarr2Parquet(BaseConverter):
             variables: Subset of variable names to read from the Zarr and merge
                 into the existing Parquet store (add-var mode).
         """
-        # The per-window header in _convert_window announces var_key, range and
-        # chunk count, so no separate "initializing" line is logged here.
+        # Each window logs exactly one line, and _convert_window's *label* names
+        # the regime that produced it — the windows of the incremental mode are
+        # otherwise indistinguishable from one another in the log.
 
         # Mode 1 — add-var: reprocess the full Zarr range so the overlap resolver
         # can JOIN the new columns into every partition.
         if variables is not None and start_date is None and end_date is None:
-            logger.info(
-                f"add-var mode: merging {variables} into all existing partitions "
-                f"({self.repo_start.date()} → {self.repo_end.date()})"
-            )
             ok = self._convert_window(
                 DateRange(self.repo_start, self.repo_end),
                 time_resolution,
                 depth,
                 variables,
+                label=f"Merging {variables} into all existing partitions",
             )
 
         # Mode 2 — explicit dates (or partial override).
@@ -259,7 +259,13 @@ class Zarr2Parquet(BaseConverter):
             ok = (
                 True
                 if window is None
-                else self._convert_window(window, time_resolution, depth, variables)
+                else self._convert_window(
+                    window,
+                    time_resolution,
+                    depth,
+                    variables,
+                    label="Converting requested range",
+                )
             )
 
         # Mode 3 — incremental: append new dates, then backfill lagging columns.
@@ -267,6 +273,22 @@ class Zarr2Parquet(BaseConverter):
         # the append and backfill windows are disjoint, so execution order is free.
         else:
             ok = True
+
+            # The pre-append store end is the pivot between the two regimes:
+            # dates after it are appended, dates at or before it are backfilled.
+            # Every window below is derived from it, so log it once — without it
+            # the ranges that follow cannot be interpreted from the log alone.
+            pivot = (
+                self.indexer.get_time_coverage()
+                if self.indexer._dataset_meta_initialized
+                else None
+            )
+            if pivot is not None:
+                logger.info(
+                    f"Parquet store covers {pivot.start.date()} → {pivot.end.date()}"
+                    f"; appending after {pivot.end.date()}, backfilling within."
+                )
+
             backfill_groups = self._resolve_backfill_groups()
 
             # A ``None`` window means there is nothing new to append; backfill
@@ -274,14 +296,22 @@ class Zarr2Parquet(BaseConverter):
             # of being swallowed as "nothing to append".
             window = self._resolve_date_range(None, None)
             if window is not None:
-                ok &= self._convert_window(window, time_resolution, depth, None)
+                ok &= self._convert_window(
+                    window,
+                    time_resolution,
+                    depth,
+                    None,
+                    label="Appending new dates",
+                )
 
             for window, cols in backfill_groups:
-                logger.info(
-                    f"Backfilling {sorted(cols)} into existing partitions: "
-                    f"{window.start.date()} → {window.end.date()}"
+                ok &= self._convert_window(
+                    window,
+                    time_resolution,
+                    depth,
+                    sorted(cols),
+                    label=f"Backfilling {sorted(cols)} into existing partitions",
                 )
-                ok &= self._convert_window(window, time_resolution, depth, sorted(cols))
 
         if ok:
             logger.success(
@@ -300,6 +330,8 @@ class Zarr2Parquet(BaseConverter):
         time_resolution: TimeResolution,
         depth: float | None,
         variables: list[str] | None,
+        *,
+        label: str = "Converting",
     ) -> bool:
         """
         Convert a single date window to Parquet, one monthly chunk at a time.
@@ -308,13 +340,20 @@ class Zarr2Parquet(BaseConverter):
         each chunk and writes them via ``ParquetIndexer.add_data``, which appends
         non-overlapping partitions or JOINs overlapping ones automatically.
 
+        Args:
+            label: Names the regime this window belongs to (append, backfill,
+                add-var, explicit range) in the one line logged for it. The
+                caller owns the wording because only it knows why the window
+                exists; ``var_key`` is not repeated here — the log's ``var``
+                column already carries it on every line.
+
         Returns ``True`` when every chunk converted without error.
         """
         periods = split_time_range(window, time_resolution)
-        logger.info(
-            f"Zarr → Parquet conversion for '{self.var_key.upper()}': "
-            f"{window.start.date()} → {window.end.date()} ({len(periods)} chunk(s))"
-        )
+        # The chunk count is only informative when the window actually splits;
+        # the per-chunk DEBUG lines below cover that case in full.
+        chunks = f" ({len(periods)} chunks)" if len(periods) > 1 else ""
+        logger.info(f"{label}: {window.start.date()} → {window.end.date()}{chunks}")
 
         _failed = False
         for period in periods:
@@ -542,6 +581,21 @@ class Zarr2Parquet(BaseConverter):
     # -------------------------------------------------------------------------
     # Internal helpers
     # -------------------------------------------------------------------------
+
+    def _column_groups(self) -> dict[str, str]:
+        """
+        Map every compiled column to the var_key that produces it.
+
+        Lets the store report a lag as "seapodym is behind" rather than listing
+        the nine columns seapodym happens to compile into — the columns of a
+        var_key always move together (they share ``compiled_vars`` dates), so
+        they carry no information the var_key does not.
+        """
+        return {
+            col: vkey
+            for vkey, vc in self.app_config.variables.items()
+            for col in (vc.compiled_vars or [])
+        }
 
     def _derive_folder_name(self) -> str:
         """

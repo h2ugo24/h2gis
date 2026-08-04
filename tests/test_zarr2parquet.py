@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
+from loguru import logger
 
 from h2mare.format_converters.zarr2parquet import Zarr2Parquet
 from h2mare.types import DateRange
@@ -661,6 +662,58 @@ class TestRunIncremental:
         # Second call = backfill (explicit column subset)
         second = mock_conv.call_args_list[1]
         assert second.args[3] == ["sst", "sst_fdist"]
+
+    def test_each_window_logs_exactly_one_labelled_line(self, tmp_path):
+        """Regression: every backfill window was announced twice — once by run()
+        and again by _convert_window's generic header, with the same dates on
+        both lines and nothing marking which regime produced them.
+
+        Also pins the pivot line: the pre-append store end is what separates
+        'appending after' from 'backfilling within', and the windows below
+        cannot be interpreted without it.
+        """
+        z = _make_converter(
+            tmp_path,
+            parquet_initialized=True,
+            parquet_end=pd.Timestamp("1998-06-30"),
+        )
+
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="INFO", format="{message}")
+        try:
+            with (
+                patch.object(z, "_convert_window", wraps=z._convert_window),
+                patch.object(
+                    z,
+                    "_resolve_backfill_groups",
+                    return_value=[
+                        (
+                            DateRange(
+                                pd.Timestamp("1998-06-01"), pd.Timestamp("1998-06-30")
+                            ),
+                            {"sst"},
+                        )
+                    ],
+                ),
+                patch("h2mare.format_converters.zarr2parquet.pl") as mock_pl,
+            ):
+                mock_pl.from_pandas.return_value = MagicMock()
+                z.zarr_repo.open_dataset.return_value = MagicMock(dims={})
+                z.run()
+        finally:
+            logger.remove(sink)
+
+        assert any(
+            m.startswith("Parquet store covers 1998-01-01 → 1998-06-30")
+            for m in messages
+        )
+        # One line per window, each naming its regime — not two saying the same.
+        assert sum(m.startswith("Appending new dates:") for m in messages) == 1
+        assert sum(m.startswith("Backfilling ['sst']") for m in messages) == 1
+        assert not any(
+            m.startswith("Zarr → Parquet conversion for") and "complete" not in m
+            for m in messages
+        )
 
     def test_backfill_runs_even_when_nothing_to_append(self, tmp_path):
         """An 'up to date' append still lets backfill proceed.

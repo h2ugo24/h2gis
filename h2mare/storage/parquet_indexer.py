@@ -37,6 +37,7 @@ class ParquetIndexer:
         lat_col: str = "lat",
         target_file_mb: int = 256,
         partition_by: list[str] | None = None,
+        column_groups: dict[str, str] | None = None,
     ):
         """
         Parquet data indexer.
@@ -51,6 +52,10 @@ class ParquetIndexer:
                 components ("year", "month", "day") are auto-derived from the time column; all
                 other columns must be present in the DataFrame passed to add_data().
                 None means ["year", "month"].
+            column_groups (dict[str, str] | None, optional): Maps a column to the
+                name of whatever produces it (a var_key, for the pipeline). Used
+                only to report missing columns by their producer instead of one
+                by one. None means report raw column names.
 
         Raises:
             ValueError: If time, lat, lon cols not in data.
@@ -62,6 +67,7 @@ class ParquetIndexer:
             lat_col=lat_col,
             target_file_mb=target_file_mb,
             partition_by=partition_by,
+            column_groups=column_groups,
         )
         self._catalog = ParquetCatalog(self._store)
 

@@ -67,6 +67,7 @@ class ParquetStore:
         lat_col: str = "lat",
         target_file_mb: int = 256,
         partition_by: list[str] | None = None,
+        column_groups: dict[str, str] | None = None,
     ):
         self.parquet_root = Path(parquet_root)
         self.time_col = time_col
@@ -74,6 +75,7 @@ class ParquetStore:
         self.lat_col = lat_col
         self._target_file_mb = target_file_mb
         self._partition_by = list(partition_by) if partition_by else ["year", "month"]
+        self.column_groups = dict(column_groups) if column_groups else {}
 
         self.partition_cols = set(self._partition_by)
         self.physical_schema = None
@@ -271,6 +273,28 @@ class ParquetStore:
         self.physical_schema = dict(polars_float64_to_float32(physical_df).schema)
         self.physical_cols = set(self.physical_schema.keys())
 
+    def _format_missing(self, missing: set[str]) -> str:
+        """
+        Render the "missing columns" warning at the caller's granularity.
+
+        Without *column_groups* the store has no vocabulary beyond column names,
+        so it lists them. With it, columns are reported as the groups that own
+        them — for the pipeline, the var_keys: one lagging source contributes
+        all of its compiled columns at once, so naming every column repeats a
+        single fact up to a dozen times and buries which source is actually
+        behind. The groups are also what a reader can act on: they map to a
+        variable in config, to a downloader, and to the backfill that will fill
+        the nulls in on a later run.
+        """
+        if not self.column_groups:
+            return f"Missing variables in new data, written as null: {sorted(missing)}"
+
+        groups = sorted({self.column_groups.get(col, col) for col in missing})
+        return (
+            f"Lagging behind the write window, written as null: {groups} — "
+            "backfilled automatically once their source catches up."
+        )
+
     def _align_to_schema(
         self, df: pl.DataFrame, include_partitions: bool = True
     ) -> pl.DataFrame:
@@ -289,7 +313,7 @@ class ParquetStore:
         missing = (physical_cols - self.partition_cols) - set(df_physical.columns)
         if missing:
             if missing != self._missing_warned:
-                logger.warning(f"Missing variables in new data: {missing}")
+                logger.warning(self._format_missing(missing))
                 self._missing_warned = set(missing)
             df_physical = df_physical.with_columns(
                 [
