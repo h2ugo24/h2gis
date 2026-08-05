@@ -130,7 +130,7 @@ class TestResolveDateRange:
     def test_already_up_to_date_returns_none(self, tmp_path):
         """Inferred start beyond zarr end → nothing to convert, a clean no-op.
 
-        Mirrors utils.date_range.resolve_date_range: inferred ranges signal
+        Mirrors storage.coverage.resolve_date_range: inferred ranges signal
         'nothing to do' with None; only explicit dates raise.
         """
         z = _make_converter(

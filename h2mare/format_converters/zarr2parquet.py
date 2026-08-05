@@ -631,7 +631,7 @@ class Zarr2Parquet(BaseConverter):
         2. Incremental gap: ``parquet_end + 1 day`` → ``zarr_end``.
         3. First run: ``zarr_start`` → ``zarr_end`` (parquet store empty).
 
-        Mirrors :func:`h2mare.utils.date_range.resolve_date_range`: an inferred
+        Mirrors :func:`h2mare.storage.coverage.resolve_date_range`: an inferred
         range that has nothing left to convert is a clean no-op (``None``), while
         explicitly supplied dates in the wrong order stay a caller error.
 

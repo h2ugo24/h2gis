@@ -8,8 +8,47 @@ from __future__ import annotations
 
 from typing import Sequence
 
+import polars as pl
+
 from h2mare.config import AppConfig
 from h2mare.types import TimeResolution
+
+
+def validate_columns(
+    data: pl.LazyFrame | pl.DataFrame, cols: str | Sequence[str]
+) -> None:
+    """
+    Check that *cols* are present in *data*.
+
+    Lives here rather than beside its Parquet callers because both
+    ``storage.parquet_helpers`` and ``utils.plot`` need it: importing it from
+    storage into utils inverted the package layering (utils is a leaf) and
+    closed an import cycle, since ``storage.zarr_catalog`` imports
+    ``utils.labels``.
+
+    Args:
+        data (pl.LazyFrame | pl.DataFrame): Input data
+        cols (str | Sequence[str]): Columns to check.
+
+    Raises:
+        TypeError: If cols are not a string or sequence of strings.
+        ValueError: If columns are not in data.
+    """
+    if isinstance(cols, str):
+        required = {cols}
+    elif isinstance(cols, Sequence):
+        required = set(cols)
+    else:
+        raise TypeError("`cols` must a string or a sequence of strings")
+
+    if isinstance(data, pl.LazyFrame):
+        existing = set(data.collect_schema().names())
+    else:
+        existing = set(data.schema.names())
+
+    missing = required - existing
+    if missing:
+        raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
 
 
 def validate_var_key(var_key: str, config: AppConfig) -> str:
