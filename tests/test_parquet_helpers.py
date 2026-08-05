@@ -7,10 +7,10 @@ import polars as pl
 import pytest
 
 from h2mare.storage.parquet_helpers import (
-    _required_columns,
     aggregate_by_space_time,
     aggregate_by_time,
     polars_float64_to_float32,
+    validate_columns,
 )
 from h2mare.utils.plot import df_to_grid, split_by_group
 
@@ -50,27 +50,27 @@ class TestFloat64ToFloat32:
 
 
 # ---------------------------------------------------------------------------
-# _required_columns
+# validate_columns
 # ---------------------------------------------------------------------------
 
 
 class TestRequiredColumns:
     def test_passes_when_present(self):
         df = pl.DataFrame({"a": [1], "b": [2]})
-        _required_columns(df, ["a", "b"])  # should not raise
+        validate_columns(df, ["a", "b"])  # should not raise
 
     def test_raises_when_missing(self):
         df = pl.DataFrame({"a": [1]})
         with pytest.raises(ValueError, match="b"):
-            _required_columns(df, ["a", "b"])
+            validate_columns(df, ["a", "b"])
 
     def test_single_string(self):
         df = pl.DataFrame({"a": [1]})
-        _required_columns(df, "a")
+        validate_columns(df, "a")
 
     def test_lazyframe(self):
         lf = pl.DataFrame({"a": [1], "b": [2]}).lazy()
-        _required_columns(lf, ["a", "b"])
+        validate_columns(lf, ["a", "b"])
 
 
 # ---------------------------------------------------------------------------

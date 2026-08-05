@@ -21,8 +21,8 @@ from IPython.display import clear_output, display
 from loguru import logger
 
 from h2mare.config import get_settings
-from h2mare.storage.parquet_helpers import _required_columns
 from h2mare.types import BBox
+from h2mare.validators import validate_columns
 
 _PANEL_WIDTH = 3.0  # inches per panel column
 _WSPACE = -0.15  # fractional horizontal gap between panels
@@ -81,7 +81,7 @@ def plot_maps(
     if df.is_empty():
         raise ValueError("No data after aggregation.")
 
-    _required_columns(df, var_name)
+    validate_columns(df, var_name)
 
     # Derive group column from time_col when not already present
     if agg_by not in df.columns:
@@ -90,7 +90,7 @@ def plot_maps(
                 f"Column '{agg_by}' not found in df. "
                 f"Pass time_col so it can be derived automatically."
             )
-        _required_columns(df, time_col)
+        validate_columns(df, time_col)
         if agg_by == "month":
             df = df.with_columns(pl.col(time_col).dt.month().alias("month"))
         elif agg_by == "season":
@@ -275,7 +275,7 @@ def make_axes(
 def df_to_grid(
     df: pl.DataFrame, var_name: str, *, lon_col: str = "lon", lat_col: str = "lat"
 ):
-    _required_columns(df, [var_name, lon_col, lat_col])
+    validate_columns(df, [var_name, lon_col, lat_col])
     lon = df[lon_col].to_numpy()
     lat = df[lat_col].to_numpy()
     val = df[var_name].to_numpy()
@@ -296,7 +296,7 @@ def split_by_group(
     df: pl.DataFrame,
     group_col: str,
 ) -> dict[int | str, pl.DataFrame]:
-    _required_columns(df, group_col)
+    validate_columns(df, group_col)
 
     if group_col == "month":
         df = df.sort("month")

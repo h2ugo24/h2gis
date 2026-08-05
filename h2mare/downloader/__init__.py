@@ -1,4 +1,4 @@
-from h2mare.utils.date_range import resolve_date_range
+from h2mare.storage.coverage import resolve_date_range
 
 from .aviso_downloader import AVISODownloader
 from .base import BaseDownloader

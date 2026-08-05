@@ -18,8 +18,8 @@ h2mare/
   ├── downloader/           # Source fetchers (CMEMS, AVISO, CDS) selected via registry.py → data/raw/downloads/
   ├── format_converters/    # netcdf2zarr (regrid → 0.25°/daily), zarr2parquet, parquet2csv, zarr_map_export
   ├── processing/           # Per-var preprocessing; compiler.py merges → h2ds; core/ holds source transforms
-  ├── storage/              # zarr_catalog (facade) / _index (resume index) / _reader (open_dataset); parquet_store (write) / _indexer (API) / _catalog (read)
-  └── utils/                # date_range, spatial (grids/masks), labels, logging, paths
+  ├── storage/              # zarr_catalog (facade) / _index (resume index) / _reader (open_dataset); parquet_store (write) / _indexer (API) / _catalog (read); coverage (date-range resolution)
+  └── utils/                # spatial (grids/masks), labels, logging, paths, datetime_utils
 ```
 
 The pipeline flows left-to-right through these packages: downloader/ fetches raw files → format_converters/ +

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Literal
 
 import polars as pl
+
+from h2mare.validators import validate_columns
 
 SEASON_INDEX = {
     "spring": 0,
@@ -24,37 +25,6 @@ def polars_float64_to_float32(df: pl.DataFrame) -> pl.DataFrame:
         return col
 
     return df.with_columns([_convert(df[col]) for col in df.columns])
-
-
-def _required_columns(
-    data: pl.LazyFrame | pl.DataFrame, cols: str | Sequence[str]
-) -> None:
-    """
-    Check if provided cols are in data.
-
-    Args:
-        data (pl.LazyFrame | pl.DataFrame): Input data
-        cols (str | Sequence[str]): Columns to check.
-
-    Raises:
-        TypeError: If cols are not a string or sequence of strings.
-        ValueError: If columns are not in data.
-    """
-    if isinstance(cols, str):
-        required = {cols}
-    elif isinstance(cols, Sequence):
-        required = set(cols)
-    else:
-        raise TypeError("`cols` must a string or a sequence of strings")
-
-    if isinstance(data, pl.LazyFrame):
-        existing = set(data.collect_schema().names())
-    else:
-        existing = set(data.schema.names())
-
-    missing = required - existing
-    if missing:
-        raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
 
 
 def aggregate_by_space_time(
@@ -97,7 +67,7 @@ def aggregate_by_space_time(
 
     vars_name = [vars_name] if isinstance(vars_name, str) else vars_name
 
-    _required_columns(lf, [*vars_name, time_col, lon_col, lat_col])
+    validate_columns(lf, [*vars_name, time_col, lon_col, lat_col])
 
     if agg_by == "month":
         lf = lf.with_columns(pl.col(time_col).dt.month().alias(agg_by))
@@ -155,7 +125,7 @@ def aggregate_by_time(
     """
     vars_list = [vars_name] if isinstance(vars_name, str) else vars_name
 
-    _required_columns(lf, [*vars_list, time_col])
+    validate_columns(lf, [*vars_list, time_col])
 
     # Build aggregation expressions once
     agg_exprs = [pl.col(v).mean() for v in vars_list]
@@ -220,7 +190,7 @@ def aggregate_by_time_stats(
     Returns:
         pl.LazyFrame: Columns 'time_agg', '{var}_mean', '{var}_std', '{var}_min', '{var}_max'.
     """
-    _required_columns(lf, [var_name, time_col])
+    validate_columns(lf, [var_name, time_col])
 
     agg_exprs = [
         pl.col(var_name).mean().alias(f"{var_name}_mean"),
