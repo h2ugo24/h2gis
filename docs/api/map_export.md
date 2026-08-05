@@ -3,6 +3,10 @@
 `export_map_zarr` rewrites a per-period Zarr store into a **map-optimized sibling
 store** for interactive visualization, leaving the canonical store untouched.
 
+h2mare only *writes* the `_map` store — the consumer is the external interactive-viz
+app. No code in this package reads it back, and none of the plotting helpers in
+`h2mare.utils.plot` open it (they plot data the caller already holds).
+
 ```python
 from h2mare.format_converters.zarr_map_export import export_map_zarr
 
