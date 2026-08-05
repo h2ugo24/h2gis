@@ -5,6 +5,42 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-08-05
+
+### Breaking
+
+- `h2mare.utils` no longer re-exports the plotting helpers (`plot_maps`,
+  `plot_snapshot`, `animate_vars`, `plot_interactive_map`,
+  `plot_records_on_field`). Import them from `h2mare.utils.plot` instead. The
+  package-level re-export forced `utils` to import `storage`, and importing
+  anything from `h2mare.utils` pulled in matplotlib, cartopy and geopandas.
+- `resolve_date_range` moved from `h2mare.utils.date_range` to
+  `h2mare.storage.coverage`, beside `get_store_coverage` and
+  `split_time_range`. `h2mare/utils/date_range.py` is removed.
+
+### Changed
+
+- `utils/` is a leaf package again: it imports `storage` nowhere, at module
+  scope or inside a function. `storage` may import `utils`, not the reverse.
+  The column check shared by both (`_required_columns`) moved to
+  `validators.py` as `validate_columns`.
+- The Zarr → Parquet step logs one labelled line per window naming its regime
+  (append, backfill, add-var, explicit range) instead of announcing each window
+  twice with the same dates. The pre-append store end — the pivot separating
+  the append from the backfills — is logged once, so the windows below it can
+  be interpreted.
+- A lagging source is reported by `var_key` rather than by every compiled
+  column it owns, and only once per producer per run.
+
+### Fixed
+
+- `xr.concat` calls pass `join` explicitly. xarray is changing the default from
+  `"outer"` to `"exact"`, which would have turned a coordinate mismatch into a
+  `ValueError` on a routine dependency bump.
+- The missing-columns warning no longer re-fires when the gap *shrinks* (a
+  source partly catching up) or when two writes miss different columns of the
+  same producer.
+
 ## [0.6.0] - 2026-07-31
 
 ### Added
