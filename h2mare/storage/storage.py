@@ -189,7 +189,12 @@ def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
             ds_old_tail.close()
 
         if len(parts) > 1:
-            ds_out = xr.concat(parts, dim="time", data_vars="minimal")
+            # join is explicit because xarray's concat default changes from
+            # "outer" to "exact"; without it this call starts raising once that
+            # lands. "outer" pins today's behaviour — note it is also the
+            # failure mode the snapping above guards against, so a genuine grid
+            # mismatch here unions into a NaN-holed axis rather than failing.
+            ds_out = xr.concat(parts, dim="time", data_vars="minimal", join="outer")
             # Rechunk to match the existing zarr layout and avoid dask
             # chunk-alignment errors.
             ds_out = ds_out.chunk(

@@ -652,7 +652,8 @@ class EDDIESProcessor:
             )
             return None
 
-        ds_year = xr.concat(daily, dim="time")
+        # Explicit join: xarray's concat default changes from "outer" to "exact".
+        ds_year = xr.concat(daily, dim="time", join="outer")
         return self._set_attrs(ds_year)
 
     def _set_attrs(self, ds: xr.Dataset) -> xr.Dataset:
