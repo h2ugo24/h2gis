@@ -386,7 +386,8 @@ def get_previous_dates_da(da: xr.DataArray, var_key: str):
             da_prev = ds_prev["ekman_pumping"]
         else:
             da_prev = ds_prev
-        return xr.concat([da, da_prev], dim="time").sortby("time")
+        # Explicit join: xarray's concat default changes from "outer" to "exact".
+        return xr.concat([da, da_prev], dim="time", join="outer").sortby("time")
     else:
         logger.warning("No previous data available. Returning input data array.")
         return da
