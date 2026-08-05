@@ -204,7 +204,9 @@ def ensure_row_id(
 
     data = data.copy()
     data[col] = range(len(data))
-    logger.info(f"No '{col}' column found — added a positional one (0..{len(data) - 1}).")
+    logger.info(
+        f"No '{col}' column found — added a positional one (0..{len(data) - 1})."
+    )
     return data
 
 

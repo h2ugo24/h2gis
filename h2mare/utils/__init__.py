@@ -8,14 +8,13 @@ from .files_io import safe_move_files, safe_rmtree
 from .labels import create_filename_label, create_label_from_dataset
 from .logging import log_time
 from .paths import resolve_download_path, resolve_store_path
-from .plot import (
-    animate_vars,
-    plot_interactive_map,
-    plot_maps,
-    plot_records_on_field,
-    plot_snapshot,
-)
 from .spatial import GridBuilder, clip_land_data, haversine_min_distance_kdtree
+
+# ``.plot`` is deliberately NOT re-exported here. Importing it eagerly made every
+# ``h2mare.utils.*`` import pull in matplotlib/cartopy/geopandas, and — because
+# plot needs ZarrCatalog while storage.zarr_catalog imports utils.labels — it
+# forced a cycle that plot.py had to work around with a function-level import.
+# Import the module directly instead: ``from h2mare.utils.plot import plot_maps``.
 
 __all__ = [
     "log_time",
@@ -32,9 +31,4 @@ __all__ = [
     "normalize_dates",
     "to_datetime",
     "more_than_one_year",
-    "plot_maps",
-    "animate_vars",
-    "plot_snapshot",
-    "plot_interactive_map",
-    "plot_records_on_field",
 ]

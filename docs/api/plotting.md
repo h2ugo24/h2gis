@@ -1,9 +1,9 @@
 # Plotting utilities
 
-Standalone plotting helpers in `h2mare.utils.plot`, importable from `h2mare.utils`:
+Standalone plotting helpers in `h2mare.utils.plot`:
 
 ```python
-from h2mare.utils import (
+from h2mare.utils.plot import (
     plot_maps,             # climatological panel maps from a Parquet DataFrame
     plot_snapshot,         # all variables of a Dataset at one time step
     animate_vars,          # animate a variable over time or depth
@@ -11,6 +11,12 @@ from h2mare.utils import (
     plot_records_on_field, # the variable field around each record, location overlaid
 )
 ```
+
+Import from the module path, not from `h2mare.utils`. The package deliberately
+does not re-export these: `plot_records_on_field` needs `ZarrCatalog`, and
+`storage.zarr_catalog` imports `utils.labels`, so re-exporting plot would make
+importing anything from `h2mare.utils` circular — and would pull
+matplotlib/cartopy/geopandas into every `h2mare.utils.*` import.
 
 These are free functions for ad-hoc and notebook use. For the Parquet store's
 bundled accessor (`indexer.plot.time_series(...)`, etc.) see
