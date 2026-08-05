@@ -18,8 +18,8 @@ h2mare/
   ├── downloader/           # Source fetchers (CMEMS, AVISO, CDS) selected via registry.py → data/raw/downloads/
   ├── format_converters/    # netcdf2zarr (regrid → 0.25°/daily), zarr2parquet, parquet2csv, zarr_map_export
   ├── processing/           # Per-var preprocessing; compiler.py merges → h2ds; core/ holds source transforms
-  ├── storage/              # zarr_catalog (facade) / _index (resume index) / _reader (open_dataset); parquet_store (write) / _indexer (API) / _catalog (read)
-  └── utils/                # date_range, spatial (grids/masks), labels, logging, paths
+  ├── storage/              # zarr_catalog (facade) / _index (resume index) / _reader (open_dataset); parquet_store (write) / _indexer (API) / _catalog (read); coverage (date-range resolution)
+  └── utils/                # spatial (grids/masks), labels, logging, paths, datetime_utils
 ```
 
 The pipeline flows left-to-right through these packages: downloader/ fetches raw files → format_converters/ +
@@ -111,8 +111,10 @@ viz read to decompress many unwanted days). It logs the resulting layout/shape/s
 `export_map_zarr` (`format_converters/zarr_map_export.py`) rewrites a per-period store into a map-chunked **sibling**
 (`h2ds` → `h2ds_map`; or any `var_key` / config-free `source_root`). It's a pure projection: lazy split-rechunk,
 atomic temp-dir swap, source never modified. The `_map` store is a full duplicate (~h2ds size) — a derived,
-rebuildable artifact. The interactive-viz field path reads `h2ds_map`; the canonical `h2ds` stays extraction-chunked.
-See `docs/api/map_export.md`.
+rebuildable artifact. `h2ds_map` is written here and read by the **external** interactive-viz app; nothing in
+h2mare consumes it, so don't go looking for a reader in this repo (in particular, `plot_interactive_map` in
+`utils/plot.py` plots a DataFrame the caller passes in and opens no store). The canonical `h2ds` stays
+extraction-chunked. See `docs/api/map_export.md`.
 
 ## Git workflow
 
