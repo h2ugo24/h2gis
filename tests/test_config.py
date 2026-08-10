@@ -59,6 +59,45 @@ class TestFindProjectRoot:
 
 
 # ---------------------------------------------------------------------------
+# directory creation
+# ---------------------------------------------------------------------------
+
+
+class TestDirectoryCreation:
+    def test_settings_creates_nothing_under_base_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("H2MARE_ROOT", str(tmp_path))
+        monkeypatch.delenv("STORE_ROOT", raising=False)
+        Settings()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_discovered_root_creates_nothing(self, tmp_path, monkeypatch):
+        """A config.yaml in cwd makes tmp_path the project root — still no data/."""
+        monkeypatch.delenv("H2MARE_ROOT", raising=False)
+        monkeypatch.delenv("STORE_ROOT", raising=False)
+        (tmp_path / "config.yaml").write_text(_MINIMAL_CONFIG_YAML)
+        monkeypatch.chdir(tmp_path)
+        s = Settings()
+        assert s.BASE_DIR == tmp_path.resolve()
+        assert not (tmp_path / "data").exists()
+        assert not (tmp_path / "logs").exists()
+
+    def test_ensure_directories_creates_tree_when_called(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("H2MARE_ROOT", str(tmp_path))
+        monkeypatch.delenv("STORE_ROOT", raising=False)
+        s = Settings()
+        s.ensure_directories()
+        for d in (
+            s.DOWNLOADS_DIR,
+            s.INTERIM_DIR,
+            s.ZARR_DIR,
+            s.PARQUET_DIR,
+            s.METADATA_DIR,
+            s.LOGS_DIR,
+        ):
+            assert d.is_dir()
+
+
+# ---------------------------------------------------------------------------
 # _get_store_dir
 # ---------------------------------------------------------------------------
 

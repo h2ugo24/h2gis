@@ -208,6 +208,7 @@ class FrontProcessor:
         )
 
         zarr_path = get_settings().INTERIM_DIR / f"{self.var_key}_tmp.zarr"
+        zarr_path.parent.mkdir(parents=True, exist_ok=True)
         da.to_dataset(name=self.var_key).to_zarr(zarr_path, mode="w")
 
         _zarr_ds = xr.open_zarr(zarr_path)

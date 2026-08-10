@@ -69,7 +69,7 @@ If auto-detection fails — for example, you run `h2mare` from an unrelated dire
 H2MARE_ROOT=/path/to/your/h2mare/project
 ```
 
-Without it, h2mare falls back to `~/.h2mare` (library mode), where no data directories are created and commands will fail.
+Without it, h2mare falls back to `~/.h2mare`, which holds no `config.yaml`, and commands will fail.
 
 ## Data storage layout
 
@@ -88,3 +88,5 @@ $STORE_ROOT/<local_folder>/          # per-variable Zarr stores (when STORE_ROOT
 ```
 
 `local_folder` is defined per variable in `config.yaml` (e.g. `CMEMS_SST`, `CMEMS_SSH`). When `STORE_ROOT` is set, Zarr output goes there; otherwise it falls back to `data/processed/zarr/`.
+
+These directories are created on first write, not at import — so a project root only grows the branches it actually uses. Call `get_settings().ensure_directories()` to scaffold the whole tree up front.
