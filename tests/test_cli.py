@@ -1,11 +1,17 @@
 """Tests for CLI commands — argument validation and error paths."""
 
+import io
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import msgspec
+import pandas as pd
 from typer.testing import CliRunner
 
+from h2mare.cli import _configure, _use_utf8_console
+from h2mare.cli.catalog import _print_catalog
 from h2mare.cli.catalog import app as catalog_app
 from h2mare.cli.compile import app as compile_app
 from h2mare.cli.main import app as main_app
@@ -261,3 +267,58 @@ class TestCatalogCLI:
             result = _runner.invoke(catalog_app, ["--all"])
         assert result.exit_code == 0
         mock_print.assert_called_once_with("sst", False)
+
+
+# ---------------------------------------------------------------------------
+# cli/__init__.py — console encoding
+# ---------------------------------------------------------------------------
+
+
+class TestConsoleEncoding:
+    @staticmethod
+    def _cp1252_stream() -> io.TextIOWrapper:
+        """Stand-in for the cp1252 stdout Windows hands the CLI."""
+        return io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+
+    def test_catalog_summary_survives_cp1252_console(self, monkeypatch):
+        cat = MagicMock()
+        cat.df = pd.DataFrame()
+        cat.summary.return_value = {
+            "num_files": 29,
+            "time_coverage": SimpleNamespace(
+                start=pd.Timestamp("1998-01-01"), end=pd.Timestamp("2026-08-06")
+            ),
+            "variables": {"sst"},
+            "total_timesteps": 10444,
+            "store_root": "D:/GlobalData/CMEMS_SST",
+            "catalog_path": "sst_zarr_catalog.parquet",
+            "last_scanned": pd.Timestamp("2026-08-10"),
+        }
+        monkeypatch.setattr(
+            "h2mare.storage.zarr_catalog.ZarrCatalog", lambda *a, **k: cat
+        )
+        monkeypatch.setattr(sys, "stdout", self._cp1252_stream())
+        monkeypatch.setattr(sys, "stderr", self._cp1252_stream())
+
+        _use_utf8_console()
+        _print_catalog("sst", show_rows=False)
+        sys.stdout.flush()
+
+        printed = sys.stdout.buffer.getvalue().decode("utf-8")
+        assert "1998-01-01 → 2026-08-06" in printed
+
+    def test_utf8_console_leaves_utf8_streams_alone(self, monkeypatch):
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+        monkeypatch.setattr(sys, "stdout", stream)
+        monkeypatch.setattr(sys, "stderr", stream)
+        _use_utf8_console()
+        assert sys.stdout.errors == "strict"
+
+    def test_every_command_configures_the_console(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(
+            "h2mare.cli._use_utf8_console", lambda: calls.append("console")
+        )
+        monkeypatch.setattr("h2mare.cli.configure_logging", lambda *a, **k: None)
+        _configure()
+        assert calls == ["console"]
