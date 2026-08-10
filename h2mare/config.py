@@ -50,11 +50,9 @@ class Settings:
         # External Storage (where all data lives)
         self.STORE_ROOT = self._get_store_dir()
 
-        # Only create directories when running inside an h2mare project (config.yaml found).
-        # When h2mare is used as a library dependency, skip directory creation so we don't
-        # pollute the consuming project with data/ and logs/ folders.
-        if self._project_mode:
-            self.ensure_directories()
+        # No directories are created here: Settings() runs on any import, and
+        # BASE_DIR may be a directory that merely contains a config.yaml. Writers
+        # mkdir their own parents.
 
         # Application config (lazy loaded)
         self._app_config: Optional[AppConfig] = None
@@ -105,7 +103,7 @@ class Settings:
         return self.STORE_ROOT / "Climatology"
 
     def ensure_directories(self):
-        """Create necessary directories on first run."""
+        """Scaffold the project directory tree under BASE_DIR. Opt-in, not automatic."""
         dirs = [
             self.DOWNLOADS_DIR,
             self.INTERIM_DIR,

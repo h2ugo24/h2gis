@@ -755,6 +755,7 @@ class Extractor:
         var_dict = self._normalize_var_dict(var_dict)
 
         tmp_path = get_settings().INTERIM_DIR / "extraction_checkpoint.feather"
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
 
         if tmp_path.exists():
             logger.warning(f"Found checkpoint file: {tmp_path}, resuming.")
