@@ -428,11 +428,18 @@ class TestRunWindow:
 
         assert groups == {}
 
+    # No groups now means one of two things, and run() tells them apart by
+    # asking whether any file parsed a date at all. These two only care about
+    # the window argument, so they stub a parseable series to land on the
+    # benign "window matched nothing" branch rather than the pattern fault.
+    _PARSED = pd.Series(["a.nc"], index=pd.DatetimeIndex(["2020-06-01"]))
+
     def test_run_passes_the_window_through(self, tmp_path):
         converter = _make_converter(tmp_path)
 
         with (
             patch.object(converter, "_group_map", return_value={}) as mock_group,
+            patch.object(converter, "_get_file_date_series", return_value=self._PARSED),
             patch("h2mare.format_converters.netcdf2zarr.recover_zarr_store"),
         ):
             converter.run("2021-01-01", "2021-12-31")
@@ -446,6 +453,7 @@ class TestRunWindow:
 
         with (
             patch.object(converter, "_group_map", return_value={}) as mock_group,
+            patch.object(converter, "_get_file_date_series", return_value=self._PARSED),
             patch("h2mare.format_converters.netcdf2zarr.recover_zarr_store"),
         ):
             converter.run()
@@ -877,3 +885,118 @@ class TestProvenanceDeliveredDates:
         [record] = self._read_provenance(conv)
 
         assert record["delivered_days"] == 10
+
+
+# ---------------------------------------------------------------------------
+# Single-day filenames and the silent no-op
+#
+# copernicusmarine names a one-day subset with a single date
+# (`..._2026-07-31.nc`), not a range. A two-date pattern matched nothing, so
+# _group_map produced no periods, run() reported "0 period(s)" success, and
+# _cleanup_downloads then deleted the file that had downloaded fine. The store
+# never changed and the run exited 0 — which is how the repair path for a
+# one-day gap was itself broken.
+# ---------------------------------------------------------------------------
+
+_OPTIONAL_RANGE = r"(\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?"
+
+_RANGE_ENTRY = {
+    "local_folder": "testvar",
+    "source_vars": ["testvar"],
+    "dataset_id_rep": "test-rep",
+    "source": "cmems",
+    "archive_raw": False,
+    "pattern": _OPTIONAL_RANGE,
+    "subset": True,
+    "filename_date_range": True,
+}
+
+
+class TestSingleDayFilename:
+    def _conv(self, tmp_path, **overrides):
+        return _make_converter(
+            tmp_path, var_key="testvar", entry={**_RANGE_ENTRY, **overrides}
+        )
+
+    def test_one_day_subset_filename_parses_as_that_day(self, tmp_path):
+        conv = self._conv(tmp_path)
+        f = Path("METOFFICE-GLO-SST_multi-vars_79.97W-9.98E_2026-07-31.nc")
+
+        assert conv._parse_file_dates(f) == [pd.Timestamp("2026-07-31")]
+
+    def test_range_filename_still_expands(self, tmp_path):
+        conv = self._conv(tmp_path)
+        f = Path("METOFFICE_multi-vars_2026-07-30-2026-07-31.nc")
+
+        assert conv._parse_file_dates(f) == [
+            pd.Timestamp("2026-07-30"),
+            pd.Timestamp("2026-07-31"),
+        ]
+
+    def test_one_day_bounds_are_the_same_day(self, tmp_path):
+        conv = self._conv(tmp_path)
+        f = Path("METOFFICE_multi-vars_2026-07-31.nc")
+
+        assert conv._get_file_date_bounds(f) == (
+            pd.Timestamp("2026-07-31"),
+            pd.Timestamp("2026-07-31"),
+        )
+
+    def test_range_bounds_use_both_dates(self, tmp_path):
+        conv = self._conv(tmp_path)
+        f = Path("METOFFICE_multi-vars_2026-07-30-2026-07-31.nc")
+
+        assert conv._get_file_date_bounds(f) == (
+            pd.Timestamp("2026-07-30"),
+            pd.Timestamp("2026-07-31"),
+        )
+
+    def test_a_one_day_file_produces_a_period(self, tmp_path):
+        """The whole point: a one-day repair download must be convertible."""
+        conv = self._conv(tmp_path)
+        (conv.download_root / "METOFFICE_2026-07-31.nc").write_bytes(b"")
+
+        assert list(conv._group_map(groupby=TimeResolution.YEAR)) == [2026]
+
+
+class TestUnparseableFilenamesAreNotSilent:
+    def _conv(self, tmp_path, pattern):
+        return _make_converter(
+            tmp_path,
+            var_key="testvar",
+            entry={**_RANGE_ENTRY, "pattern": pattern},
+        )
+
+    def test_run_raises_when_no_file_yields_a_date(self, tmp_path):
+        conv = self._conv(tmp_path, r"(\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})")
+        (conv.download_root / "METOFFICE_2026-07-31.nc").write_bytes(b"")
+
+        with pytest.raises(RuntimeError, match="none .*yielded a date"):
+            conv.run()
+
+    def test_the_error_names_the_pattern(self, tmp_path):
+        conv = self._conv(tmp_path, r"(\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})")
+        (conv.download_root / "METOFFICE_2026-07-31.nc").write_bytes(b"")
+
+        with pytest.raises(RuntimeError) as excinfo:
+            conv.run()
+
+        assert "pattern=" in str(excinfo.value)
+
+    def test_raw_files_survive_the_failure(self, tmp_path):
+        """They used to be deleted by _cleanup_downloads on the success path."""
+        conv = self._conv(tmp_path, r"(\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})")
+        raw = conv.download_root / "METOFFICE_2026-07-31.nc"
+        raw.write_bytes(b"")
+
+        with pytest.raises(RuntimeError):
+            conv.run()
+
+        assert raw.exists()
+
+    def test_a_window_matching_nothing_warns_instead_of_raising(self, tmp_path):
+        """Files parse fine; the requested window just has none of them."""
+        conv = self._conv(tmp_path, _OPTIONAL_RANGE)
+        (conv.download_root / "METOFFICE_2026-07-31.nc").write_bytes(b"")
+
+        assert conv.run("2020-01-01", "2020-01-31") is False

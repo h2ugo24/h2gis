@@ -10,7 +10,7 @@ variables:
     dataset_id_rep: METOFFICE-GLO-SST-L4-REP-OBS-SST
     dataset_id_nrt: METOFFICE-GLO-SST-L4-NRT-OBS-SST-V2
     source: cmems
-    pattern: (\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})
+    pattern: (\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?
     subset: true
     filename_date_range: true
     bbox: [-80, 0, 10, 70]
@@ -23,7 +23,7 @@ variables:
     dataset_id_rep: cmems_obs-sl_glo_phy-ssh_my_allsat-l4-duacs-0.125deg_P1D
     dataset_id_nrt: cmems_obs-sl_glo_phy-ssh_nrt_allsat-l4-duacs-0.125deg_P1D
     source: cmems
-    pattern: (\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})
+    pattern: (\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?
     subset: true
     filename_date_range: true
     bbox: [-180, -90, 180, 90]
@@ -35,7 +35,7 @@ variables:
     compiled_vars: [mld]
     dataset_id_rep: cmems_mod_glo_phy_my_0.083deg_P1D-m
     source: cmems
-    pattern: (\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})
+    pattern: (\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?
     subset: true
     filename_date_range: true
     bbox: [-80, 0, 10, 70]
@@ -47,7 +47,7 @@ variables:
     compiled_vars: [thetao_100, thetao_200, thetao_500, thetao_1000]
     dataset_id_rep: cmems_mod_glo_phy_my_0.083deg_P1D-m
     source: cmems
-    pattern: (\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})
+    pattern: (\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?
     subset: true
     filename_date_range: true
     bbox: [-80, 0, 10, 70]
@@ -61,7 +61,7 @@ variables:
     compiled_vars: [chl, chl_fdist]
     dataset_id_rep: cmems_obs-oc_glo_bgc-plankton_my_l4-gapfree-multi-4km_P1D
     source: cmems
-    pattern: (\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})
+    pattern: (\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?
     subset: true
     filename_date_range: true
     bbox: [-80, 0, 10, 70]
@@ -84,7 +84,7 @@ variables:
     compiled_vars: [o2_0, o2_100, o2_500, o2_1000]
     dataset_id_rep: cmems_mod_glo_bgc_my_0.25deg_P1D-m
     source: cmems
-    pattern: (\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})
+    pattern: (\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?
     subset: true
     filename_date_range: true
     bbox: [-80, 0, 10, 70]
@@ -146,7 +146,7 @@ variables:
     compiled_vars: [msl, u10, v10, tcc, wind_mean, wind_std, wind_max]
     dataset_id_rep: reanalysis-era5-single-levels
     source: cds
-    pattern: (\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})
+    pattern: (\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?
     filename_date_range: true
     bbox: [-80, 0, 10, 70]
 
@@ -165,7 +165,7 @@ variables:
       ]
     dataset_id_rep: reanalysis-era5-single-levels
     source: cds
-    pattern: (\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})
+    pattern: (\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?
     filename_date_range: true
     merge_time_step: true
     bbox: [-80, 0, 10, 70]
@@ -181,7 +181,7 @@ variables:
     compiled_vars: [slhf, ssrd, tisr]
     dataset_id_rep: reanalysis-era5-single-levels
     source: cds
-    pattern: (\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})
+    pattern: (\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?
     filename_date_range: true
     merge_time_step: true
     bbox: [-80, 0, 10, 70]
@@ -196,7 +196,7 @@ variables:
     compiled_vars: [swh, mdts]
     dataset_id_rep: reanalysis-era5-single-levels
     source: cds
-    pattern: (\d{4}-\d{2}-\d{2})-(\d{4}-\d{2}-\d{2})
+    pattern: (\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?
     filename_date_range: true
     bbox: [-80, 0, 10, 70]
 

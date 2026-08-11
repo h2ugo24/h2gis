@@ -209,6 +209,28 @@ class Netcdf2Zarr(BaseConverter):
 
         file_groups = self._group_map(groupby=self.time_resolution, window=window)
 
+        if not file_groups:
+            # Distinguish two ways of getting nothing. A window that matches no
+            # downloaded file is a legitimate no-op (already warned about in
+            # _group_map). Files that yield no date at all is a fault: every raw
+            # file failed the pattern. That used to be reported as "0 period(s)"
+            # success, after which _cleanup_downloads deleted the files — so a
+            # download that had worked was silently discarded, the store never
+            # changed, and the run exited 0.
+            if self._get_file_date_series().empty:
+                raise RuntimeError(
+                    f"[{self.var_key}] {len(self._get_downloaded_files())} "
+                    f"downloaded file(s) in {self.download_root}, but none "
+                    f"yielded a date via pattern={self.var_config.pattern!r}. "
+                    f"Raw files were left in place — check the pattern against "
+                    f"the filenames on disk."
+                )
+            logger.warning(
+                f"[{self.var_key}] Nothing to convert: no downloaded file falls "
+                f"within {window}. Raw files left in place."
+            )
+            return False
+
         for period, paths in file_groups.items():
             self._process_period(period, paths)
 
@@ -308,32 +330,50 @@ class Netcdf2Zarr(BaseConverter):
             )
         return sorted(files)
 
-    def _parse_file_dates(self, file: Path) -> list[pd.Timestamp]:
+    def _match_file_dates(self, file: Path) -> Optional[tuple[str, ...]]:
+        """
+        Date groups captured from a filename, with unmatched optional ones dropped.
+
+        A one-day subset is named with a single date — copernicusmarine writes
+        ``…_2026-07-31.nc`` rather than ``…_2026-07-31-2026-07-31.nc`` — so a
+        range pattern with an optional tail yields ``(date, None)``. Dropping
+        the ``None`` lets the caller treat it as the single day it is, which is
+        what makes a one-day repair download convertible at all.
+        """
         if self.var_config.pattern is None:
-            return []
+            return None
         match = re.search(self.var_config.pattern, file.name)
         if not match:
+            return None
+        groups = tuple(g for g in match.groups() if g)
+        return groups or None
+
+    def _parse_file_dates(self, file: Path) -> list[pd.Timestamp]:
+        groups = self._match_file_dates(file)
+        if groups is None:
             return []
 
         if self.var_config.filename_date_range:
-            start, end = map(pd.to_datetime, match.groups())
+            if len(groups) < 2:
+                return [pd.to_datetime(groups[0])]
+            start, end = map(pd.to_datetime, groups[:2])
             return list(pd.date_range(start, end, freq="D"))
 
-        return [pd.to_datetime("-".join(match.groups()))]
+        return [pd.to_datetime("-".join(groups))]
 
     def _get_file_date_bounds(
         self, file: Path
     ) -> tuple[pd.Timestamp, pd.Timestamp] | None:
         """Return (start, end) date for a raw file without expanding the full date range."""
-        if self.var_config.pattern is None:
+        groups = self._match_file_dates(file)
+        if groups is None:
             return None
-        match = re.search(self.var_config.pattern, file.name)
-        if not match:
-            return None
-        if self.var_config.filename_date_range:
-            start, end = map(pd.to_datetime, match.groups())
+        if self.var_config.filename_date_range and len(groups) >= 2:
+            start, end = map(pd.to_datetime, groups[:2])
             return start, end
-        date = pd.to_datetime("-".join(match.groups()))
+        date = pd.to_datetime(
+            groups[0] if self.var_config.filename_date_range else "-".join(groups)
+        )
         return date, date
 
     def _read_manifest(self) -> list[dict]:
