@@ -31,6 +31,35 @@ from h2mare.validators import validate_time_resolution, validate_var_key
 warnings.filterwarnings("ignore")
 
 
+def _dataset_dates(ds: xr.Dataset) -> pd.DatetimeIndex:
+    """Unique calendar days on a dataset's time axis, sorted. Empty if time-less."""
+    if "time" not in ds.coords:
+        return pd.DatetimeIndex([])
+    return pd.DatetimeIndex(ds.time.values).normalize().unique().sort_values()
+
+
+def _format_date_blocks(dates: pd.DatetimeIndex, max_blocks: int = 8) -> str:
+    """Render a date index as contiguous blocks: '2025-06-02, 2025-07-10→2025-07-14'."""
+    if len(dates) == 0:
+        return "none"
+    blocks: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    start = prev = dates[0]
+    for day in dates[1:]:
+        if (day - prev).days > 1:
+            blocks.append((start, prev))
+            start = day
+        prev = day
+    blocks.append((start, prev))
+
+    shown = [
+        str(a.date()) if a == b else f"{a.date()}→{b.date()}"
+        for a, b in blocks[:max_blocks]
+    ]
+    if len(blocks) > max_blocks:
+        shown.append(f"… and {len(blocks) - max_blocks} more block(s)")
+    return ", ".join(shown)
+
+
 def convert_netcdf_to_zarr(
     paths: Path | str | Iterable[Path | str],
     out_path: Path | str,
@@ -509,7 +538,15 @@ class Netcdf2Zarr(BaseConverter):
         try:
             ds = self.process_dataset(ds)
             path = self.catalog.build_file_path(ds, self.date_format)
+            # Read the axis before the write: write_append_zarr closes ds.
+            written = _dataset_dates(ds)
             write_append_zarr(self.var_key, ds, path)
+            # Deliberately before _archive_raw_files and _cleanup_period_files:
+            # a failure here must leave the raw files where they are, so the
+            # period can simply be re-converted once the gap is understood.
+            self._verify_written_dates(
+                path, written, self._expected_dates(period, paths), period
+            )
             try:
                 self._write_provenance(path, paths)
             except Exception as e:
@@ -525,6 +562,120 @@ class Netcdf2Zarr(BaseConverter):
             ) from e
         # finally:
         #    ds.close()
+
+    # ========= WRITE VERIFICATION =========
+
+    def _period_bounds(self, period: int | tuple[int, int]) -> DateRange:
+        """Calendar span of a group key produced by :meth:`_group_map`."""
+        if isinstance(period, tuple):
+            year, month = period
+            start = pd.Timestamp(year=year, month=month, day=1)
+            return DateRange(start=start, end=start + pd.offsets.MonthEnd(0))
+        start = pd.Timestamp(year=period, month=1, day=1)
+        return DateRange(start=start, end=pd.Timestamp(year=period, month=12, day=31))
+
+    def _expected_dates(
+        self, period: int | tuple[int, int], paths: list[Path]
+    ) -> pd.DatetimeIndex:
+        """
+        Daily calendar this period was *asked* to deliver, for the lag warning.
+
+        Taken from the download manifest rather than the files on disk, and the
+        distinction is the whole point: a file that failed to download is
+        absent from disk, so an expectation derived from disk moves to match
+        the loss and reports success. The manifest states what was requested,
+        and is written before conversion runs.
+
+        Falls back to the dates the raw filenames claim when no manifest exists
+        (a re-convert from archived files). That fallback cannot see a missing
+        file — which is why it only ever drives a warning, never the error.
+        """
+        bounds = self._period_bounds(period)
+        spans = [
+            (pd.to_datetime(e["start"]), pd.to_datetime(e["end"]))
+            for e in self._read_manifest()
+            if e.get("start") and e.get("end")
+        ]
+        if not spans:
+            dates = pd.DatetimeIndex(
+                sorted({d for p in paths for d in self._parse_file_dates(p)})
+            )
+            return dates[(dates >= bounds.start) & (dates <= bounds.end)]
+
+        start = max(min(s for s, _ in spans), bounds.start)
+        end = min(max(e for _, e in spans), bounds.end)
+        if start > end:
+            return pd.DatetimeIndex([])
+        return pd.date_range(start, end, freq="D")
+
+    def _stored_dates(self, path: Path) -> pd.DatetimeIndex:
+        """Time axis of the Zarr just written. Coordinate read only — no data."""
+        try:
+            with xr.open_zarr(path, consolidated=False) as stored:
+                return _dataset_dates(stored)
+        except Exception as e:
+            logger.warning(f"Could not read back the time axis of {path.name}: {e}")
+            return pd.DatetimeIndex([])
+
+    def _verify_written_dates(
+        self,
+        path: Path,
+        written: pd.DatetimeIndex,
+        expected: pd.DatetimeIndex,
+        period: int | tuple[int, int],
+    ) -> None:
+        """
+        Reconcile the dates now in the store against the dates asked for.
+
+        Raises when a day is missing from the *middle* of the span this
+        conversion just wrote: the provider published the days on either side,
+        both are in the store, and the one between them is not. There is no
+        benign reading of that, and it is the one shape of loss that nothing
+        downstream can recover — store coverage is a min/max watermark that an
+        interior hole cannot move, so the year goes on reporting itself full.
+
+        A shortfall at either end is only warned about, because provider lag
+        legitimately produces one every time the requested window runs to today.
+
+        Deliberately silent on days that are present but entirely null. That is
+        what a genuine source gap looks like (chl has three in 1999 alone), and
+        a check that fires on those every year is one people learn to ignore —
+        at which point it protects nothing.
+
+        Raises:
+            RuntimeError: If a day is missing from inside the written span.
+        """
+        if not self.var_config.expect_daily:
+            logger.debug(f"[{self.var_key}] expect_daily=False — skipping date check")
+            return
+        if len(written) < 2:
+            return
+
+        stored = self._stored_dates(path)
+        if len(stored) == 0:
+            return
+
+        span_start, span_end = written[0], written[-1]
+        missing = pd.date_range(span_start, span_end, freq="D").difference(stored)
+        if len(missing):
+            raise RuntimeError(
+                f"[{self.var_key}] period {period}: {len(missing)} day(s) missing "
+                f"from {path.name} inside the range just written "
+                f"({span_start.date()} → {span_end.date()}): "
+                f"{_format_date_blocks(missing)}. Raw files were left in place — "
+                f"re-run the download for those dates, then re-convert."
+            )
+
+        shortfall = expected[
+            (expected < span_start) | (expected > span_end)
+        ].difference(stored)
+        if len(shortfall):
+            logger.warning(
+                f"[{self.var_key}] period {period}: {len(shortfall)} requested day(s) "
+                f"not delivered outside the written span: "
+                f"{_format_date_blocks(shortfall)}. Ordinary provider lag at the "
+                f"tail; anything else is a gap `h2mare audit` will keep reporting."
+            )
 
     def _open_dataset(self, paths: list[Path]) -> xr.Dataset:
         """Open a group of files as a single dataset."""

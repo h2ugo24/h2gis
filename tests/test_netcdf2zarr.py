@@ -579,3 +579,213 @@ class TestStagingSafety:
             converter._process_eddies()
 
         mock_stage.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Write verification
+#
+# A day that never downloaded is absent from the raw files, so anything that
+# derives its expectations from disk moves to match the loss and reports
+# success. Store coverage is a min/max watermark an interior hole cannot move,
+# so the short year then goes on reporting itself full — AVISO_FSLE 1999 (128
+# of 365 days) and 2025-06-02 both survived every existing check that way.
+# ---------------------------------------------------------------------------
+
+# archive_raw=False on purpose: the archive branch moves the raw files, and on
+# Windows open_mfdataset still holds handles on them at that point, so the move
+# fails for reasons that have nothing to do with what these tests check. (That
+# lock is pre-existing — it reproduces on unmodified code.)
+_DAILY_ENTRY = {
+    "local_folder": "testvar",
+    "source_vars": ["testvar"],
+    "dataset_id_rep": "test-rep",
+    "source": "cmems",
+    "archive_raw": False,
+    "pattern": r"(\d{8})",
+    "subset": False,
+    "filename_date_range": False,
+}
+
+
+def _daily_ds(dates, null_days=()) -> xr.Dataset:
+    times = pd.DatetimeIndex(dates)
+    nulls = pd.DatetimeIndex(null_days)
+    rng = np.random.default_rng(0)
+    data = rng.uniform(10.0, 30.0, size=(len(times), 3, 3))
+    for i, t in enumerate(times):
+        if t in nulls:
+            data[i, :, :] = np.nan
+    return xr.Dataset(
+        {"testvar": (["time", "lat", "lon"], data)},
+        coords={
+            "time": times,
+            "lat": [30.0, 35.0, 40.0],
+            "lon": [-10.0, -5.0, 0.0],
+        },
+    )
+
+
+def _period_converter(tmp_path, **overrides) -> Netcdf2Zarr:
+    conv = _make_converter(
+        tmp_path, var_key="testvar", entry={**_DAILY_ENTRY, **overrides}
+    )
+    conv.catalog.build_file_path.return_value = conv.store_root / "testvar_2020.zarr"
+    return conv
+
+
+def _write_raw_days(conv: Netcdf2Zarr, dates, null_days=()) -> list[Path]:
+    """One raw file per day, named so the configured pattern matches."""
+    paths = []
+    for d in pd.DatetimeIndex(dates):
+        p = conv.download_root / f"testvar_{d.strftime('%Y%m%d')}.nc"
+        _daily_ds([d], null_days=null_days).to_netcdf(p)
+        paths.append(p)
+    return paths
+
+
+_JAN = pd.date_range("2020-01-01", "2020-01-10", freq="D")
+
+
+class TestVerifyWrittenDates:
+    def test_missing_interior_day_raises(self, tmp_path):
+        """The file for Jan 5 never arrived — exactly the FSLE 2025-06-02 shape."""
+        conv = _period_converter(tmp_path)
+        paths = _write_raw_days(conv, _JAN.drop(pd.Timestamp("2020-01-05")))
+
+        with pytest.raises(RuntimeError) as excinfo:
+            conv._process_period(2020, paths)
+
+        assert "2020-01-05" in str(excinfo.value.__cause__)
+
+    def test_raw_files_survive_the_failure(self, tmp_path):
+        """Archive/cleanup run after the check, so the period stays re-convertible."""
+        conv = _period_converter(tmp_path)
+        paths = _write_raw_days(conv, _JAN.drop(pd.Timestamp("2020-01-05")))
+
+        with pytest.raises(RuntimeError):
+            conv._process_period(2020, paths)
+
+        assert all(p.exists() for p in paths)
+
+    def test_complete_period_passes(self, tmp_path):
+        conv = _period_converter(tmp_path)
+        paths = _write_raw_days(conv, _JAN)
+
+        conv._process_period(2020, paths)  # must not raise
+
+        stored = xr.open_zarr(conv.catalog.build_file_path.return_value)
+        assert len(stored.time) == 10
+        stored.close()
+
+    def test_all_null_day_passes(self, tmp_path):
+        """A day present but entirely null is a source gap, not a defect.
+
+        chl has three in 1999 alone. A check that fires on those every year is
+        one people learn to ignore, at which point it protects nothing.
+        """
+        conv = _period_converter(tmp_path)
+        paths = _write_raw_days(conv, _JAN, null_days=[pd.Timestamp("2020-01-05")])
+
+        conv._process_period(2020, paths)  # must not raise
+
+    def test_expect_daily_false_skips_the_check(self, tmp_path):
+        conv = _period_converter(tmp_path, expect_daily=False)
+        paths = _write_raw_days(conv, _JAN.drop(pd.Timestamp("2020-01-05")))
+
+        conv._process_period(2020, paths)  # must not raise
+
+    def test_short_tail_warns_but_does_not_raise(self, tmp_path):
+        """Provider lag at the tail is ordinary and must not fail the run."""
+        conv = _period_converter(tmp_path)
+        paths = _write_raw_days(conv, _JAN)
+        (conv.download_root / "h2mare_manifest.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "dataset_id": "test-rep",
+                        "dataset_type": "rep",
+                        "start": "2020-01-01",
+                        "end": "2020-01-20",
+                    }
+                ]
+            )
+        )
+
+        with patch("h2mare.format_converters.netcdf2zarr.logger") as mock_logger:
+            conv._process_period(2020, paths)
+
+        warned = " ".join(str(c) for c in mock_logger.warning.call_args_list)
+        assert "2020-01-11" in warned
+
+    def test_single_day_period_is_not_flagged(self, tmp_path):
+        """One day has no interior, so there is nothing to be missing from it."""
+        conv = _period_converter(tmp_path)
+        paths = _write_raw_days(conv, [pd.Timestamp("2020-01-01")])
+
+        conv._process_period(2020, paths)  # must not raise
+
+
+class TestExpectedDates:
+    def test_manifest_window_wins_over_files_on_disk(self, tmp_path):
+        """The manifest states what was asked for; disk only shows what arrived."""
+        conv = _period_converter(tmp_path)
+        paths = _write_raw_days(conv, _JAN.drop(pd.Timestamp("2020-01-05")))
+        (conv.download_root / "h2mare_manifest.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "dataset_id": "test-rep",
+                        "dataset_type": "rep",
+                        "start": "2020-01-01",
+                        "end": "2020-01-10",
+                    }
+                ]
+            )
+        )
+
+        expected = conv._expected_dates(2020, paths)
+
+        assert pd.Timestamp("2020-01-05") in expected
+
+    def test_falls_back_to_filenames_without_a_manifest(self, tmp_path):
+        conv = _period_converter(tmp_path)
+        paths = _write_raw_days(conv, _JAN)
+
+        expected = conv._expected_dates(2020, paths)
+
+        assert len(expected) == 10
+
+    def test_manifest_is_clipped_to_the_period(self, tmp_path):
+        conv = _period_converter(tmp_path)
+        (conv.download_root / "h2mare_manifest.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "dataset_id": "test-rep",
+                        "dataset_type": "rep",
+                        "start": "2019-11-01",
+                        "end": "2020-03-31",
+                    }
+                ]
+            )
+        )
+
+        expected = conv._expected_dates(2020, [])
+
+        assert expected[0] == pd.Timestamp("2020-01-01")
+        assert expected[-1] == pd.Timestamp("2020-03-31")
+
+
+class TestPeriodBounds:
+    def test_year_period_spans_the_calendar_year(self, converter):
+        bounds = converter._period_bounds(2021)
+        assert bounds.start == pd.Timestamp("2021-01-01")
+        assert bounds.end == pd.Timestamp("2021-12-31")
+
+    def test_month_period_spans_the_month(self, converter):
+        bounds = converter._period_bounds((2021, 2))
+        assert bounds.start == pd.Timestamp("2021-02-01")
+        assert bounds.end == pd.Timestamp("2021-02-28")
+
+    def test_month_period_handles_leap_february(self, converter):
+        assert converter._period_bounds((2020, 2)).end == pd.Timestamp("2020-02-29")
