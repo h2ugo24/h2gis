@@ -70,6 +70,42 @@ def get_store_coverage(var_key: str) -> Optional[DateRange]:
         return None
 
 
+def get_store_missing_days(var_key: str) -> pd.DatetimeIndex:
+    """
+    Days absent from a store's time axis, inside each file's own span.
+
+    The density counterpart to :func:`get_store_coverage`, which returns a
+    ``DateRange`` and so cannot express a hole: a store holding 1999-01-01 and
+    1999-12-31 with 237 days missing between them reports the same coverage as
+    a complete one.
+
+    Reads coordinates only — no data — so this is cheap enough to call freely.
+    Note it sees days missing from the *axis*, not days present with null
+    values; the latter is a genuine source gap and is deliberately not reported
+    (see :mod:`h2mare.storage.audit`).
+
+    Returns:
+        The missing days, empty when the store is dense or unreadable.
+    """
+    from h2mare.storage.audit import audit_var_key
+
+    try:
+        result = audit_var_key(var_key)
+    except Exception as e:
+        logger.warning(f"Could not scan '{var_key}' for missing days: {e}")
+        return pd.DatetimeIndex([])
+
+    if not result.gaps:
+        return pd.DatetimeIndex([])
+    return (
+        pd.DatetimeIndex(
+            [day for gap in result.gaps for day in gap.missing],
+        )
+        .unique()
+        .sort_values()
+    )
+
+
 def resolve_date_range(
     var_key: str,
     start: Optional[DateLike] = None,

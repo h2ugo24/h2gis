@@ -2,6 +2,7 @@
 
 import json
 from typing import Sequence
+from unittest.mock import MagicMock
 
 import msgspec
 import numpy as np
@@ -12,7 +13,7 @@ from loguru import logger
 
 from h2mare.models import AppConfig
 from h2mare.storage.zarr_catalog import ZarrCatalog
-from h2mare.types import BBox
+from h2mare.types import BBox, DateRange
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -967,3 +968,88 @@ class TestOpenDatasetIntegration:
 
         with pytest.raises(FileNotFoundError, match="Catalog is empty"):
             catalog.open_dataset(start_date="2020-01-01", end_date="2020-01-03")
+
+
+# ---------------------------------------------------------------------------
+# get_nonnull_days
+#
+# The set-valued counterpart to get_vars_nonnull_end. That one answers "how far
+# has this variable got", which cannot see a null day *inside* an
+# otherwise-compiled span: the frontier moves past it and nothing asks again.
+# ---------------------------------------------------------------------------
+
+
+class TestGetNonnullDays:
+    def _store(self, tmp_path, null_days=(), name="v_2020.zarr"):
+        times = pd.date_range("2020-01-01", "2020-01-10", freq="D")
+        nulls = pd.DatetimeIndex(null_days)
+        data = np.random.default_rng(0).uniform(1, 2, size=(len(times), 2, 2))
+        for i, t in enumerate(times):
+            if t in nulls:
+                data[i, :, :] = np.nan
+        ds = xr.Dataset(
+            {"sst": (["time", "lat", "lon"], data)},
+            coords={"time": times, "lat": [30.0, 35.0], "lon": [-10.0, -5.0]},
+        )
+        root = tmp_path / "store"
+        root.mkdir(exist_ok=True)
+        ds.to_zarr(root / name)
+        return root
+
+    def _call(self, root, window, var_names, tmp_path):
+        from h2mare.storage.zarr_catalog import ZarrCatalog
+
+        cat = ZarrCatalog.__new__(ZarrCatalog)
+        cat._index = MagicMock()
+        df = pd.DataFrame(
+            [
+                {
+                    "path": str(p),
+                    "variables": ["sst"],
+                    "start_date": pd.Timestamp("2020-01-01"),
+                    "end_date": pd.Timestamp("2020-01-10"),
+                }
+                for p in sorted(root.glob("*.zarr"))
+            ]
+        )
+        type(cat._index).df = property(lambda self, _df=df: _df)
+        return ZarrCatalog.get_nonnull_days(cat, window, var_names)
+
+    def test_returns_the_days_with_data(self, tmp_path):
+        root = self._store(tmp_path)
+        window = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"))
+
+        out = self._call(root, window, ["sst"], tmp_path)
+
+        assert len(out["sst"]) == 10
+
+    def test_a_null_day_is_excluded(self, tmp_path):
+        root = self._store(tmp_path, null_days=[pd.Timestamp("2020-01-05")])
+        window = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"))
+
+        out = self._call(root, window, ["sst"], tmp_path)
+
+        assert pd.Timestamp("2020-01-05") not in out["sst"]
+        assert len(out["sst"]) == 9
+
+    def test_window_bounds_the_scan(self, tmp_path):
+        root = self._store(tmp_path)
+        window = DateRange(pd.Timestamp("2020-01-03"), pd.Timestamp("2020-01-05"))
+
+        out = self._call(root, window, ["sst"], tmp_path)
+
+        assert len(out["sst"]) == 3
+
+    def test_none_reduces_across_every_variable(self, tmp_path):
+        root = self._store(tmp_path)
+        window = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"))
+
+        out = self._call(root, window, None, tmp_path)
+
+        assert len(out["__any__"]) == 10
+
+    def test_a_variable_with_no_data_is_omitted(self, tmp_path):
+        root = self._store(tmp_path, null_days=pd.date_range("2020-01-01", periods=10))
+        window = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"))
+
+        assert self._call(root, window, ["sst"], tmp_path) == {}

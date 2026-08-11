@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal, Optional, Sequence, Union
 
+import numpy as np
 import pandas as pd
 import xarray as xr
 from loguru import logger
@@ -293,6 +294,100 @@ class ZarrCatalog:
                 ds.close()
 
         return result
+
+    def get_nonnull_days(
+        self,
+        window: DateRange,
+        var_names: Optional[Sequence[str]] = None,
+    ) -> dict[str, pd.DatetimeIndex]:
+        """
+        Dates within *window* where each variable holds non-null data.
+
+        The set-valued counterpart to :meth:`get_vars_nonnull_end`. That method
+        answers "how far has this variable got", which cannot see a null day
+        *inside* an otherwise-compiled span — the frontier moves past it and
+        nothing asks again. This answers "which days does it actually have".
+
+        Bounded by *window* on purpose: it reads values, so an unbounded call
+        would walk the whole store. Callers pass a lookback.
+
+        Args:
+            window: Date range to inspect.
+            var_names: Variables to look up. ``None`` reduces across every data
+                variable in each file and returns the result under the single
+                key ``"__any__"`` — "does this store hold anything at all on
+                this date", which is what distinguishes a fillable lag hole
+                from a gap the source itself has.
+
+        Returns:
+            Mapping of variable name to the dates it has data for. Variables
+            never found are omitted.
+        """
+        df = self.df
+        if df.empty or "path" not in df.columns:
+            return {}
+
+        rows = df.drop_duplicates(subset="path")
+        if {"start_date", "end_date"} <= set(rows.columns):
+            rows = rows[
+                (rows["end_date"] >= window.start) & (rows["start_date"] <= window.end)
+            ]
+
+        found: dict[str, list[pd.DatetimeIndex]] = {}
+        for _, row in rows.iterrows():
+            if var_names is not None:
+                file_vars = _variables_list(row.get("variables"))
+                if not [c for c in var_names if c in file_vars]:
+                    continue
+            try:
+                ds = xr.open_zarr(row["path"], consolidated=False)
+            except Exception as e:
+                logger.warning(f"Could not open {row['path']} for non-null scan: {e}")
+                continue
+            try:
+                if "time" not in ds.coords:
+                    continue
+                ds = ds.sel(time=slice(window.start, window.end))
+                times = pd.DatetimeIndex(ds["time"].values).normalize()
+                if len(times) == 0:
+                    continue
+
+                cols = (
+                    [c for c in var_names if c in ds.data_vars]
+                    if var_names is not None
+                    else list(ds.data_vars)
+                )
+                lazy = {
+                    str(c): ds[c]
+                    .notnull()
+                    .any(dim=[d for d in ds[c].dims if d != "time"])
+                    for c in cols
+                    if "time" in ds[c].dims
+                }
+                if not lazy:
+                    continue
+                mask_ds = xr.Dataset(lazy).compute()
+
+                if var_names is None:
+                    any_mask = np.zeros(len(times), dtype=bool)
+                    for c in lazy:
+                        any_mask |= np.asarray(mask_ds[c].values, dtype=bool)
+                    found.setdefault("__any__", []).append(times[any_mask])
+                else:
+                    for c in lazy:
+                        m = np.asarray(mask_ds[c].values, dtype=bool)
+                        if m.any():
+                            found.setdefault(c, []).append(times[m])
+            finally:
+                ds.close()
+
+        return {
+            name: pd.DatetimeIndex(np.concatenate([p.values for p in parts]))
+            .unique()
+            .sort_values()
+            for name, parts in found.items()
+            if parts
+        }
 
     def get_variables(self) -> set[str]:
         """Get all unique variables across all zarr files."""

@@ -38,6 +38,15 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 DX = 0.25
 DY = 0.25
 
+# How far back an incremental compile looks for a null day it could refill.
+# The check reads values, so it has to be bounded or every compile would walk
+# the whole store; 24 months covers damage from a run that failed recently,
+# which is the case worth automating. Older holes surface through
+# ``h2mare audit`` and are repaired with explicit dates, which bypass every
+# watermark. The Parquet layer runs the same idea at 400 days
+# (``zarr2parquet._BACKFILL_HOLE_LOOKBACK_DAYS``) over a cheaper store.
+_HOLE_LOOKBACK_DAYS = 730
+
 
 def calculate_moon_phase(
     lat: float, lon: float, dates: pd.DatetimeIndex
@@ -312,6 +321,62 @@ class Compiler:
         cov = self.catalog.get_var_time_coverage(rep)
         return cov.end if cov is not None else None
 
+    def _fillable_hole_start(
+        self, vkey: str, src_cov: DateRange
+    ) -> Optional[pd.Timestamp]:
+        """
+        Earliest day inside the lookback where the source has data and h2ds does not.
+
+        Two conditions, and both matter:
+
+        * **h2ds is null there.** The compiled column has no usable value for
+          that day, whether the row is missing or NaN-padded.
+        * **the source has data there.** A day the source is null for cannot be
+          filled by recompiling it, and treating it as a hole would re-merge the
+          same window on every run without ever converging. chl's legitimate
+          all-null days are precisely this case, and they must not trigger work.
+
+        Bounded by :data:`_HOLE_LOOKBACK_DAYS` because it reads values. Older
+        holes are reported by ``h2mare audit`` and repaired with explicit
+        ``--start-date``/``--end-date``, which force a full recompile of the
+        range regardless of what the watermarks say.
+
+        Returns:
+            The earliest fillable date, or ``None`` when there is nothing to
+            backfill (the overwhelmingly common case).
+        """
+        var_config = self.app_config.variables.get(vkey)
+        cols = (var_config.compiled_vars if var_config else None) or []
+        if not cols:
+            return None
+        rep = cols[0]
+
+        end = min(src_cov.end, pd.Timestamp.now().normalize())
+        floor = max(src_cov.start, end - pd.Timedelta(days=_HOLE_LOOKBACK_DAYS))
+        if floor > end:
+            return None
+        window = DateRange(start=floor, end=end)
+
+        try:
+            h2ds_have = self.catalog.get_nonnull_days(window, [rep]).get(
+                rep, pd.DatetimeIndex([])
+            )
+            null_days = pd.date_range(floor, end, freq="D").difference(h2ds_have)
+            if len(null_days) == 0:
+                return None
+
+            source_have = ZarrCatalog(vkey, auto_refresh=False).get_nonnull_days(window)
+            fillable = null_days.intersection(
+                source_have.get("__any__", pd.DatetimeIndex([]))
+            )
+        except Exception as e:
+            logger.warning(f"{vkey}: hole scan failed ({e}) — skipping backfill check.")
+            return None
+
+        if len(fillable) == 0:
+            return None
+        return pd.Timestamp(fillable.min())
+
     def _resolve_compile_range(
         self,
         start: Optional[pd.Timestamp],
@@ -358,6 +423,21 @@ class Compiler:
                 if h2ds_var_end is not None
                 else src_cov.start
             )
+
+            # The end alone cannot see a hole behind it. A variable compiled
+            # while its source lagged lands NaN-padded; once a later compile
+            # carries it, the non-null end jumps past the NaN stretch and an
+            # end-based window strands those days forever. sst 2026-07-31 is
+            # exactly this — h2ds has the day, the column is null, and the end
+            # sits at 2026-08-06.
+            hole = self._fillable_hole_start(vkey, src_cov)
+            if hole is not None and hole < var_start:
+                logger.info(
+                    f"{vkey}: backfilling from {hole.date()} — source has data "
+                    f"for days h2ds does not."
+                )
+                var_start = hole
+
             if var_start <= src_cov.end:
                 ranges.append(DateRange(start=var_start, end=src_cov.end))
                 compiling.append(f"{vkey} ({var_start.date()}→{src_cov.end.date()})")
