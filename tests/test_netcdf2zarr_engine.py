@@ -18,7 +18,7 @@ from h2mare.format_converters.netcdf2zarr import convert_netcdf_to_zarr
 
 
 def _make_ds(start: str = "2020-01-01", n_days: int = 5, seed: int = 0) -> xr.Dataset:
-    """Varied (non-constant) data so have_vars_unique_values does not fire."""
+    """Varied (non-constant) data, so no slice looks degenerate."""
     times = pd.date_range(start, periods=n_days, freq="D")
     rng = np.random.default_rng(seed)
     data = rng.uniform(10.0, 30.0, size=(n_days, 3, 3))

@@ -9,7 +9,6 @@ from h2mare.storage.xarray_helpers import (
     chunk_dataset,
     convert360_180,
     get_dataset_encoding,
-    have_vars_unique_values,
     rename_dims,
     snap_grid_coords,
     unified_time_chunk,
@@ -56,26 +55,6 @@ class TestUnifiedTimeChunk:
         )
         with pytest.raises(ValueError, match="time"):
             unified_time_chunk(ds)
-
-
-class TestHaveVarsUniqueValues:
-    def test_nonexistent_path_returns_false(self, tmp_path):
-        bad_path = tmp_path / "nonexistent.zarr"
-        assert have_vars_unique_values(bad_path) is False
-
-    def test_dataset_with_varied_values_returns_false(self):
-        ds = _make_ds(n_time=5)
-        assert have_vars_unique_values(ds) is False
-
-    def test_dataset_with_constant_last_slice_returns_true(self):
-        times = pd.date_range("2020-01-01", periods=3, freq="D")
-        data = np.random.rand(3, 4, 4).astype(np.float32)
-        data[-1, :, :] = 5.0  # last time step is constant
-        ds = xr.Dataset(
-            {"sst": (["time", "lat", "lon"], data)},
-            coords={"time": times, "lat": range(4), "lon": range(4)},
-        )
-        assert have_vars_unique_values(ds) is True
 
 
 class TestConvert360To180:

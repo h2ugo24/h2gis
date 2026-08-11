@@ -19,6 +19,7 @@ from loguru import logger
 from h2mare.config import AppConfig, get_settings
 from h2mare.format_converters.base import BaseConverter
 from h2mare.processing.registry import PROCESSORS
+from h2mare.storage.audit import format_date_blocks
 from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import chunk_dataset, rename_dims, snap_grid_coords
@@ -36,28 +37,6 @@ def _dataset_dates(ds: xr.Dataset) -> pd.DatetimeIndex:
     if "time" not in ds.coords:
         return pd.DatetimeIndex([])
     return pd.DatetimeIndex(ds.time.values).normalize().unique().sort_values()
-
-
-def _format_date_blocks(dates: pd.DatetimeIndex, max_blocks: int = 8) -> str:
-    """Render a date index as contiguous blocks: '2025-06-02, 2025-07-10→2025-07-14'."""
-    if len(dates) == 0:
-        return "none"
-    blocks: list[tuple[pd.Timestamp, pd.Timestamp]] = []
-    start = prev = dates[0]
-    for day in dates[1:]:
-        if (day - prev).days > 1:
-            blocks.append((start, prev))
-            start = day
-        prev = day
-    blocks.append((start, prev))
-
-    shown = [
-        str(a.date()) if a == b else f"{a.date()}→{b.date()}"
-        for a, b in blocks[:max_blocks]
-    ]
-    if len(blocks) > max_blocks:
-        shown.append(f"… and {len(blocks) - max_blocks} more block(s)")
-    return ", ".join(shown)
 
 
 def convert_netcdf_to_zarr(
@@ -662,7 +641,7 @@ class Netcdf2Zarr(BaseConverter):
                 f"[{self.var_key}] period {period}: {len(missing)} day(s) missing "
                 f"from {path.name} inside the range just written "
                 f"({span_start.date()} → {span_end.date()}): "
-                f"{_format_date_blocks(missing)}. Raw files were left in place — "
+                f"{format_date_blocks(missing)}. Raw files were left in place — "
                 f"re-run the download for those dates, then re-convert."
             )
 
@@ -673,7 +652,7 @@ class Netcdf2Zarr(BaseConverter):
             logger.warning(
                 f"[{self.var_key}] period {period}: {len(shortfall)} requested day(s) "
                 f"not delivered outside the written span: "
-                f"{_format_date_blocks(shortfall)}. Ordinary provider lag at the "
+                f"{format_date_blocks(shortfall)}. Ordinary provider lag at the "
                 f"tail; anything else is a gap `h2mare audit` will keep reporting."
             )
 

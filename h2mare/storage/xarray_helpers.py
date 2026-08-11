@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -234,46 +233,6 @@ def unified_time_chunk(
 
     chunk_len = max(1, min(chunk_len, da.sizes[time_dim]))
     return chunk_len
-
-
-def have_vars_unique_values(ds: Path | xr.Dataset) -> bool:
-    """
-    Return ``True`` if **any** variable in the given Zarr path or dataset has only one
-    unique value in its last time slice. Used to detect corrupt merge output.
-
-    Parameters
-    ----------
-    ds : pathlib.Path or xarray.Dataset
-        Either a path to a Zarr store or an already opened Dataset.
-    """
-    own_ds = False
-    if isinstance(ds, Path):
-        try:
-            ds = xr.open_zarr(ds)
-            own_ds = True
-        except Exception as e:
-            logger.error(f"Could not open Zarr store at {ds}: {e}")
-            return False
-
-    unique_found = False
-
-    try:
-        for var in ds.data_vars:
-            if "time" not in ds[var].dims:
-                continue
-            last_slice = ds[var].isel(time=-1)
-            uniq = np.unique(last_slice.values)
-            if len(uniq) == 1:
-                t = str(last_slice.time.values)[:10]
-                logger.warning(
-                    f"{var} has a single unique value ({uniq[0]:.4g}) at time={t} "
-                    f"in {ds.encoding.get('source', 'unknown')}"
-                )
-                unique_found = True
-    finally:
-        if own_ds:
-            ds.close()
-    return unique_found
 
 
 def convert360_180(_ds: xr.Dataset) -> xr.Dataset:
