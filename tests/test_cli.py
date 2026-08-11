@@ -584,3 +584,78 @@ class TestAuditReporting:
         )
 
         assert result.exit_code == 1
+
+
+class TestCatalogMissingStore:
+    """The warning belongs in the output, attributable to the variable.
+
+    resolve_store_path warns "will be created when data is added", which is
+    false for a read-only inspector and doubly so for `moon` — computed at
+    compile time, it never gets a store at all.
+    """
+
+    def test_catalog_does_not_warn_about_a_missing_store(self, tmp_path):
+        from h2mare.storage.zarr_catalog import ZarrCatalog
+
+        with (
+            patch(
+                "h2mare.cli.catalog.get_settings", return_value=_mock_settings(tmp_path)
+            ),
+            patch.object(ZarrCatalog, "__init__", return_value=None) as mock_init,
+            patch.object(
+                ZarrCatalog,
+                "df",
+                new_callable=lambda: property(lambda s: pd.DataFrame()),
+            ),
+            patch.object(ZarrCatalog, "summary", return_value={"num_files": 0}),
+        ):
+            _runner.invoke(catalog_app, ["sst"])
+
+        assert mock_init.call_args.kwargs.get("warn_if_missing") is False
+
+    def test_missing_store_is_annotated_in_the_output(self, tmp_path):
+        from h2mare.storage.zarr_catalog import ZarrCatalog
+
+        gone = tmp_path / "definitely_not_here"
+        with (
+            patch(
+                "h2mare.cli.catalog.get_settings", return_value=_mock_settings(tmp_path)
+            ),
+            patch.object(ZarrCatalog, "__init__", return_value=None),
+            patch.object(
+                ZarrCatalog,
+                "df",
+                new_callable=lambda: property(lambda s: pd.DataFrame()),
+            ),
+            patch.object(
+                ZarrCatalog,
+                "summary",
+                return_value={"num_files": 0, "store_root": str(gone)},
+            ),
+        ):
+            result = _runner.invoke(catalog_app, ["sst"])
+
+        assert "(does not exist)" in result.output
+
+    def test_an_existing_store_is_not_annotated(self, tmp_path):
+        from h2mare.storage.zarr_catalog import ZarrCatalog
+
+        with (
+            patch(
+                "h2mare.cli.catalog.get_settings", return_value=_mock_settings(tmp_path)
+            ),
+            patch.object(ZarrCatalog, "__init__", return_value=None),
+            patch.object(
+                ZarrCatalog,
+                "df",
+                new_callable=lambda: property(lambda s: pd.DataFrame()),
+            ),
+            patch.object(
+                ZarrCatalog,
+                "summary",
+                return_value={"num_files": 0, "store_root": str(tmp_path)},
+            ),
+        ):
+            result = _runner.invoke(catalog_app, ["sst"])
+
+        assert "(does not exist)" not in result.output
