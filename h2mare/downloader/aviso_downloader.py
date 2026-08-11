@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import warnings
@@ -19,6 +20,45 @@ from h2mare.storage.coverage import resolve_date_range
 from h2mare.types import DateLike, DateRange, FTPDownloadTask
 
 warnings.filterwarnings("ignore")
+
+
+def _download_to_part(
+    local_path: Path, ftp: FTP, remote_path: str, file_size: Optional[int]
+) -> None:
+    """
+    Retrieve *remote_path* into *local_path*, via a sidecar renamed on success.
+
+    Writing straight to ``local_path`` would leave a truncated ``*.nc`` behind
+    when a connection drops mid-``RETR``. The convert step globs ``*.nc`` and
+    has no way to tell a partial file from a complete one, so the damage
+    surfaces much later as missing or corrupt days inside a year that every
+    coverage check reports as healthy.
+    """
+    part_path = local_path.with_name(local_path.name + ".part")
+    try:
+        with open(part_path, "wb") as f:
+            if file_size:
+                # disable=None: tqdm auto-disables on non-tty, so scheduled
+                # runs don't persist one log line per refresh tick.
+                with tqdm(
+                    total=file_size,
+                    unit="B",
+                    unit_scale=True,
+                    desc=remote_path.split("/")[-1],
+                    disable=None,
+                ) as pbar:
+
+                    def callback(data):
+                        f.write(data)
+                        pbar.update(len(data))
+
+                    ftp.retrbinary(f"RETR {remote_path}", callback)
+            else:
+                ftp.retrbinary(f"RETR {remote_path}", f.write)
+        os.replace(part_path, local_path)
+    except BaseException:
+        part_path.unlink(missing_ok=True)
+        raise
 
 
 class AVISODownloader(BaseDownloader):
@@ -278,8 +318,12 @@ class AVISODownloader(BaseDownloader):
         scanner falls back to ``dataset_id_rep``, labelling near-real-time data
         as delayed-time.
 
-        Ranges come from the filenames actually downloaded rather than from the
-        requested range, so the manifest describes what is on disk.
+        Ranges come from the filenames of the *planned* tasks rather than from
+        the caller's requested range, so an incremental run records only the
+        gap it set out to fill instead of claiming the whole history. Note this
+        is the planned set, not the delivered one — a task whose download failed
+        still widens the span, which is what lets the convert step notice that
+        a date the manifest covers never made it into the store.
         """
         records = []
         for source, dataset_id in (
@@ -333,25 +377,7 @@ class AVISODownloader(BaseDownloader):
                 logger.warning(f"Error getting file size for {path}: {e}")
                 file_size = None
 
-            with open(local_path, "wb") as f:
-                if file_size:
-                    # disable=None: tqdm auto-disables on non-tty, so scheduled
-                    # runs don't persist one log line per refresh tick.
-                    with tqdm(
-                        total=file_size,
-                        unit="B",
-                        unit_scale=True,
-                        desc=path.split("/")[-1],
-                        disable=None,
-                    ) as pbar:
-
-                        def callback(data):
-                            f.write(data)
-                            pbar.update(len(data))
-
-                        self.ftp.retrbinary(f"RETR {path}", callback)
-                else:
-                    self.ftp.retrbinary(f"RETR {path}", f.write)
+            _download_to_part(local_path, self.ftp, path, file_size)
 
         self._retry_call(_attempt, max_attempts=3, wait_min=10, wait_max=60)
         logger.success(f"Downloaded {path.split('/')[-1]} to {local_path}")
@@ -362,8 +388,19 @@ class AVISODownloader(BaseDownloader):
         dataset_id: str,
         output_dir: Optional[Path] = None,
         max_workers: int = 2,
-    ):
-        """Download multiple FSLE files in parallel using multiple FTP connections."""
+    ) -> list[str]:
+        """
+        Download multiple FSLE files in parallel using multiple FTP connections.
+
+        Returns:
+            The remote paths that could not be downloaded after all retries.
+
+        Callers must treat a non-empty result as a failed download. A file that
+        never arrives leaves no trace anywhere downstream: store coverage is a
+        min/max watermark that a one-day hole cannot move, and the convert step
+        derives its expectations from the files that *did* arrive, so it writes
+        a short year and reports success.
+        """
         output_dir = output_dir or self.download_dir
 
         def download_single(
@@ -382,23 +419,7 @@ class AVISODownloader(BaseDownloader):
                         logger.warning(f"Error getting file size for {path}: {e}")
                         file_size = None
 
-                    with open(local_path, "wb") as f:
-                        if file_size:
-                            with tqdm(
-                                total=file_size,
-                                unit="B",
-                                unit_scale=True,
-                                desc=path.split("/")[-1],
-                                disable=None,
-                            ) as pbar:
-
-                                def callback(data):
-                                    f.write(data)
-                                    pbar.update(len(data))
-
-                                ftp.retrbinary(f"RETR {path}", callback)
-                        else:
-                            ftp.retrbinary(f"RETR {path}", f.write)
+                    _download_to_part(local_path, ftp, path, file_size)
                 finally:
                     try:
                         ftp.quit()
@@ -408,13 +429,17 @@ class AVISODownloader(BaseDownloader):
             self._retry_call(_attempt, max_attempts=3, wait_min=10, wait_max=60)
             return path
 
+        failed: list[str] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(download_single, path): path for path in paths}
             for future in as_completed(futures):
+                path = futures[future]
                 try:
                     future.result()
                 except Exception as e:
-                    logger.error(f"❌ Failed to download {futures[future]}: {e}")
+                    logger.error(f"❌ Failed to download {path}: {e}")
+                    failed.append(path)
+        return failed
 
     def run(
         self,
@@ -483,12 +508,13 @@ class AVISODownloader(BaseDownloader):
         if nrt_paths:
             nrt_dir.mkdir(parents=True, exist_ok=True)
 
+        failed: list[str] = []
         if parallel:
             if rep_paths:
                 logger.info(
                     f"Starting parallel download of {len(rep_paths)} REP files..."
                 )
-                self.download_parallel(
+                failed += self.download_parallel(
                     rep_paths,
                     dataset_id=self.var_config.dataset_id_rep,
                     output_dir=rep_dir,
@@ -498,7 +524,7 @@ class AVISODownloader(BaseDownloader):
                 logger.info(
                     f"Starting parallel download of {len(nrt_paths)} NRT files..."
                 )
-                self.download_parallel(
+                failed += self.download_parallel(
                     nrt_paths,
                     dataset_id=self.var_config.dataset_id_nrt,
                     output_dir=nrt_dir,
@@ -514,14 +540,34 @@ class AVISODownloader(BaseDownloader):
                 )
                 if dataset_id:
                     self.adjust_ftp_path_to_dataset(dataset_id)
-                self.download_file(task.filepath, dest)
+                try:
+                    self.download_file(task.filepath, dest)
+                except Exception as e:
+                    logger.error(f"❌ Failed to download {task.filepath}: {e}")
+                    failed.append(task.filepath)
 
         # Disconnect FTP
         # self.ftp.quit()
+        # Written even on failure, and deliberately: the manifest records the
+        # range that was *requested*, which is the only surviving statement of
+        # what the store should contain once the raw files are archived or
+        # deleted. Reconciling it against what was delivered is what turns a
+        # partial download into a detectable defect rather than a short year.
         self._write_manifest(tasks, base_dir)
+        self._cleanup_empty_download_dir()
+
+        requested = len(rep_paths) + len(nrt_paths)
+        if failed:
+            raise RuntimeError(
+                f"[{self.var_key}] Download incomplete: {len(failed)} of {requested} "
+                f"file(s) failed after retries — {', '.join(sorted(failed)[:10])}"
+                f"{' …' if len(failed) > 10 else ''}. Re-run to fetch the missing "
+                f"dates; converting now would write a store with silent gaps."
+            )
+
         logger.success(
-            f"Download complete: {len(rep_paths)} REP + {len(nrt_paths)} NRT file(s) "
+            f"Download complete: {requested}/{requested} file(s) "
+            f"({len(rep_paths)} REP + {len(nrt_paths)} NRT) "
             f"in {time.perf_counter() - t0:.1f}s"
         )
-        self._cleanup_empty_download_dir()
         return True
