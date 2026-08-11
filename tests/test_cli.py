@@ -362,6 +362,7 @@ class TestAuditCLI:
                 ok=True,
                 n_known_gaps=0,
                 known_gaps=pd.DatetimeIndex([]),
+                store_exists=True,
             )
             result = _runner.invoke(audit_app, ["sst"])
         assert result.exit_code == 0
@@ -389,6 +390,7 @@ class TestAuditCLI:
                 ok=False,
                 n_known_gaps=0,
                 known_gaps=pd.DatetimeIndex([]),
+                store_exists=True,
             )
             result = _runner.invoke(audit_app, ["sst"])
         assert result.exit_code == 1
@@ -414,6 +416,7 @@ class TestAuditKnownGapsDisplay:
             ok=ok,
             known_gaps=idx,
             n_known_gaps=len(idx),
+            store_exists=True,
         )
 
     def _run(self, tmp_path, result, args):
@@ -472,3 +475,112 @@ class TestAuditKnownGapsDisplay:
         ).output
 
         assert "2025-06-02 → 2025-06-04" in out
+
+
+class TestAuditReporting:
+    """Advice and labels have to match the check that produced the findings."""
+
+    def _result(self, *, gaps=(), slices=(), store_exists=True):
+        return SimpleNamespace(
+            var_key="chl",
+            n_files=29,
+            gaps=list(gaps),
+            slices=list(slices),
+            errors=[],
+            ok=not (gaps or slices),
+            known_gaps=pd.DatetimeIndex([]),
+            n_known_gaps=0,
+            store_exists=store_exists,
+        )
+
+    def _gap(self):
+        return SimpleNamespace(
+            path=Path("a_2025.zarr"),
+            span=(pd.Timestamp("2025-01-01"), pd.Timestamp("2025-12-31")),
+            missing=pd.DatetimeIndex([pd.Timestamp("2025-06-02")]),
+        )
+
+    def _slice(self, variable="chl", date="1999-01-25"):
+        return SimpleNamespace(
+            path=Path("chl_1999.zarr"),
+            variable=variable,
+            date=pd.Timestamp(date),
+            kind="empty",
+            detail="no finite values",
+        )
+
+    def _run(self, tmp_path, result, args):
+        with (
+            patch(
+                "h2mare.cli.audit.get_settings", return_value=_mock_settings(tmp_path)
+            ),
+            patch("h2mare.storage.audit.audit_var_key", return_value=result),
+        ):
+            return _runner.invoke(audit_app, args)
+
+    def test_value_findings_do_not_advise_re_downloading(self, tmp_path):
+        """Re-running cannot fill a day the provider never published."""
+        out = self._run(
+            tmp_path, self._result(slices=[self._slice()]), ["sst", "--values"]
+        ).output
+
+        assert "re-run the download" not in out.lower()
+        assert "known_gaps" in out
+
+    def test_axis_findings_do_advise_re_downloading(self, tmp_path):
+        out = self._run(tmp_path, self._result(gaps=[self._gap()]), ["sst"]).output
+
+        assert "re-run the" in out.lower()
+
+    def test_both_kinds_get_their_own_advice(self, tmp_path):
+        out = self._run(
+            tmp_path,
+            self._result(gaps=[self._gap()], slices=[self._slice()]),
+            ["sst", "--values"],
+        ).output
+
+        assert "re-run the" in out.lower()
+        assert "known_gaps" in out
+
+    def test_header_names_the_value_check(self, tmp_path):
+        out = self._run(
+            tmp_path, self._result(), ["sst", "--values", "--show-ok"]
+        ).output
+
+        assert "axis + value check" in out
+
+    def test_header_says_axis_only_by_default(self, tmp_path):
+        out = self._run(tmp_path, self._result(), ["sst", "--show-ok"]).output
+
+        assert "— axis check" in out
+
+    def test_a_day_is_reported_once_across_variables(self, tmp_path):
+        """chl reported 22 findings for 11 days, one per column."""
+        out = self._run(
+            tmp_path,
+            self._result(slices=[self._slice("chl"), self._slice("chl_fdist")]),
+            ["sst", "--values"],
+        ).output
+
+        assert out.count("1999-01-25") == 1
+        assert "chl, chl_fdist" in out
+
+    def test_a_missing_store_is_skipped_not_passed(self, tmp_path):
+        out = self._run(
+            tmp_path, self._result(store_exists=False), ["sst", "--show-ok"]
+        ).output
+
+        assert "[SKIP]" in out
+        assert "[OK]" not in out
+
+    def test_since_without_values_is_flagged(self, tmp_path):
+        result = self._run(tmp_path, self._result(), ["sst", "--since", "2025-01-01"])
+
+        assert "only bounds --values" in result.output
+
+    def test_unparseable_since_exits_1(self, tmp_path):
+        result = self._run(
+            tmp_path, self._result(), ["sst", "--values", "--since", "nonsense"]
+        )
+
+        assert result.exit_code == 1

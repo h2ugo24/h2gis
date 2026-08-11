@@ -6,6 +6,8 @@ switched off within a season, at which point it protects nothing — so the
 false-positive cases below matter as much as the true-positive ones.
 """
 
+from unittest.mock import patch
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -441,3 +443,172 @@ class TestVarAuditKnownGaps:
         )
 
         assert v.ok is True
+
+
+# ---------------------------------------------------------------------------
+# Value-scan correctness
+#
+# Running --values on chl surfaced four defects at once: known_gaps suppressed
+# axis gaps but not value findings, so 11 unfixable days reported forever; the
+# reductions were computed one at a time, which on a 97 GB store is three real
+# re-reads from disk; and the report gave advice ("re-run the download") that
+# cannot fix a day the provider never published.
+# ---------------------------------------------------------------------------
+
+
+class TestKnownGapsSuppressValueFindings:
+    def test_a_known_gap_is_not_reported_as_empty(self, tmp_path):
+        path = _write(
+            _ds(_JAN, null_days=[pd.Timestamp("2020-01-05")]), tmp_path / "a.zarr"
+        )
+
+        _, slices, error = audit_zarr_file(
+            path,
+            check_values=True,
+            known_gaps=pd.DatetimeIndex([pd.Timestamp("2020-01-05")]),
+        )
+
+        # error must be None too: an exception here would empty `slices` and
+        # make this pass for entirely the wrong reason.
+        assert (slices, error) == ([], None)
+
+    def test_an_unlisted_empty_day_is_still_reported(self, tmp_path):
+        path = _write(
+            _ds(_JAN, null_days=[pd.Timestamp("2020-01-05")]), tmp_path / "a.zarr"
+        )
+
+        _, slices, _ = audit_zarr_file(
+            path,
+            check_values=True,
+            known_gaps=pd.DatetimeIndex([pd.Timestamp("2020-01-08")]),
+        )
+
+        assert [s.date for s in slices] == [pd.Timestamp("2020-01-05")]
+
+    def test_a_degenerate_day_can_also_be_suppressed(self, tmp_path):
+        path = _write(
+            _ds(_JAN, constant_days=[pd.Timestamp("2020-01-05")]), tmp_path / "a.zarr"
+        )
+
+        _, slices, _ = audit_zarr_file(
+            path,
+            check_values=True,
+            known_gaps=pd.DatetimeIndex([pd.Timestamp("2020-01-05")]),
+        )
+
+        assert slices == []
+
+
+class TestValueWindow:
+    def test_window_bounds_the_scan(self, tmp_path):
+        from h2mare.types import DateRange
+
+        path = _write(
+            _ds(_JAN, null_days=[pd.Timestamp("2020-01-02")]), tmp_path / "a.zarr"
+        )
+
+        _, slices, _ = audit_zarr_file(
+            path,
+            check_values=True,
+            value_window=DateRange(
+                start=pd.Timestamp("2020-01-05"), end=pd.Timestamp("2020-01-10")
+            ),
+        )
+
+        assert slices == []
+
+    def test_a_file_wholly_outside_the_window_is_skipped(self, tmp_path):
+        """min/max over a zero-length axis raises rather than returning empty."""
+        from h2mare.types import DateRange
+
+        path = _write(_ds(_JAN), tmp_path / "a.zarr")
+
+        gap, slices, error = audit_zarr_file(
+            path,
+            check_values=True,
+            value_window=DateRange(
+                start=pd.Timestamp("2030-01-01"), end=pd.Timestamp("2030-12-31")
+            ),
+        )
+
+        assert (slices, error) == ([], None)
+
+    def test_a_finding_inside_the_window_is_kept(self, tmp_path):
+        from h2mare.types import DateRange
+
+        path = _write(
+            _ds(_JAN, null_days=[pd.Timestamp("2020-01-07")]), tmp_path / "a.zarr"
+        )
+
+        _, slices, _ = audit_zarr_file(
+            path,
+            check_values=True,
+            value_window=DateRange(
+                start=pd.Timestamp("2020-01-05"), end=pd.Timestamp("2020-01-10")
+            ),
+        )
+
+        assert [s.date for s in slices] == [pd.Timestamp("2020-01-07")]
+
+
+class TestSliceHealthIsOnePass:
+    """n_finite/min/max used to be computed one at a time.
+
+    On a store far too large for page cache — chl alone is 97 GB — each
+    separate materialisation is a real re-read from disk, so that was three
+    times the I/O the check actually needs.
+    """
+
+    def _count_computes(self, ds) -> int:
+        real = xr.Dataset.compute
+        calls = []
+
+        def counting(self, *args, **kwargs):
+            calls.append(1)
+            return real(self, *args, **kwargs)
+
+        with patch.object(xr.Dataset, "compute", counting):
+            check_slice_health(ds)
+        return len(calls)
+
+    def test_reductions_are_fused_into_one_compute(self):
+        ds = _ds(_JAN, null_days=[pd.Timestamp("2020-01-05")]).chunk({"time": 2})
+
+        assert self._count_computes(ds) == 1
+
+    def test_multiple_variables_still_one_compute(self):
+        ds = _ds(_JAN).chunk({"time": 2})
+        ds["testvar2"] = ds["testvar"] * 2
+
+        assert self._count_computes(ds) == 1
+
+
+class TestStoreExists:
+    def test_missing_store_is_flagged(self, tmp_path):
+        from h2mare.storage.audit import VarAudit
+
+        v = VarAudit(
+            var_key="moon",
+            store_root=tmp_path / "nope",
+            n_files=0,
+            gaps=[],
+            slices=[],
+            errors=[],
+            store_exists=False,
+        )
+
+        assert v.store_exists is False
+
+    def test_present_store_is_the_default(self, tmp_path):
+        from h2mare.storage.audit import VarAudit
+
+        v = VarAudit(
+            var_key="sst",
+            store_root=tmp_path,
+            n_files=1,
+            gaps=[],
+            slices=[],
+            errors=[],
+        )
+
+        assert v.store_exists is True

@@ -34,9 +34,11 @@ Examples
 
 from typing import Optional
 
+import pandas as pd
 import typer
 
 from h2mare.config import get_settings
+from h2mare.types import DateRange
 
 app = typer.Typer()
 
@@ -55,6 +57,14 @@ def _print_var_audit(audit, show_all: bool, show_known: bool = False) -> None:
             typer.echo("           known source gaps (never published upstream):")
             for block in _blocks(audit.known_gaps):
                 typer.echo(f"             {block}")
+
+    if not audit.store_exists:
+        # Not a pass: nothing was checked. `moon` is computed at compile time
+        # and has no store, but a missing store is also what a misconfigured
+        # STORE_ROOT or an unmounted drive looks like, and "[OK] 0 file(s)"
+        # would report both as healthy.
+        typer.echo(f"  [SKIP] {audit.var_key:<16} no store directory on disk")
+        return
 
     if audit.ok:
         # A variable with suppressed days prints under --known even without
@@ -75,11 +85,19 @@ def _print_var_audit(audit, show_all: bool, show_known: bool = False) -> None:
         for block in _blocks(gap.missing):
             typer.echo(f"        {block}")
 
+    # One line per day rather than per (variable, day). All of a var_key's
+    # columns share dates by config convention, so listing each separately just
+    # doubles the output — chl reported 22 findings for 11 days.
+    by_day: dict[tuple, list[str]] = {}
     for issue in audit.slices:
-        typer.echo(
-            f"    {issue.path.name}  {issue.variable} @ {issue.date.date()}"
-            f"  [{issue.kind}] {issue.detail}"
-        )
+        key = (issue.path.name, issue.date, issue.kind, issue.detail)
+        by_day.setdefault(key, []).append(issue.variable)
+
+    for (fname, date, kind, detail), variables in sorted(
+        by_day.items(), key=lambda kv: (kv[0][0], kv[0][1])
+    ):
+        cols = ", ".join(sorted(variables))
+        typer.echo(f"    {fname}  {date.date()}  [{kind}] {detail}  ({cols})")
 
     for error in audit.errors:
         typer.echo(f"    ! {error}")
@@ -131,6 +149,13 @@ def audit(
         help="List the days excluded via each variable's known_gaps config "
         "entry, rather than only counting them.",
     ),
+    since: Optional[str] = typer.Option(
+        None,
+        "--since",
+        help="Bound --values to dates on or after this (YYYY-MM-DD). The value "
+        "scan is disk-bound over the whole store — chl alone is 97 GB — so "
+        "auditing more than one variable without this is an hours-long job.",
+    ),
 ) -> None:
     """Report days missing from the middle of a store's own time span."""
     from h2mare.storage.audit import audit_parquet_nulls, audit_var_key
@@ -156,15 +181,38 @@ def audit(
             raise typer.Exit(code=1)
         keys = [var_key]
 
+    value_window = None
+    if since:
+        try:
+            value_window = DateRange(
+                start=pd.Timestamp(since), end=pd.Timestamp.now().normalize()
+            )
+        except Exception:
+            typer.echo(f"Could not parse --since {since!r} as a date.", err=True)
+            raise typer.Exit(code=1) from None
+        if not check_values:
+            typer.echo("--since only bounds --values; ignoring it.", err=True)
+
+    n_gaps = n_slices = 0
+
     if keys:
-        typer.echo(f"\nAuditing {len(keys)} variable(s) — axis check")
+        checks = "axis + value check" if check_values else "axis check"
+        bound = f", values since {value_window.start.date()}" if value_window else ""
+        typer.echo(f"\nAuditing {len(keys)} variable(s) — {checks}{bound}")
         for key in keys:
             try:
-                result = audit_var_key(key, check_values=check_values)
+                result = audit_var_key(
+                    key,
+                    check_values=check_values,
+                    value_window=value_window,
+                    progress=check_values,
+                )
             except Exception as e:
                 typer.echo(f"  [SKIP] {key:<16} {e}")
                 continue
             _print_var_audit(result, show_ok, show_known)
+            n_gaps += len(result.gaps)
+            n_slices += len(result.slices)
             findings += len(result.gaps) + len(result.slices) + len(result.errors)
 
     if check_parquet:
@@ -178,10 +226,23 @@ def audit(
             typer.echo("  [OK]   no wholly-null columns")
 
     if findings:
-        typer.echo(
-            f"\n{findings} finding(s). Interior gaps are pipeline defects, not "
-            "source gaps — re-run the download and convert for those dates."
-        )
+        # Advice per finding type. The two need opposite responses, and a
+        # single hardcoded line told anyone looking at a value finding to
+        # "re-run the download" — which cannot fix a day the provider never
+        # published, and reads as confident while being exactly wrong.
+        typer.echo(f"\n{findings} finding(s).")
+        if n_gaps:
+            typer.echo(
+                "  Days absent from the axis are pipeline defects: re-run the "
+                "download and convert for those dates."
+            )
+        if n_slices:
+            typer.echo(
+                "  Days present but empty are usually source gaps, and "
+                "re-running will not fill them. Confirm against the provider; "
+                "if the data was never published, record it in the variable's "
+                "known_gaps so this stops being reported."
+            )
         raise typer.Exit(code=1)
 
     typer.echo("\nNo gaps found.")

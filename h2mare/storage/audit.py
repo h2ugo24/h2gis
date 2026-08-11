@@ -29,7 +29,10 @@ narrow:
 
 ``check_slice_health`` is the value-based check, for the cases where a store is
 present and complete but degenerate. It is the second line of defence and is
-run only on request (``--values``), because it is the expensive one.
+run only on request (``--values``), because it is the expensive one: it reads
+every cell, and the stores are far past what page cache holds — chl alone is
+97 GB across 29 files. Callers auditing more than one variable should bound it
+with a window.
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ import xarray as xr
 from loguru import logger
 
 from h2mare.config import AppConfig, get_settings
+from h2mare.types import DateRange
 from h2mare.utils.paths import resolve_store_path
 from h2mare.validators import validate_var_key
 
@@ -79,6 +83,11 @@ class VarAudit(NamedTuple):
     # were suppressed — a suppression list nothing can print is one that grows
     # unnoticed into a way to bury real defects.
     known_gaps: pd.DatetimeIndex = pd.DatetimeIndex([])
+    # False when the variable has no store directory at all — `moon` is
+    # computed at compile time and never gets one. Distinguishing this from an
+    # empty-but-present store keeps "nothing was checked" from rendering as a
+    # pass.
+    store_exists: bool = True
 
     @property
     def n_known_gaps(self) -> int:
@@ -179,7 +188,7 @@ def interior_gaps(dates: pd.DatetimeIndex) -> pd.DatetimeIndex:
 
 
 def check_slice_health(
-    ds: xr.Dataset, *, sample: Optional[int] = None
+    ds: xr.Dataset, *, window: Optional[DateRange] = None
 ) -> list[tuple[str, pd.Timestamp, str, str]]:
     """
     Per-(variable, time) reduction returning every empty or degenerate slice.
@@ -192,44 +201,69 @@ def check_slice_health(
     conflated "all missing" with "constant" because NaN collapses to a single
     unique value.
 
-    Here one lazy pass yields ``(n_finite, min, max)`` per slice, from which
-    both signals fall out separately:
+    One lazy pass yields ``(n_finite, min, max)`` per slice, from which both
+    signals fall out separately:
 
     * ``n_finite == 0``            → ``"empty"``      (no usable data at all)
     * ``min == max``, n_finite > 0 → ``"degenerate"`` (a single repeated value)
 
+    Every reduction for every variable goes into a single ``compute()``. That
+    is not a tidiness point: these stores are far too large to sit in page
+    cache — chl alone is 97 GB — so each separate ``.values`` call is a real
+    re-read from disk. Computing them one at a time made this three times
+    slower than the disk requires.
+
+    Args:
+        ds: Dataset to inspect.
+        window: Restrict the scan to this range. Reading values is disk-bound
+            and unbounded scans cover the whole store, so callers auditing more
+            than one variable should pass one.
+
     Returns:
         ``(variable, date, kind, detail)`` tuples. Empty when everything is fine.
     """
-    issues: list[tuple[str, pd.Timestamp, str, str]] = []
+    if window is not None:
+        ds = ds.sel(time=slice(window.start, window.end))
+        # A file wholly outside the window keeps its variables but loses every
+        # timestep, and min/max over a zero-length axis raises rather than
+        # returning empty. Nothing to check here.
+        if "time" not in ds.coords or ds.sizes.get("time", 0) == 0:
+            return []
 
-    for name, da in ds.data_vars.items():
+    # Keys are generated positionally so they cannot collide with a real
+    # variable name; `columns` maps them back.
+    lazy: dict[str, xr.DataArray] = {}
+    columns: list[tuple[str, str, str, str]] = []
+
+    for i, (name, da) in enumerate(ds.data_vars.items()):
         if "time" not in da.dims:
             continue
         spatial = [d for d in da.dims if d != "time"]
         if not spatial:
             continue
+        k_n, k_lo, k_hi = f"_{i}_n", f"_{i}_lo", f"_{i}_hi"
+        lazy[k_n] = np.isfinite(da).sum(dim=spatial)
+        lazy[k_lo] = da.min(dim=spatial, skipna=True)
+        lazy[k_hi] = da.max(dim=spatial, skipna=True)
+        columns.append((str(name), k_n, k_lo, k_hi))
 
-        sub = da.isel(time=slice(None, sample)) if sample else da
-        finite = np.isfinite(sub)
-        n_finite = finite.sum(dim=spatial)
-        lo = sub.min(dim=spatial, skipna=True)
-        hi = sub.max(dim=spatial, skipna=True)
+    if not lazy:
+        return []
 
-        n_finite, lo, hi = xr.align(n_finite, lo, hi, join="exact")
-        n_vals, lo_vals, hi_vals = (
-            np.asarray(n_finite.values),
-            np.asarray(lo.values),
-            np.asarray(hi.values),
-        )
-        times = pd.DatetimeIndex(sub.time.values)
+    stats = xr.Dataset(lazy).compute()
+    times = pd.DatetimeIndex(ds["time"].values).normalize()
 
+    issues: list[tuple[str, pd.Timestamp, str, str]] = []
+    for name, k_n, k_lo, k_hi in columns:
+        n_vals = np.asarray(stats[k_n].values)
+        lo_vals = np.asarray(stats[k_lo].values)
+        hi_vals = np.asarray(stats[k_hi].values)
         for i, when in enumerate(times):
             if n_vals[i] == 0:
-                issues.append((str(name), when, "empty", "no finite values"))
+                issues.append((name, when, "empty", "no finite values"))
             elif lo_vals[i] == hi_vals[i]:
                 issues.append(
-                    (str(name), when, "degenerate", f"single value {lo_vals[i]:.6g}")
+                    (name, when, "degenerate", f"single value {lo_vals[i]:.6g}")
                 )
 
     return issues
@@ -240,6 +274,7 @@ def audit_zarr_file(
     *,
     check_values: bool = False,
     known_gaps: Optional[pd.DatetimeIndex] = None,
+    value_window: Optional[DateRange] = None,
 ) -> tuple[
     Optional[AxisGap],
     list[SliceIssue],
@@ -248,9 +283,10 @@ def audit_zarr_file(
     """
     Audit one Zarr store. Coordinates only unless *check_values* is set.
 
-    Days listed in *known_gaps* are dropped from the result — the provider
-    never published them, so reporting them every run would train the reader to
-    ignore the output.
+    Days listed in *known_gaps* are dropped from **both** results. They are
+    days the provider never published, which is exactly what an all-null slice
+    looks like — suppressing them from the axis check but not the value check
+    would leave the value check reporting the same unfixable days forever.
     """
     try:
         ds = xr.open_zarr(path, consolidated=False)
@@ -273,9 +309,14 @@ def audit_zarr_file(
 
         slices: list[SliceIssue] = []
         if check_values:
+            # `known_gaps or []` would call bool() on the Index, which raises
+            # "truth value is ambiguous" — caught by the handler below and
+            # silently turned into zero findings.
+            suppress = set(known_gaps) if known_gaps is not None else set()
             slices = [
                 SliceIssue(path=path, variable=v, date=d, kind=k, detail=detail)
-                for v, d, k, detail in check_slice_health(ds)
+                for v, d, k, detail in check_slice_health(ds, window=value_window)
+                if d.normalize() not in suppress
             ]
         return gap, slices, None
     except Exception as e:
@@ -290,6 +331,8 @@ def audit_var_key(
     app_config: Optional[AppConfig] = None,
     store_root: Optional[Path] = None,
     check_values: bool = False,
+    value_window: Optional[DateRange] = None,
+    progress: bool = False,
 ) -> VarAudit:
     """
     Audit every Zarr store belonging to *var_key*.
@@ -301,7 +344,14 @@ def audit_var_key(
     """
     config = app_config or get_settings().app_config
     var_key = validate_var_key(var_key, config)
-    root = resolve_store_path(config.variables[var_key], store_root)
+    # warn_if_missing is for callers about to write. This one only reads, and
+    # its "will be created when data is added" advice is simply false here —
+    # `moon` is computed at compile time and never gets a store at all. The
+    # absence is reported through store_exists instead, where it is attributable
+    # to a variable rather than being a log line that scrolls past.
+    root = resolve_store_path(
+        config.variables[var_key], store_root, warn_if_missing=False
+    )
 
     gaps: list[AxisGap] = []
     slices: list[SliceIssue] = []
@@ -310,9 +360,25 @@ def audit_var_key(
     suppressed = known_gap_days(config.variables[var_key])
 
     files = sorted(root.glob("*.zarr")) if root.exists() else []
-    for path in files:
+
+    # A bar only earns its place on the value scan. The axis check runs at
+    # ~126 ms/file, where progress reporting is pure noise; the value scan is
+    # disk-bound over the whole store and previously showed nothing at all
+    # until it finished, which for chl meant 25 minutes of silence.
+    stream = files
+    if progress and files:
+        from tqdm import tqdm
+
+        # disable=None: tqdm auto-disables off a tty, so a scheduled run does
+        # not persist one log line per refresh tick.
+        stream = tqdm(files, desc=f"{var_key:<14}", unit="file", disable=None)
+
+    for path in stream:
         gap, found, error = audit_zarr_file(
-            path, check_values=check_values, known_gaps=suppressed
+            path,
+            check_values=check_values,
+            known_gaps=suppressed,
+            value_window=value_window,
         )
         if gap:
             gaps.append(gap)
@@ -328,6 +394,7 @@ def audit_var_key(
         slices=slices,
         errors=errors,
         known_gaps=suppressed,
+        store_exists=root.exists(),
     )
 
 
