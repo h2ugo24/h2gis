@@ -19,7 +19,7 @@ from loguru import logger
 from h2mare.config import AppConfig, get_settings
 from h2mare.format_converters.base import BaseConverter
 from h2mare.processing.registry import PROCESSORS
-from h2mare.storage.audit import format_date_blocks
+from h2mare.storage.audit import format_date_blocks, known_gap_days
 from h2mare.storage.provenance import (
     annotate_delivered,
     merge_records,
@@ -702,6 +702,9 @@ class Netcdf2Zarr(BaseConverter):
 
         span_start, span_end = written[0], written[-1]
         missing = pd.date_range(span_start, span_end, freq="D").difference(stored)
+        # Days the provider never published are not the pipeline's doing, and
+        # failing on them would make a whole period permanently unconvertible.
+        missing = missing.difference(known_gap_days(self.var_config))
         if len(missing):
             raise RuntimeError(
                 f"[{self.var_key}] period {period}: {len(missing)} day(s) missing "

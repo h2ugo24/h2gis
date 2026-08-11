@@ -286,6 +286,11 @@ switched off, and then it would protect nothing.
 A store whose tail stops short of today is ordinary provider lag and is never
 flagged; only the interior of a store's own span is checked.
 
+Days the provider never published are a third case: they leave an axis hole
+that no amount of re-running can fill. Record them in `known_gaps` (see
+[Configuration](configuration.md)) and the audit excludes them, reporting how
+many it suppressed so the list stays visible rather than silently growing.
+
 **Examples**
 
 ```bash

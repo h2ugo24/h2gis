@@ -1000,3 +1000,30 @@ class TestUnparseableFilenamesAreNotSilent:
         (conv.download_root / "METOFFICE_2026-07-31.nc").write_bytes(b"")
 
         assert conv.run("2020-01-01", "2020-01-31") is False
+
+
+class TestKnownGapsAtConversion:
+    """A day the provider never published must not fail the whole period."""
+
+    def test_a_known_gap_does_not_fail_conversion(self, tmp_path):
+        conv = _period_converter(tmp_path, known_gaps=["2020-01-05"])
+        paths = _write_raw_days(conv, _JAN.drop(pd.Timestamp("2020-01-05")))
+
+        conv._process_period(2020, paths)  # must not raise
+
+    def test_an_unlisted_gap_still_fails(self, tmp_path):
+        conv = _period_converter(tmp_path, known_gaps=["2020-01-08"])
+        paths = _write_raw_days(conv, _JAN.drop(pd.Timestamp("2020-01-05")))
+
+        with pytest.raises(RuntimeError) as excinfo:
+            conv._process_period(2020, paths)
+
+        assert "2020-01-05" in str(excinfo.value.__cause__)
+
+    def test_an_interval_entry_covers_a_block(self, tmp_path):
+        conv = _period_converter(tmp_path, known_gaps=["2020-01-04/2020-01-06"])
+        paths = _write_raw_days(
+            conv, _JAN.drop(pd.date_range("2020-01-04", "2020-01-06"))
+        )
+
+        conv._process_period(2020, paths)  # must not raise

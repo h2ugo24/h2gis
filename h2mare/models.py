@@ -92,6 +92,20 @@ class KeyVarConfigEntry(msgspec.Struct):
     # of anything. This is about the *axis*, not the values: a day present but
     # entirely null is a source gap and is deliberately not flagged.
     expect_daily: bool = True
+    # Days the provider never published, which therefore cannot be downloaded,
+    # converted or backfilled. Each entry is either "YYYY-MM-DD" or a closed
+    # interval "YYYY-MM-DD/YYYY-MM-DD".
+    #
+    # Needed because a source that ships one file per day produces an *axis*
+    # hole when it skips one, which is otherwise indistinguishable from data
+    # the pipeline lost — AVISO simply has no fsle file for 2025-06-02, and its
+    # remote listing jumps 20250601 → 20250603. Without somewhere to record
+    # that, the gap checks would report it on every run forever, and a check
+    # that cries wolf is one people stop reading.
+    #
+    # Only for gaps confirmed absent at the source. Anything else is a defect
+    # and belongs fixed, not listed.
+    known_gaps: Optional[list[str]] = None
 
     def __post_init__(self):
         if self.bbox is not None:

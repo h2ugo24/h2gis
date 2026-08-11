@@ -309,3 +309,88 @@ class TestAuditParquetNulls:
             c in {"time", "lon", "lat"}
             for _, c in audit_parquet_nulls(store.parquet_root)
         )
+
+
+# ---------------------------------------------------------------------------
+# known_gaps
+#
+# A source shipping one file per day produces an *axis* hole when it skips one,
+# which is indistinguishable from data the pipeline lost. AVISO has no fsle
+# file for 2025-06-02 — its remote listing jumps 20250601 → 20250603 — so that
+# day can never be filled. Without somewhere to record it, the checks would
+# report the same unfixable day forever, and a check that cries wolf is one
+# people stop reading.
+# ---------------------------------------------------------------------------
+
+
+class _Cfg:
+    def __init__(self, known_gaps=None):
+        self.known_gaps = known_gaps
+
+
+class TestKnownGapDays:
+    def test_single_date(self):
+        from h2mare.storage.audit import known_gap_days
+
+        assert list(known_gap_days(_Cfg(["2025-06-02"]))) == [
+            pd.Timestamp("2025-06-02")
+        ]
+
+    def test_closed_interval_expands(self):
+        from h2mare.storage.audit import known_gap_days
+
+        assert len(known_gap_days(_Cfg(["2025-06-02/2025-06-05"]))) == 4
+
+    def test_dates_and_intervals_mix(self):
+        from h2mare.storage.audit import known_gap_days
+
+        out = known_gap_days(_Cfg(["2025-01-01", "2025-06-02/2025-06-03"]))
+        assert len(out) == 3
+
+    def test_none_is_empty(self):
+        from h2mare.storage.audit import known_gap_days
+
+        assert len(known_gap_days(_Cfg(None))) == 0
+
+    def test_malformed_entry_is_skipped_not_raised(self):
+        """A typo in a suppression list must not stop a pipeline run."""
+        from h2mare.storage.audit import known_gap_days
+
+        out = known_gap_days(_Cfg(["not-a-date", "2025-06-02"]))
+        assert list(out) == [pd.Timestamp("2025-06-02")]
+
+    def test_result_is_deduplicated_and_sorted(self):
+        from h2mare.storage.audit import known_gap_days
+
+        out = known_gap_days(_Cfg(["2025-06-03", "2025-06-02", "2025-06-03"]))
+        assert list(out) == [pd.Timestamp("2025-06-02"), pd.Timestamp("2025-06-03")]
+
+
+class TestKnownGapsSuppressReporting:
+    def test_a_known_gap_is_not_reported(self, tmp_path):
+        path = _write(_ds(_JAN.drop(pd.Timestamp("2020-01-05"))), tmp_path / "a.zarr")
+
+        gap, _, _ = audit_zarr_file(
+            path, known_gaps=pd.DatetimeIndex([pd.Timestamp("2020-01-05")])
+        )
+
+        assert gap is None
+
+    def test_an_unlisted_gap_is_still_reported(self, tmp_path):
+        path = _write(_ds(_JAN.drop(pd.Timestamp("2020-01-05"))), tmp_path / "a.zarr")
+
+        gap, _, _ = audit_zarr_file(
+            path, known_gaps=pd.DatetimeIndex([pd.Timestamp("2020-01-08")])
+        )
+
+        assert list(gap.missing) == [pd.Timestamp("2020-01-05")]
+
+    def test_only_the_listed_days_are_dropped(self, tmp_path):
+        dropped = _JAN.drop(pd.DatetimeIndex(["2020-01-05", "2020-01-08"]))
+        path = _write(_ds(dropped), tmp_path / "a.zarr")
+
+        gap, _, _ = audit_zarr_file(
+            path, known_gaps=pd.DatetimeIndex([pd.Timestamp("2020-01-05")])
+        )
+
+        assert list(gap.missing) == [pd.Timestamp("2020-01-08")]

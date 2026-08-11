@@ -360,6 +360,7 @@ class TestAuditCLI:
                 slices=[],
                 errors=[],
                 ok=True,
+                n_known_gaps=0,
             )
             result = _runner.invoke(audit_app, ["sst"])
         assert result.exit_code == 0
@@ -379,7 +380,13 @@ class TestAuditCLI:
             patch("h2mare.storage.audit.audit_var_key") as mock_audit,
         ):
             mock_audit.return_value = SimpleNamespace(
-                var_key="sst", n_files=1, gaps=[gap], slices=[], errors=[], ok=False
+                var_key="sst",
+                n_files=1,
+                gaps=[gap],
+                slices=[],
+                errors=[],
+                ok=False,
+                n_known_gaps=0,
             )
             result = _runner.invoke(audit_app, ["sst"])
         assert result.exit_code == 1
