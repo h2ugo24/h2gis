@@ -271,10 +271,11 @@ uv run h2mare audit [VAR_KEY] [OPTIONS]
 |---|---|---|---|
 | `VAR_KEY` | text | — | Variable key to audit (e.g. `sst`, `fsle`) |
 | `-a, --all` | flag | false | Audit every configured variable |
-| `--values` | flag | false | Also report present-but-unusable slices (empty or single-valued). Reads data — much slower |
+| `--values` | flag | false | Also report present-but-unusable slices (empty or single-valued). Reads data — much slower; pair with `--since`. Shows a per-file progress bar |
 | `--parquet` | flag | false | Check the Parquet store for wholly-null columns, from footer statistics. Reads no data |
 | `--show-ok` | flag | false | List variables that passed too |
 | `--known` | flag | false | List the days excluded via each variable's `known_gaps` config entry, rather than only counting them |
+| `--since` | date | — | Bound `--values` to dates on or after this. The value scan is disk-bound over the whole store — `chl` alone is 97 GB — so auditing more than one variable without it is an hours-long job |
 
 **What it does and does not flag**
 
@@ -303,6 +304,22 @@ uv run h2mare audit --all --known
 
 A variable with suppressed days prints under `--known` even without
 `--show-ok`, so the list is visible on an otherwise clean store.
+
+**Cost of `--values`**
+
+The axis check reads coordinates and takes about a minute for the whole store.
+`--values` reads every cell, and the stores are far too large for page cache —
+`chl` alone is 97 GB across 29 files, roughly 9 minutes on its own. Bound it:
+
+```bash
+# 35 seconds instead of 9 minutes
+uv run h2mare audit chl --values --since 2025-01-01
+```
+
+A day absent from the axis and a day present-but-empty need opposite responses,
+so the summary gives advice per finding type: re-download for the first,
+confirm-then-`known_gaps` for the second. Re-running never fills a day the
+provider did not publish.
 
 **Examples**
 
