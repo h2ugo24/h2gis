@@ -659,3 +659,68 @@ class TestCatalogMissingStore:
             result = _runner.invoke(catalog_app, ["sst"])
 
         assert "(does not exist)" not in result.output
+
+
+class TestAuditFindingCount:
+    """The count has to match the lines printed, or it reads as a discrepancy."""
+
+    def _run(self, tmp_path, slices, args):
+        result = SimpleNamespace(
+            var_key="chl",
+            n_files=29,
+            gaps=[],
+            slices=list(slices),
+            errors=[],
+            ok=False,
+            known_gaps=pd.DatetimeIndex([]),
+            n_known_gaps=0,
+            store_exists=True,
+        )
+        with (
+            patch(
+                "h2mare.cli.audit.get_settings", return_value=_mock_settings(tmp_path)
+            ),
+            patch("h2mare.storage.audit.audit_var_key", return_value=result),
+        ):
+            return _runner.invoke(audit_app, args)
+
+    def _slice(self, variable, date="1999-01-25"):
+        return SimpleNamespace(
+            path=Path("chl_1999.zarr"),
+            variable=variable,
+            date=pd.Timestamp(date),
+            kind="empty",
+            detail="no finite values",
+        )
+
+    def test_one_day_across_two_columns_counts_once(self, tmp_path):
+        out = self._run(
+            tmp_path,
+            [self._slice("chl"), self._slice("chl_fdist")],
+            ["sst", "--values"],
+        ).output
+
+        assert "1 finding(s)" in out
+
+    def test_distinct_days_count_separately(self, tmp_path):
+        out = self._run(
+            tmp_path,
+            [
+                self._slice("chl", "1999-01-25"),
+                self._slice("chl_fdist", "1999-01-25"),
+                self._slice("chl", "1999-11-17"),
+            ],
+            ["sst", "--values"],
+        ).output
+
+        assert "2 finding(s)" in out
+
+    def test_the_count_matches_the_lines_printed(self, tmp_path):
+        out = self._run(
+            tmp_path,
+            [self._slice("chl"), self._slice("chl_fdist")],
+            ["sst", "--values"],
+        ).output
+
+        printed = sum(1 for line in out.splitlines() if "[empty]" in line)
+        assert f"{printed} finding(s)" in out
