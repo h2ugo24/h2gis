@@ -16,6 +16,7 @@ Examples
     uv run h2mare catalog sst --rows
 """
 
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -30,7 +31,12 @@ def _print_catalog(var_key: str, show_rows: bool) -> None:
     from h2mare.storage.zarr_catalog import ZarrCatalog
 
     try:
-        cat = ZarrCatalog(var_key)
+        # warn_if_missing is for callers about to write; this one only reads,
+        # and its "will be created when data is added" advice is false here —
+        # `moon` is computed at compile time and never gets a store. The
+        # absence is reported on the Store line instead, where it belongs to
+        # the variable being inspected rather than scrolling past as a log line.
+        cat = ZarrCatalog(var_key, warn_if_missing=False)
     except Exception as e:
         typer.echo(f"  [{var_key}] Could not load catalog: {e}", err=True)
         return
@@ -50,7 +56,11 @@ def _print_catalog(var_key: str, show_rows: bool) -> None:
     variables = summary.get("variables") or set()
     typer.echo(f"  Variables  : {', '.join(sorted(variables)) if variables else '—'}")
     typer.echo(f"  Timesteps  : {summary.get('total_timesteps', '—')}")
-    typer.echo(f"  Store      : {summary.get('store_root', '—')}")
+    store_root = summary.get("store_root")
+    missing = (
+        "  (does not exist)" if store_root and not Path(store_root).exists() else ""
+    )
+    typer.echo(f"  Store      : {store_root or '—'}{missing}")
     typer.echo(f"  Catalog    : {summary.get('catalog_path', '—')}")
     last = summary.get("last_scanned")
     last_str = (

@@ -43,6 +43,7 @@ class ZarrCatalog:
         metadata_root: Optional[Path] = None,
         auto_refresh: bool = True,
         verbose: bool = False,
+        warn_if_missing: bool = True,
     ) -> None:
         """
         Manages a Parquet catalog of processed zarr datasets.
@@ -72,7 +73,9 @@ class ZarrCatalog:
         self.time_resolution = validate_time_resolution(time_resolution)
 
         # Setup directories
-        self.store_root = resolve_store_path(self.var_config, store_root)
+        self.store_root = resolve_store_path(
+            self.var_config, store_root, warn_if_missing=warn_if_missing
+        )
         self.metadata_root = metadata_root or get_settings().METADATA_DIR
 
         # The catalog DataFrame and its refresh lifecycle live in ZarrIndex;
