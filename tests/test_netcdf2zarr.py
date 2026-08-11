@@ -599,10 +599,9 @@ class TestStagingSafety:
 # of 365 days) and 2025-06-02 both survived every existing check that way.
 # ---------------------------------------------------------------------------
 
-# archive_raw=False on purpose: the archive branch moves the raw files, and on
-# Windows open_mfdataset still holds handles on them at that point, so the move
-# fails for reasons that have nothing to do with what these tests check. (That
-# lock is pre-existing — it reproduces on unmodified code.)
+# archive_raw=False keeps these tests off the archive branch, which moves files
+# and is not what they are about. TestArchiveRawReleasesFileHandles covers that
+# path directly.
 _DAILY_ENTRY = {
     "local_folder": "testvar",
     "source_vars": ["testvar"],
@@ -1027,3 +1026,64 @@ class TestKnownGapsAtConversion:
         )
 
         conv._process_period(2020, paths)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# archive_raw and the Windows file lock
+#
+# process_dataset rebinds its argument, so the object open_mfdataset returned
+# had no surviving reference and was never closed — and closing the *derived*
+# dataset does not release the underlying *.nc handles. On Windows those
+# handles blocked safe_move_files, so an archive_raw: true variable could not
+# complete a conversion at all: PermissionError [WinError 32].
+# ---------------------------------------------------------------------------
+
+
+class TestArchiveRawReleasesFileHandles:
+    def _conv(self, tmp_path):
+        conv = _period_converter(tmp_path, archive_raw=True)
+        # _archive_raw_files only moves when the two roots differ.
+        assert conv.download_root != conv.store_root
+        return conv
+
+    def test_archiving_moves_the_raw_files(self, tmp_path):
+        conv = self._conv(tmp_path)
+        paths = _write_raw_days(conv, _JAN)
+
+        conv._process_period(2020, paths)
+
+        archived = sorted((conv.store_root / "2020").glob("*.nc"))
+        assert len(archived) == len(paths)
+
+    def test_the_originals_are_gone_from_the_download_dir(self, tmp_path):
+        conv = self._conv(tmp_path)
+        paths = _write_raw_days(conv, _JAN)
+
+        conv._process_period(2020, paths)
+
+        assert not any(p.exists() for p in paths)
+
+    def test_the_zarr_is_still_written(self, tmp_path):
+        conv = self._conv(tmp_path)
+        paths = _write_raw_days(conv, _JAN)
+
+        conv._process_period(2020, paths)
+
+        stored = xr.open_zarr(conv.catalog.build_file_path.return_value)
+        assert len(stored.time) == len(_JAN)
+        stored.close()
+
+    def test_raw_files_are_movable_after_a_failed_period(self, tmp_path):
+        """The failure path leaked the handles too, locking the whole tree."""
+        import shutil
+
+        conv = self._conv(tmp_path)
+        paths = _write_raw_days(conv, _JAN.drop(pd.Timestamp("2020-01-05")))
+
+        with pytest.raises(RuntimeError):
+            conv._process_period(2020, paths)
+
+        dest = tmp_path / "moved"
+        dest.mkdir()
+        shutil.move(str(paths[0]), str(dest / paths[0].name))  # must not raise
+        assert (dest / paths[0].name).exists()

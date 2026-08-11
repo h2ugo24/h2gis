@@ -37,6 +37,17 @@ from h2mare.validators import validate_time_resolution, validate_var_key
 warnings.filterwarnings("ignore")
 
 
+def _close_all(*datasets: Optional[xr.Dataset]) -> None:
+    """Close every given dataset, ignoring ``None`` and already-closed ones."""
+    for ds in datasets:
+        if ds is None:
+            continue
+        try:
+            ds.close()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"Ignoring error while closing dataset: {e}")
+
+
 def _dataset_dates(ds: xr.Dataset) -> pd.DatetimeIndex:
     """Unique calendar days on a dataset's time axis, sorted. Empty if time-less."""
     if "time" not in ds.coords:
@@ -578,10 +589,17 @@ class Netcdf2Zarr(BaseConverter):
     def _process_period(self, period, paths: list[Path]) -> None:
         logger.info(f"Processing period (year/year-month): {period}")
 
-        ds = self._open_dataset(paths)
+        # Keep the object open_mfdataset returned. process_dataset rebinds its
+        # argument, so without this the only reference to it is lost — and
+        # closing the *derived* dataset does not release the underlying *.nc
+        # handles. On Windows those handles then block _archive_raw_files from
+        # moving the raw files ([WinError 32]), which is why archive_raw: true
+        # variables could not complete a conversion at all.
+        ds_raw = self._open_dataset(paths)
+        ds: Optional[xr.Dataset] = None
 
         try:
-            ds = self.process_dataset(ds)
+            ds = self.process_dataset(ds_raw)
             path = self.catalog.build_file_path(ds, self.date_format)
             # Read the axis before the write: write_append_zarr closes ds.
             written = _dataset_dates(ds)
@@ -596,8 +614,12 @@ class Netcdf2Zarr(BaseConverter):
                 self._write_provenance(path, paths, self._stored_dates(path))
             except Exception as e:
                 logger.warning(f"Could not write provenance for {path.name}: {e}")
-            ds.close()
-            del ds
+
+            # Release every handle on the raw files before anything moves or
+            # deletes them. Both closes are needed and neither is redundant.
+            _close_all(ds, ds_raw)
+            ds = None
+
             self._archive_raw_files(period, paths)
             self._cleanup_period_files(paths)
 
@@ -605,8 +627,11 @@ class Netcdf2Zarr(BaseConverter):
             raise RuntimeError(
                 f"Failed processing data for var_key {self.var_key}"
             ) from e
-        # finally:
-        #    ds.close()
+        finally:
+            # Idempotent, so the success path closing early costs nothing; this
+            # is here for the failure path, which previously leaked the handles
+            # and left the store directory locked on Windows.
+            _close_all(ds, ds_raw)
 
     # ========= WRITE VERIFICATION =========
 
