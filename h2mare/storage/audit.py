@@ -74,6 +74,8 @@ class VarAudit(NamedTuple):
     gaps: list[AxisGap]
     slices: list[SliceIssue]
     errors: list[str]
+    # Days excluded because config records the provider never published them.
+    n_known_gaps: int = 0
 
     @property
     def n_missing_days(self) -> int:
@@ -82,6 +84,42 @@ class VarAudit(NamedTuple):
     @property
     def ok(self) -> bool:
         return not (self.gaps or self.slices or self.errors)
+
+
+def known_gap_days(var_config) -> pd.DatetimeIndex:
+    """
+    Expand a variable's ``known_gaps`` config entries into individual days.
+
+    Accepts ``"YYYY-MM-DD"`` and the closed interval ``"YYYY-MM-DD/YYYY-MM-DD"``.
+    Malformed entries are warned about and skipped rather than raising: a typo
+    in a suppression list must not be able to stop a pipeline run.
+
+    These are days the provider never published. A source shipping one file per
+    day produces an *axis* hole when it skips one, which is otherwise
+    indistinguishable from data the pipeline lost, so without this the checks
+    would report the same unfixable day on every run — and a check that cries
+    wolf stops being read.
+    """
+    entries = getattr(var_config, "known_gaps", None) or []
+    days: list[pd.DatetimeIndex] = []
+    for entry in entries:
+        try:
+            if "/" in str(entry):
+                start, end = str(entry).split("/", 1)
+                days.append(pd.date_range(start.strip(), end.strip(), freq="D"))
+            else:
+                days.append(pd.DatetimeIndex([pd.to_datetime(str(entry))]))
+        except Exception as e:
+            logger.warning(f"Ignoring malformed known_gaps entry {entry!r}: {e}")
+
+    if not days:
+        return pd.DatetimeIndex([])
+    return (
+        pd.DatetimeIndex(np.concatenate([d.values for d in days]))
+        .normalize()
+        .unique()
+        .sort_values()
+    )
 
 
 def contiguous_blocks(
@@ -191,13 +229,22 @@ def check_slice_health(
 
 
 def audit_zarr_file(
-    path: Path, *, check_values: bool = False
+    path: Path,
+    *,
+    check_values: bool = False,
+    known_gaps: Optional[pd.DatetimeIndex] = None,
 ) -> tuple[
     Optional[AxisGap],
     list[SliceIssue],
     Optional[str],
 ]:
-    """Audit one Zarr store. Coordinates only unless *check_values* is set."""
+    """
+    Audit one Zarr store. Coordinates only unless *check_values* is set.
+
+    Days listed in *known_gaps* are dropped from the result — the provider
+    never published them, so reporting them every run would train the reader to
+    ignore the output.
+    """
     try:
         ds = xr.open_zarr(path, consolidated=False)
     except Exception as e:
@@ -209,6 +256,8 @@ def audit_zarr_file(
 
         dates = pd.DatetimeIndex(ds.time.values).normalize().unique().sort_values()
         missing = interior_gaps(dates)
+        if known_gaps is not None and len(missing):
+            missing = missing.difference(known_gaps)
         gap = (
             AxisGap(path=path, span=(dates[0], dates[-1]), missing=missing)
             if len(missing)
@@ -251,9 +300,13 @@ def audit_var_key(
     slices: list[SliceIssue] = []
     errors: list[str] = []
 
+    suppressed = known_gap_days(config.variables[var_key])
+
     files = sorted(root.glob("*.zarr")) if root.exists() else []
     for path in files:
-        gap, found, error = audit_zarr_file(path, check_values=check_values)
+        gap, found, error = audit_zarr_file(
+            path, check_values=check_values, known_gaps=suppressed
+        )
         if gap:
             gaps.append(gap)
         slices.extend(found)
@@ -267,6 +320,7 @@ def audit_var_key(
         gaps=gaps,
         slices=slices,
         errors=errors,
+        n_known_gaps=len(suppressed),
     )
 
 

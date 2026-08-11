@@ -93,6 +93,11 @@ variables:
     compile_depth_slices: [0, 100, 500, 1000]
     
   fsle:
+    # AVISO never published this day: the remote NRT listing jumps
+    # nrt_..._20250601_... -> nrt_..._20250603_..., so there is no file to
+    # fetch and no way to fill the gap. Recorded so the checks stop
+    # reporting an unfixable day on every run.
+    known_gaps: ['2025-06-02']
     local_folder: AVISO_FSLE
     archive_raw: true
     source_vars: [fsle_max]

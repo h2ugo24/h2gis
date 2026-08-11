@@ -40,9 +40,15 @@ app = typer.Typer()
 
 def _print_var_audit(audit, show_all: bool) -> None:
     """Render one variable's findings. Returns nothing; prints to stdout."""
+    known = (
+        f"  ({audit.n_known_gaps} known source gap(s) excluded)"
+        if audit.n_known_gaps
+        else ""
+    )
+
     if audit.ok:
         if show_all:
-            typer.echo(f"  [OK]   {audit.var_key:<16} {audit.n_files} file(s)")
+            typer.echo(f"  [OK]   {audit.var_key:<16} {audit.n_files} file(s){known}")
         return
 
     typer.echo(f"\n  [FAIL] {audit.var_key:<16} {audit.n_files} file(s)")
