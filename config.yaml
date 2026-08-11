@@ -55,6 +55,20 @@ variables:
     compile_depth_slices: [100, 200, 500, 1000]
 
   chl:
+    # Confirmed empty at source, not lost in transit: re-downloading each
+    # of these from CMEMS returns a normal 14.6 MB file in which all
+    # 3,628,800 pixels are fill. Neighbouring days come back ~60% finite
+    # (1998-11-16, 1998-11-21, 2000-11-16, 2000-11-18), so this is not a
+    # seasonal effect. Note 'gapfree' in the dataset id means gap-filling
+    # within a day's coverage, not that every day has usable input.
+    known_gaps:
+      - '1998-11-17/1998-11-20'
+      - '1998-12-17'
+      - '1999-01-25'
+      - '1999-11-17/1999-11-18'
+      - '2000-11-17'
+      - '2001-11-18'
+      - '2002-12-31'
     local_folder: CMEMS_Chla_4km_daily
     archive_raw: false
     source_vars: [CHL]

@@ -6,6 +6,7 @@ switched off within a season, at which point it protects nothing — so the
 false-positive cases below matter as much as the true-positive ones.
 """
 
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -612,3 +613,43 @@ class TestStoreExists:
         )
 
         assert v.store_exists is True
+
+
+class TestShippedKnownGaps:
+    """Guard the suppression lists in the tracked config.yaml.
+
+    A malformed entry is skipped with a warning, so it fails safe — the day
+    just keeps being reported. The dangerous typo is the opposite one: an
+    interval wider than intended, which silently hides days nobody confirmed.
+    """
+
+    def _shipped(self, var_key):
+        import msgspec
+        import yaml
+
+        from h2mare.models import AppConfig
+        from h2mare.storage.audit import known_gap_days
+
+        raw = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
+        config = msgspec.convert(
+            {"variables": raw["variables"], "secrets": {}}, AppConfig, strict=False
+        )
+        return known_gap_days(config.variables[var_key])
+
+    def test_chl_suppresses_exactly_the_confirmed_days(self):
+        assert [str(d.date()) for d in self._shipped("chl")] == [
+            "1998-11-17",
+            "1998-11-18",
+            "1998-11-19",
+            "1998-11-20",
+            "1998-12-17",
+            "1999-01-25",
+            "1999-11-17",
+            "1999-11-18",
+            "2000-11-17",
+            "2001-11-18",
+            "2002-12-31",
+        ]
+
+    def test_fsle_suppresses_exactly_the_confirmed_day(self):
+        assert [str(d.date()) for d in self._shipped("fsle")] == ["2025-06-02"]
