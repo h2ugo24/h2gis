@@ -1,5 +1,7 @@
 """H2GIS command-line interface."""
 
+import sys
+
 import typer
 
 from h2mare.cli.catalog import catalog
@@ -17,9 +19,24 @@ app = typer.Typer(
 )
 
 
+def _use_utf8_console() -> None:
+    """Switch stdout/stderr to UTF-8 so command output can carry non-ASCII.
+
+    Windows hands Python a cp1252 console, which raises UnicodeEncodeError on
+    the arrows and dashes the summaries print — killing the command mid-output.
+    Reconfigure in place so sinks already bound to these streams follow along.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        encoding = (getattr(stream, "encoding", "") or "").lower()
+        if reconfigure is not None and encoding.replace("-", "") != "utf8":
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 @app.callback()
 def _configure() -> None:
-    """Configure logging once for every h2mare command."""
+    """Configure the console and logging once for every h2mare command."""
+    _use_utf8_console()
     configure_logging()
 
 
