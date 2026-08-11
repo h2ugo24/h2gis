@@ -518,3 +518,89 @@ class TestOverlapResolution:
         times = pd.DatetimeIndex(ds.time.values)
         assert times.is_unique, "Duplicate timestamps after append"
         ds.close()
+
+
+# ---------------------------------------------------------------------------
+# Root attributes across appends
+#
+# The in-place fast path ends in to_zarr(append_dim="time"), which rewrites the
+# group attrs from the incoming dataset — and that carries none, so the store's
+# own metadata was wiped. The rewrite paths keep them, which is why this only
+# bit strictly-after appends: the common case, and the one every daily run
+# takes. source_datasets is the casualty that matters — provenance stamped by
+# one run vanished on the next, so merge_records never found anything to merge
+# with. The merge/variable-addition cases below are guards, not regressions.
+# ---------------------------------------------------------------------------
+
+
+def _stamp(path, **attrs) -> None:
+    import zarr
+
+    zarr.open_group(str(path), mode="r+").attrs.update(attrs)
+
+
+def _attrs(path) -> dict:
+    import zarr
+
+    return dict(zarr.open_group(str(path), mode="r").attrs)
+
+
+class TestRootAttrsSurviveAppend:
+    def test_attrs_survive_a_strictly_after_append(self, tmp_path):
+        path = tmp_path / "sst.zarr"
+        write_append_zarr("sst", _make_ds("2020-01-01", 5), path)
+        _stamp(path, source_datasets='[{"dataset_id": "a"}]')
+
+        write_append_zarr("sst", _make_ds("2020-01-06", 5), path)
+
+        assert _attrs(path)["source_datasets"] == '[{"dataset_id": "a"}]'
+
+    def test_attrs_survive_an_overlapping_merge(self, tmp_path):
+        path = tmp_path / "sst.zarr"
+        write_append_zarr("sst", _make_ds("2020-01-01", 5), path)
+        _stamp(path, source_datasets='[{"dataset_id": "a"}]')
+
+        write_append_zarr("sst", _make_ds("2020-01-03", 5), path)
+
+        assert _attrs(path)["source_datasets"] == '[{"dataset_id": "a"}]'
+
+    def test_attrs_survive_a_variable_addition(self, tmp_path):
+        path = tmp_path / "sst.zarr"
+        write_append_zarr("sst", _make_ds("2020-01-01", 5), path)
+        _stamp(path, source_datasets='[{"dataset_id": "a"}]')
+
+        other = _make_ds("2020-01-01", 5).rename({"sst": "chl"})
+        write_append_zarr("sst", other, path)
+
+        assert _attrs(path)["source_datasets"] == '[{"dataset_id": "a"}]'
+
+    def test_multiple_attrs_are_all_kept(self, tmp_path):
+        path = tmp_path / "sst.zarr"
+        write_append_zarr("sst", _make_ds("2020-01-01", 5), path)
+        _stamp(path, source_datasets="[]", note="keep me")
+
+        write_append_zarr("sst", _make_ds("2020-01-06", 5), path)
+
+        assert _attrs(path)["note"] == "keep me"
+
+    def test_a_value_written_by_the_append_still_wins(self, tmp_path):
+        """Restoration fills gaps; it must not clobber what the write set."""
+        path = tmp_path / "sst.zarr"
+        write_append_zarr("sst", _make_ds("2020-01-01", 5), path)
+        _stamp(path, note="old")
+
+        fresh = _make_ds("2020-01-06", 5)
+        fresh.attrs["note"] = "new"
+        write_append_zarr("sst", fresh, path)
+
+        assert _attrs(path)["note"] == "new"
+
+    def test_a_store_without_attrs_is_unaffected(self, tmp_path):
+        path = tmp_path / "sst.zarr"
+        write_append_zarr("sst", _make_ds("2020-01-01", 5), path)
+
+        write_append_zarr("sst", _make_ds("2020-01-06", 5), path)
+
+        ds = xr.open_zarr(path)
+        assert len(ds.time) == 10
+        ds.close()

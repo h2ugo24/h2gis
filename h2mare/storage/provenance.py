@@ -50,22 +50,64 @@ def merge_records(existing: list[dict], new: list[dict]) -> list[dict]:
 
     Periods are appended to incrementally, so a Zarr written across several runs
     accumulates coverage. Replacing the attribute with only the latest run's
-    records — as the generic converter path does — would drop the earlier part
-    of the same file.
+    records — as the generic converter path used to — would drop the earlier
+    part of the same file.
+
+    Only the *requested* span is merged. The delivered fields are dropped here
+    and recomputed by :func:`annotate_delivered`, because they cannot be
+    combined arithmetically: summing double-counts a re-convert of a period
+    already present, and taking a maximum understates a genuine append.
     """
     merged: dict[str, dict] = {}
     for record in [*existing, *new]:
         key = record["dataset_id"]
+        span = {k: v for k, v in record.items() if not k.startswith("delivered_")}
         if key not in merged:
-            merged[key] = dict(record)
+            merged[key] = span
             continue
-        merged[key]["start_date"] = min(merged[key]["start_date"], record["start_date"])
-        merged[key]["end_date"] = max(merged[key]["end_date"], record["end_date"])
+        merged[key]["start_date"] = min(merged[key]["start_date"], span["start_date"])
+        merged[key]["end_date"] = max(merged[key]["end_date"], span["end_date"])
     return sorted(merged.values(), key=lambda r: r["start_date"])
 
 
+def annotate_delivered(records: list[dict], stored: pd.DatetimeIndex) -> list[dict]:
+    """
+    Stamp each record with what the store actually holds inside its span.
+
+    ``start_date``/``end_date`` say what was *asked* for; without a companion
+    statement of what arrived, every later integrity question has to reopen the
+    data. Recording the delivered day count alongside turns "did this file get
+    everything it claims" into a metadata comparison.
+
+    Recomputed from the store's own time axis rather than accumulated across
+    runs, which makes it idempotent: it always describes the file as it now
+    stands, however many conversions contributed to it. It is also the only
+    moment the truth is available for ``archive_raw: false`` variables, whose
+    raw files are gone by the next run.
+
+    Adds ``delivered_days``, ``delivered_start`` and ``delivered_end``.
+    A record whose span holds nothing gets ``delivered_days: 0`` and no bounds.
+    """
+    stored = pd.DatetimeIndex(stored).normalize().unique()
+    out = []
+    for record in records:
+        start = pd.to_datetime(record["start_date"])
+        end = pd.to_datetime(record["end_date"])
+        inside = stored[(stored >= start) & (stored <= end)]
+        annotated = dict(record)
+        annotated["delivered_days"] = int(len(inside))
+        if len(inside):
+            annotated["delivered_start"] = inside.min().strftime("%Y-%m-%d")
+            annotated["delivered_end"] = inside.max().strftime("%Y-%m-%d")
+        out.append(annotated)
+    return out
+
+
 def write_provenance_for_window(
-    zarr_path: Path, manifest: list[dict], window: DateRange
+    zarr_path: Path,
+    manifest: list[dict],
+    window: DateRange,
+    stored: pd.DatetimeIndex | None = None,
 ) -> list[dict]:
     """
     Stamp ``source_datasets`` onto *zarr_path* for the given written *window*.
@@ -73,6 +115,11 @@ def write_provenance_for_window(
     Merges with whatever the file already carries, so repeated appends widen the
     recorded coverage instead of overwriting it. Returns the records written
     (empty when the manifest covers none of the window).
+
+    Args:
+        stored: The store's time axis, used to record what was actually
+            delivered against each requested span. Read from *zarr_path* when
+            omitted.
     """
     import zarr
 
@@ -84,8 +131,22 @@ def write_provenance_for_window(
     raw = root.attrs.get("source_datasets")
     existing = json.loads(raw) if raw else []
     combined = merge_records(existing, records)
+    combined = annotate_delivered(
+        combined, stored if stored is not None else read_store_dates(zarr_path)
+    )
     root.attrs["source_datasets"] = json.dumps(combined)
     return combined
+
+
+def read_store_dates(zarr_path: Path) -> pd.DatetimeIndex:
+    """Time axis of a Zarr store. Coordinate read only — no data is touched."""
+    try:
+        with xr.open_zarr(zarr_path, consolidated=False) as ds:
+            if "time" not in ds.coords:
+                return pd.DatetimeIndex([])
+            return pd.DatetimeIndex(ds.time.values).normalize().unique().sort_values()
+    except Exception:
+        return pd.DatetimeIndex([])
 
 
 def backfill_provenance(catalog: "ZarrCatalog", rep_end_date: DateLike) -> int:
