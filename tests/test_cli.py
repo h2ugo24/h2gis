@@ -361,6 +361,7 @@ class TestAuditCLI:
                 errors=[],
                 ok=True,
                 n_known_gaps=0,
+                known_gaps=pd.DatetimeIndex([]),
             )
             result = _runner.invoke(audit_app, ["sst"])
         assert result.exit_code == 0
@@ -387,7 +388,87 @@ class TestAuditCLI:
                 errors=[],
                 ok=False,
                 n_known_gaps=0,
+                known_gaps=pd.DatetimeIndex([]),
             )
             result = _runner.invoke(audit_app, ["sst"])
         assert result.exit_code == 1
         assert "2026-07-31" in result.output
+
+
+class TestAuditKnownGapsDisplay:
+    """A suppression list nothing can print is one that grows unnoticed."""
+
+    def _result(self, *, ok: bool, known: list[str]):
+        gap = SimpleNamespace(
+            path=Path("aviso_fsle_2025.zarr"),
+            span=(pd.Timestamp("2025-01-01"), pd.Timestamp("2025-12-31")),
+            missing=pd.DatetimeIndex([pd.Timestamp("2025-09-09")]),
+        )
+        idx = pd.DatetimeIndex([pd.Timestamp(d) for d in known])
+        return SimpleNamespace(
+            var_key="fsle",
+            n_files=29,
+            gaps=[] if ok else [gap],
+            slices=[],
+            errors=[],
+            ok=ok,
+            known_gaps=idx,
+            n_known_gaps=len(idx),
+        )
+
+    def _run(self, tmp_path, result, args):
+        with (
+            patch(
+                "h2mare.cli.audit.get_settings", return_value=_mock_settings(tmp_path)
+            ),
+            patch("h2mare.storage.audit.audit_var_key", return_value=result),
+        ):
+            return _runner.invoke(audit_app, args)
+
+    def test_failing_var_still_reports_the_suppressed_count(self, tmp_path):
+        """Regression: the count was built but never interpolated on [FAIL]."""
+        out = self._run(
+            tmp_path, self._result(ok=False, known=["2025-06-02"]), ["sst"]
+        ).output
+
+        assert "[FAIL]" in out
+        assert "1 known source gap(s) excluded" in out
+
+    def test_known_flag_lists_the_dates(self, tmp_path):
+        out = self._run(
+            tmp_path, self._result(ok=True, known=["2025-06-02"]), ["sst", "--known"]
+        ).output
+
+        assert "2025-06-02" in out
+
+    def test_known_flag_shows_a_passing_var_without_show_ok(self, tmp_path):
+        """Otherwise the one thing --known exists for is invisible when clean."""
+        out = self._run(
+            tmp_path, self._result(ok=True, known=["2025-06-02"]), ["sst", "--known"]
+        ).output
+
+        assert "fsle" in out
+
+    def test_known_flag_is_quiet_for_a_var_without_gaps(self, tmp_path):
+        out = self._run(
+            tmp_path, self._result(ok=True, known=[]), ["sst", "--known"]
+        ).output
+
+        assert "known source gaps" not in out
+
+    def test_dates_are_not_listed_without_the_flag(self, tmp_path):
+        out = self._run(
+            tmp_path, self._result(ok=True, known=["2025-06-02"]), ["sst", "--show-ok"]
+        ).output
+
+        assert "1 known source gap(s) excluded" in out
+        assert "2025-06-02" not in out
+
+    def test_an_interval_is_rendered_as_a_range(self, tmp_path):
+        out = self._run(
+            tmp_path,
+            self._result(ok=True, known=["2025-06-02", "2025-06-03", "2025-06-04"]),
+            ["sst", "--known"],
+        ).output
+
+        assert "2025-06-02 → 2025-06-04" in out

@@ -274,6 +274,7 @@ uv run h2mare audit [VAR_KEY] [OPTIONS]
 | `--values` | flag | false | Also report present-but-unusable slices (empty or single-valued). Reads data — much slower |
 | `--parquet` | flag | false | Check the Parquet store for wholly-null columns, from footer statistics. Reads no data |
 | `--show-ok` | flag | false | List variables that passed too |
+| `--known` | flag | false | List the days excluded via each variable's `known_gaps` config entry, rather than only counting them |
 
 **What it does and does not flag**
 
@@ -290,6 +291,18 @@ Days the provider never published are a third case: they leave an axis hole
 that no amount of re-running can fill. Record them in `known_gaps` (see
 [Configuration](configuration.md)) and the audit excludes them, reporting how
 many it suppressed so the list stays visible rather than silently growing.
+`--known` prints the dates themselves:
+
+```
+uv run h2mare audit --all --known
+
+  [OK]   fsle             29 file(s)  (1 known source gap(s) excluded)
+           known source gaps (never published upstream):
+             2025-06-02
+```
+
+A variable with suppressed days prints under `--known` even without
+`--show-ok`, so the list is visible on an otherwise clean store.
 
 **Examples**
 

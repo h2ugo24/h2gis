@@ -27,6 +27,9 @@ Examples
 
     # Parity check on the Parquet store, from footer stats (no data read)
     uv run h2mare audit --parquet
+
+    # Show which days are excluded as known source gaps
+    uv run h2mare audit --all --known
 """
 
 from typing import Optional
@@ -38,7 +41,7 @@ from h2mare.config import get_settings
 app = typer.Typer()
 
 
-def _print_var_audit(audit, show_all: bool) -> None:
+def _print_var_audit(audit, show_all: bool, show_known: bool = False) -> None:
     """Render one variable's findings. Returns nothing; prints to stdout."""
     known = (
         f"  ({audit.n_known_gaps} known source gap(s) excluded)"
@@ -46,12 +49,24 @@ def _print_var_audit(audit, show_all: bool) -> None:
         else ""
     )
 
+    def _known_lines() -> None:
+        """List the suppressed days, so the list can be audited in place."""
+        if show_known and audit.n_known_gaps:
+            typer.echo("           known source gaps (never published upstream):")
+            for block in _blocks(audit.known_gaps):
+                typer.echo(f"             {block}")
+
     if audit.ok:
-        if show_all:
+        # A variable with suppressed days prints under --known even without
+        # --show-ok; otherwise the one thing --known exists to show would be
+        # invisible on a clean store, which is the normal case.
+        if show_all or (show_known and audit.n_known_gaps):
             typer.echo(f"  [OK]   {audit.var_key:<16} {audit.n_files} file(s){known}")
+            _known_lines()
         return
 
-    typer.echo(f"\n  [FAIL] {audit.var_key:<16} {audit.n_files} file(s)")
+    typer.echo(f"\n  [FAIL] {audit.var_key:<16} {audit.n_files} file(s){known}")
+    _known_lines()
 
     for gap in audit.gaps:
         span = f"{gap.span[0].date()} → {gap.span[1].date()}"
@@ -109,6 +124,13 @@ def audit(
     show_ok: bool = typer.Option(
         False, "--show-ok", is_flag=True, help="List variables that passed too."
     ),
+    show_known: bool = typer.Option(
+        False,
+        "--known",
+        is_flag=True,
+        help="List the days excluded via each variable's known_gaps config "
+        "entry, rather than only counting them.",
+    ),
 ) -> None:
     """Report days missing from the middle of a store's own time span."""
     from h2mare.storage.audit import audit_parquet_nulls, audit_var_key
@@ -142,7 +164,7 @@ def audit(
             except Exception as e:
                 typer.echo(f"  [SKIP] {key:<16} {e}")
                 continue
-            _print_var_audit(result, show_ok)
+            _print_var_audit(result, show_ok, show_known)
             findings += len(result.gaps) + len(result.slices) + len(result.errors)
 
     if check_parquet:
