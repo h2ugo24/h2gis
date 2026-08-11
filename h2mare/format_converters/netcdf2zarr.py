@@ -20,6 +20,11 @@ from h2mare.config import AppConfig, get_settings
 from h2mare.format_converters.base import BaseConverter
 from h2mare.processing.registry import PROCESSORS
 from h2mare.storage.audit import format_date_blocks
+from h2mare.storage.provenance import (
+    annotate_delivered,
+    merge_records,
+    read_store_dates,
+)
 from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import chunk_dataset, rename_dims, snap_grid_coords
@@ -342,10 +347,20 @@ class Netcdf2Zarr(BaseConverter):
             logger.warning(f"Could not read download manifest: {e}")
             return []
 
-    def _write_provenance(self, zarr_path: Path, paths: list[Path]) -> None:
+    def _write_provenance(
+        self,
+        zarr_path: Path,
+        paths: list[Path],
+        stored: Optional[pd.DatetimeIndex] = None,
+    ) -> None:
         """
         Write source provenance as a zarr root attribute (``source_datasets``).
         Skipped silently when no download manifest is available.
+
+        Args:
+            stored: The store's time axis, recorded against each requested span
+                so the file states what it actually holds and not only what was
+                asked for. Read back from *zarr_path* when omitted.
         """
         manifest = self._read_manifest()
         if not manifest:
@@ -414,7 +429,18 @@ class Netcdf2Zarr(BaseConverter):
         import zarr
 
         root = zarr.open_group(str(zarr_path), mode="r+")
-        root.attrs["source_datasets"] = json.dumps(records)
+
+        # Merge rather than overwrite. A period file is appended to across runs,
+        # so replacing the attribute with only this run's records drops the
+        # earlier part of the same file — the eddies path has always merged.
+        raw = root.attrs.get("source_datasets")
+        existing = json.loads(raw) if isinstance(raw, str) and raw else []
+        combined = merge_records(existing, records)
+        combined = annotate_delivered(
+            combined, stored if stored is not None else read_store_dates(zarr_path)
+        )
+
+        root.attrs["source_datasets"] = json.dumps(combined)
         logger.debug(f"Wrote provenance to zarr attrs: {zarr_path.name}")
 
     # ========= PROCESSING FUNCTIONS =========
@@ -527,7 +553,7 @@ class Netcdf2Zarr(BaseConverter):
                 path, written, self._expected_dates(period, paths), period
             )
             try:
-                self._write_provenance(path, paths)
+                self._write_provenance(path, paths, self._stored_dates(path))
             except Exception as e:
                 logger.warning(f"Could not write provenance for {path.name}: {e}")
             ds.close()

@@ -19,6 +19,38 @@ from h2mare.storage.xarray_helpers import snap_grid_coords
 from h2mare.types import BBox, DateRange
 
 
+def _read_root_attrs(path: Path) -> dict:
+    """Zarr root-group attributes, or ``{}`` when unreadable."""
+    try:
+        import zarr
+
+        return dict(zarr.open_group(str(path), mode="r").attrs)
+    except Exception as e:
+        logger.debug(f"Could not read root attrs of {path.name}: {e}")
+        return {}
+
+
+def _restore_root_attrs(path: Path, preserved: dict) -> None:
+    """
+    Put back root attributes the write dropped, without clobbering new ones.
+
+    Only keys absent after the write are restored, so a value the write
+    deliberately set still wins.
+    """
+    if not preserved:
+        return
+    try:
+        import zarr
+
+        root = zarr.open_group(str(path), mode="r+")
+        missing = {k: v for k, v in preserved.items() if k not in root.attrs}
+        if missing:
+            root.attrs.update(missing)
+            logger.debug(f"Restored {sorted(missing)} on {path.name} after append")
+    except Exception as e:
+        logger.warning(f"Could not restore root attrs on {path.name}: {e}")
+
+
 def write_append_zarr(
     var_key: str,
     ds: xr.Dataset,
@@ -49,7 +81,20 @@ def write_append_zarr(
     if path.exists():
         # No log here: each append path announces itself (in-place append,
         # variable-addition, or overlap merge).
+        #
+        # The in-place fast path ends in to_zarr(append_dim="time"), which
+        # rewrites the group attrs from the incoming dataset — and that carries
+        # none, so the store's own metadata was wiped. The rewrite paths keep
+        # them (xr.concat/merge carry ds_old's attrs through), which is why this
+        # only ever bit strictly-after appends: the common case.
+        #
+        # source_datasets is the casualty that matters. Provenance stamped by
+        # one run vanished on the next, so merge_records never found anything to
+        # merge with and backfill_provenance's "skip files that already have the
+        # attr" was undone by the following append.
+        preserved = _read_root_attrs(path)
         _append_data(var_key, ds, path)
+        _restore_root_attrs(path, preserved)
 
     else:
         logger.info(f"Saving new dataset at {path}")
