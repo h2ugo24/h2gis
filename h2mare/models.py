@@ -85,6 +85,13 @@ class KeyVarConfigEntry(msgspec.Struct):
     # var_key. Used to select only these columns when adding a variable to an
     # existing Parquet store (--add-var). None means not yet declared.
     compiled_vars: Optional[list[str]] = None
+    # Whether this product publishes one time step per calendar day. True
+    # (default) lets the convert step reject a Zarr whose time axis skips a day
+    # inside the range it just wrote. Set False only for products with a
+    # coarser or irregular native cadence, where a missing day is not evidence
+    # of anything. This is about the *axis*, not the values: a day present but
+    # entirely null is a source gap and is deliberately not flagged.
+    expect_daily: bool = True
 
     def __post_init__(self):
         if self.bbox is not None:
