@@ -75,7 +75,14 @@ class VarAudit(NamedTuple):
     slices: list[SliceIssue]
     errors: list[str]
     # Days excluded because config records the provider never published them.
-    n_known_gaps: int = 0
+    # Carried as the dates rather than a count so a caller can show which days
+    # were suppressed — a suppression list nothing can print is one that grows
+    # unnoticed into a way to bury real defects.
+    known_gaps: pd.DatetimeIndex = pd.DatetimeIndex([])
+
+    @property
+    def n_known_gaps(self) -> int:
+        return len(self.known_gaps)
 
     @property
     def n_missing_days(self) -> int:
@@ -320,7 +327,7 @@ def audit_var_key(
         gaps=gaps,
         slices=slices,
         errors=errors,
-        n_known_gaps=len(suppressed),
+        known_gaps=suppressed,
     )
 
 

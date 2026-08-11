@@ -394,3 +394,50 @@ class TestKnownGapsSuppressReporting:
         )
 
         assert list(gap.missing) == [pd.Timestamp("2020-01-08")]
+
+
+class TestVarAuditKnownGaps:
+    def test_count_derives_from_the_dates(self, tmp_path):
+        from h2mare.storage.audit import VarAudit
+
+        v = VarAudit(
+            var_key="fsle",
+            store_root=tmp_path,
+            n_files=1,
+            gaps=[],
+            slices=[],
+            errors=[],
+            known_gaps=pd.DatetimeIndex(["2025-06-02", "2025-06-03"]),
+        )
+
+        assert v.n_known_gaps == 2
+
+    def test_defaults_to_none_suppressed(self, tmp_path):
+        from h2mare.storage.audit import VarAudit
+
+        v = VarAudit(
+            var_key="sst",
+            store_root=tmp_path,
+            n_files=1,
+            gaps=[],
+            slices=[],
+            errors=[],
+        )
+
+        assert v.n_known_gaps == 0
+        assert len(v.known_gaps) == 0
+
+    def test_suppressed_days_do_not_make_a_var_fail(self, tmp_path):
+        from h2mare.storage.audit import VarAudit
+
+        v = VarAudit(
+            var_key="fsle",
+            store_root=tmp_path,
+            n_files=1,
+            gaps=[],
+            slices=[],
+            errors=[],
+            known_gaps=pd.DatetimeIndex(["2025-06-02"]),
+        )
+
+        assert v.ok is True
