@@ -11,6 +11,7 @@ import pandas as pd
 from typer.testing import CliRunner
 
 from h2mare.cli import _configure, _use_utf8_console
+from h2mare.cli.audit import app as audit_app
 from h2mare.cli.catalog import _print_catalog
 from h2mare.cli.catalog import app as catalog_app
 from h2mare.cli.compile import app as compile_app
@@ -322,3 +323,64 @@ class TestConsoleEncoding:
         monkeypatch.setattr("h2mare.cli.configure_logging", lambda *a, **k: None)
         _configure()
         assert calls == ["console"]
+
+
+# ---------------------------------------------------------------------------
+# cli/audit.py — audit command
+# ---------------------------------------------------------------------------
+
+
+class TestAuditCLI:
+    def test_no_target_exits_with_code_1(self, tmp_path):
+        with patch(
+            "h2mare.cli.audit.get_settings", return_value=_mock_settings(tmp_path)
+        ):
+            result = _runner.invoke(audit_app, [])
+        assert result.exit_code == 1
+
+    def test_unknown_var_key_exits_with_code_1(self, tmp_path):
+        with patch(
+            "h2mare.cli.audit.get_settings", return_value=_mock_settings(tmp_path)
+        ):
+            result = _runner.invoke(audit_app, ["nonexistent"])
+        assert result.exit_code == 1
+        assert "Unknown" in result.output
+
+    def test_clean_store_exits_zero(self, tmp_path):
+        with (
+            patch(
+                "h2mare.cli.audit.get_settings", return_value=_mock_settings(tmp_path)
+            ),
+            patch("h2mare.storage.audit.audit_var_key") as mock_audit,
+        ):
+            mock_audit.return_value = SimpleNamespace(
+                var_key="sst",
+                n_files=3,
+                gaps=[],
+                slices=[],
+                errors=[],
+                ok=True,
+            )
+            result = _runner.invoke(audit_app, ["sst"])
+        assert result.exit_code == 0
+        assert "No gaps found" in result.output
+
+    def test_findings_exit_non_zero(self, tmp_path):
+        """The command gates a scheduled run, so a gap must fail the process."""
+        gap = SimpleNamespace(
+            path=Path("cmems_sst_2026.zarr"),
+            span=(pd.Timestamp("2026-01-01"), pd.Timestamp("2026-08-06")),
+            missing=pd.DatetimeIndex([pd.Timestamp("2026-07-31")]),
+        )
+        with (
+            patch(
+                "h2mare.cli.audit.get_settings", return_value=_mock_settings(tmp_path)
+            ),
+            patch("h2mare.storage.audit.audit_var_key") as mock_audit,
+        ):
+            mock_audit.return_value = SimpleNamespace(
+                var_key="sst", n_files=1, gaps=[gap], slices=[], errors=[], ok=False
+            )
+            result = _runner.invoke(audit_app, ["sst"])
+        assert result.exit_code == 1
+        assert "2026-07-31" in result.output

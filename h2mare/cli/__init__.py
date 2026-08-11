@@ -4,6 +4,7 @@ import sys
 
 import typer
 
+from h2mare.cli.audit import audit
 from h2mare.cli.catalog import catalog
 from h2mare.cli.compile import compile
 from h2mare.cli.main import run
@@ -45,6 +46,10 @@ app.command(
     "convert", help="Convert downloaded NetCDF/GRIB files to Zarr (no download)."
 )(convert)
 app.command("catalog", help="Inspect ZarrCatalog metadata for a variable.")(catalog)
+app.command(
+    "audit",
+    help="Report days missing from the middle of a store's own time span.",
+)(audit)
 app.command(
     "compile",
     help="Merge per-variable Zarr stores into the unified h2ds compiled dataset.",

@@ -113,9 +113,6 @@ def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
         var_key: The key for the variable to be processed and must exist in app_config.variables
         ds_new: New dataset to append.
         path: file path created by ``ZarrCatalog(var_key).build_file_path()``
-
-    Raises:
-        ValueError: If corrupted dataset is detected with unique values after concatenation.
     """
     ds_old = xr.open_zarr(path, consolidated=False)
     ds_old_vars = set(ds_old.data_vars)

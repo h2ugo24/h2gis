@@ -250,6 +250,69 @@ uv run h2mare catalog sst --rows
 
 ---
 
+## `h2mare audit`
+
+Report days that are missing from the **middle** of a store's own time span.
+
+Every other coverage mechanism is a frontier — a start and an end. A year
+holding January 1st and December 31st reports itself complete however much is
+missing in between, which is how `AVISO_FSLE` 1999 shipped with 128 of 365 days
+and passed every check.
+
+The default check reads time **coordinates** only, never data: the full
+production store takes about a minute, so there is no cache and no incremental
+mode. Exits non-zero when anything is found, so it can gate a scheduled run.
+
+```
+uv run h2mare audit [VAR_KEY] [OPTIONS]
+```
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `VAR_KEY` | text | — | Variable key to audit (e.g. `sst`, `fsle`) |
+| `-a, --all` | flag | false | Audit every configured variable |
+| `--values` | flag | false | Also report present-but-unusable slices (empty or single-valued). Reads data — much slower |
+| `--parquet` | flag | false | Check the Parquet store for wholly-null columns, from footer statistics. Reads no data |
+| `--show-ok` | flag | false | List variables that passed too |
+
+**What it does and does not flag**
+
+A day *absent from the time axis* is a pipeline defect and is reported. A day
+*present but entirely null* is a genuine source gap — `chl` has three in 1999
+alone — and is only reported under `--values`. Keeping those separate is what
+lets the default check stay enabled: one that flagged `chl` every year would be
+switched off, and then it would protect nothing.
+
+A store whose tail stops short of today is ordinary provider lag and is never
+flagged; only the interior of a store's own span is checked.
+
+**Examples**
+
+```bash
+# Every configured variable
+uv run h2mare audit --all
+
+# One variable
+uv run h2mare audit fsle
+
+# Also look for present-but-unusable slices
+uv run h2mare audit fsle --values
+
+# Parity check on the Parquet store
+uv run h2mare audit --parquet
+```
+
+Repair a reported gap through the normal path — re-run the download and convert
+for those dates, then `compile`, then rewrite the affected Parquet months:
+
+```bash
+uv run h2mare run -v fsle --start-date 2025-06-02 --end-date 2025-06-02
+uv run h2mare compile
+uv run h2mare parquet --start-date 2025-06-01 --end-date 2025-06-30
+```
+
+---
+
 ## Variable keys
 
 Valid values for `-v / --vars`:
