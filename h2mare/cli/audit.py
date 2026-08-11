@@ -212,8 +212,15 @@ def audit(
                 continue
             _print_var_audit(result, show_ok, show_known)
             n_gaps += len(result.gaps)
-            n_slices += len(result.slices)
-            findings += len(result.gaps) + len(result.slices) + len(result.errors)
+            # Count the days shown, not the (variable, day) pairs behind them.
+            # The display collapses a var_key's columns onto one line, so
+            # counting issues reported 22 findings above 11 printed lines.
+            n_slices += len({(s.path, s.date) for s in result.slices})
+            findings += (
+                len(result.gaps)
+                + len({(s.path, s.date) for s in result.slices})
+                + len(result.errors)
+            )
 
     if check_parquet:
         typer.echo("\nAuditing Parquet store — wholly-null columns")
