@@ -363,10 +363,11 @@ class TestAuditCLI:
                 n_known_gaps=0,
                 known_gaps=pd.DatetimeIndex([]),
                 store_exists=True,
+                store_expected=True,
             )
             result = _runner.invoke(audit_app, ["sst"])
         assert result.exit_code == 0
-        assert "No gaps found" in result.output
+        assert "no gaps found" in result.output
 
     def test_findings_exit_non_zero(self, tmp_path):
         """The command gates a scheduled run, so a gap must fail the process."""
@@ -391,6 +392,7 @@ class TestAuditCLI:
                 n_known_gaps=0,
                 known_gaps=pd.DatetimeIndex([]),
                 store_exists=True,
+                store_expected=True,
             )
             result = _runner.invoke(audit_app, ["sst"])
         assert result.exit_code == 1
@@ -417,6 +419,7 @@ class TestAuditKnownGapsDisplay:
             known_gaps=idx,
             n_known_gaps=len(idx),
             store_exists=True,
+            store_expected=True,
         )
 
     def _run(self, tmp_path, result, args):
@@ -480,7 +483,7 @@ class TestAuditKnownGapsDisplay:
 class TestAuditReporting:
     """Advice and labels have to match the check that produced the findings."""
 
-    def _result(self, *, gaps=(), slices=(), store_exists=True):
+    def _result(self, *, gaps=(), slices=(), store_exists=True, store_expected=True):
         return SimpleNamespace(
             var_key="chl",
             n_files=29,
@@ -491,6 +494,8 @@ class TestAuditReporting:
             known_gaps=pd.DatetimeIndex([]),
             n_known_gaps=0,
             store_exists=store_exists,
+            store_expected=store_expected,
+            store_root=Path("store/chl"),
         )
 
     def _gap(self):
@@ -565,13 +570,66 @@ class TestAuditReporting:
         assert out.count("1999-01-25") == 1
         assert "chl, chl_fdist" in out
 
-    def test_a_missing_store_is_skipped_not_passed(self, tmp_path):
+    def test_a_missing_store_is_never_passed(self, tmp_path):
         out = self._run(
             tmp_path, self._result(store_exists=False), ["sst", "--show-ok"]
         ).output
 
-        assert "[SKIP]" in out
         assert "[OK]" not in out
+
+    def test_a_downloaded_variable_with_no_store_fails(self, tmp_path):
+        """An unmounted drive must not read as a clean store."""
+        result = self._run(
+            tmp_path, self._result(store_exists=False), ["sst", "--show-ok"]
+        )
+
+        assert result.exit_code == 1
+        assert "[FAIL]" in result.output
+        assert "STORE_ROOT" in result.output
+        assert "no gaps found" not in result.output.lower()
+
+    def test_a_computed_variable_with_no_store_is_skipped(self, tmp_path):
+        """`moon` never gets a store; reporting it forever teaches people to
+        ignore the command."""
+        result = self._run(
+            tmp_path,
+            self._result(store_exists=False, store_expected=False),
+            ["sst", "--show-ok"],
+        )
+
+        assert "[SKIP]" in result.output
+        assert "[FAIL]" not in result.output
+
+    def test_nothing_checked_does_not_report_a_pass(self, tmp_path):
+        """The only variable asked for was skipped, so there is no pass to
+        report — and no finding either."""
+        result = self._run(
+            tmp_path,
+            self._result(store_exists=False, store_expected=False),
+            ["sst"],
+        )
+
+        assert result.exit_code == 1
+        assert "Nothing was checked" in result.output
+        assert "no gaps found" not in result.output.lower()
+
+    def test_an_audit_that_raises_is_a_finding(self, tmp_path):
+        """Not a skip: the check did not run and nobody knows why."""
+        with (
+            patch(
+                "h2mare.cli.audit.get_settings", return_value=_mock_settings(tmp_path)
+            ),
+            patch(
+                "h2mare.storage.audit.audit_var_key",
+                side_effect=OSError("drive not ready"),
+            ),
+        ):
+            result = _runner.invoke(audit_app, ["sst"])
+
+        assert result.exit_code == 1
+        assert "[ERROR]" in result.output
+        assert "drive not ready" in result.output
+        assert "no gaps found" not in result.output.lower()
 
     def test_since_without_values_is_flagged(self, tmp_path):
         result = self._run(tmp_path, self._result(), ["sst", "--since", "2025-01-01"])
@@ -584,6 +642,135 @@ class TestAuditReporting:
         )
 
         assert result.exit_code == 1
+
+
+class TestAuditScopeLine:
+    """A verdict has to carry its own scope, or it claims more than it read.
+
+    "No gaps found." reads as a statement about the store; what was checked may
+    have been one variable, or one variable since 2020, or — with stores
+    skipped — fewer variables than were asked for.
+    """
+
+    _TWO_VARS = msgspec.convert(
+        {
+            "variables": {
+                "sst": {
+                    "local_folder": "sst",
+                    "source_vars": ["analysed_sst"],
+                    "dataset_id_rep": "cmems-sst",
+                    "source": "cmems",
+                    "archive_raw": False,
+                },
+                "moon": {
+                    "local_folder": "moon",
+                    "source_vars": ["moon_phase"],
+                    "dataset_id_rep": "ephem4.2",
+                    "source": "python",
+                    "archive_raw": False,
+                },
+            },
+            "secrets": {},
+        },
+        AppConfig,
+    )
+
+    def _result(self, var_key, *, store_exists=True, store_expected=True):
+        return SimpleNamespace(
+            var_key=var_key,
+            n_files=29,
+            gaps=[],
+            slices=[],
+            errors=[],
+            ok=True,
+            known_gaps=pd.DatetimeIndex([]),
+            n_known_gaps=0,
+            store_exists=store_exists,
+            store_expected=store_expected,
+            store_root=Path(f"store/{var_key}"),
+        )
+
+    def _run_all(self, tmp_path, args):
+        settings = _mock_settings(tmp_path)
+        settings.app_config = self._TWO_VARS
+
+        def _audit(key, **kwargs):
+            if key == "moon":
+                return self._result(key, store_exists=False, store_expected=False)
+            return self._result(key)
+
+        with (
+            patch("h2mare.cli.audit.get_settings", return_value=settings),
+            patch("h2mare.storage.audit.audit_var_key", side_effect=_audit),
+        ):
+            return _runner.invoke(audit_app, args)
+
+    def test_the_verdict_states_how_many_were_checked(self, tmp_path):
+        result = self._run_all(tmp_path, ["--all"])
+
+        assert result.exit_code == 0
+        assert "Checked 1 of 2 key variable(s)" in result.output
+
+    def test_a_benign_skip_is_stated_once(self, tmp_path):
+        """The [SKIP] line already carries the variable and the reason; the
+        verdict's shortfall points at it rather than repeating it."""
+        out = self._run_all(tmp_path, ["--all"]).output
+
+        assert out.count("moon") == 1
+        assert "[SKIP] moon" in out
+
+    def test_counts_are_labelled_key_variables(self, tmp_path):
+        """A var_key such as `eddies` is ~15 columns; a bare count reads as
+        those."""
+        out = self._run_all(tmp_path, ["--all"]).output
+
+        assert "key variable(s)" in out
+        assert "of 2 variable(s)" not in out
+
+    def test_the_verdict_names_a_single_variable(self, tmp_path):
+        out = self._run_all(tmp_path, ["sst"]).output
+
+        assert "Checked key variable sst" in out
+
+    def test_the_verdict_carries_the_value_window(self, tmp_path):
+        """Otherwise a pass conceals that everything before --since was never
+        opened."""
+        out = self._run_all(
+            tmp_path, ["sst", "--values", "--since", "2020-01-01"]
+        ).output
+
+        assert "axis + value check since 2020-01-01" in out
+
+    def test_the_verdict_says_axis_check_by_default(self, tmp_path):
+        out = self._run_all(tmp_path, ["sst"]).output
+
+        assert "Checked key variable sst, axis check" in out
+
+    def test_the_opening_and_closing_lines_agree(self, tmp_path):
+        """Two wordings for the same check read as two different runs."""
+        out = self._run_all(tmp_path, ["--all", "--values"]).output
+
+        assert out.count("axis + value check") == 2
+
+    def test_findings_carry_the_same_scope(self, tmp_path):
+        settings = _mock_settings(tmp_path)
+        settings.app_config = self._TWO_VARS
+        failing = self._result("sst")
+        failing.gaps = [
+            SimpleNamespace(
+                path=Path("sst_2026.zarr"),
+                span=(pd.Timestamp("2026-01-01"), pd.Timestamp("2026-12-31")),
+                missing=pd.DatetimeIndex([pd.Timestamp("2026-07-31")]),
+            )
+        ]
+        with (
+            patch("h2mare.cli.audit.get_settings", return_value=settings),
+            patch("h2mare.storage.audit.audit_var_key", return_value=failing),
+        ):
+            result = _runner.invoke(audit_app, ["sst"])
+
+        assert result.exit_code == 1
+        assert "Checked key variable sst, axis check — 1 finding(s)." in result.output
 
 
 class TestCatalogMissingStore:
