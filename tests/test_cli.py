@@ -18,6 +18,7 @@ from h2mare.cli.compile import app as compile_app
 from h2mare.cli.main import app as main_app
 from h2mare.cli.nc2zarr import app as nc2zarr_app
 from h2mare.models import AppConfig
+from h2mare.types import BBox
 
 _runner = CliRunner()
 
@@ -846,6 +847,73 @@ class TestCatalogMissingStore:
             result = _runner.invoke(catalog_app, ["sst"])
 
         assert "(does not exist)" not in result.output
+
+
+class TestCatalogBbox:
+    """The inspector reports the extent on disk, and flags a config mismatch."""
+
+    def _output(self, tmp_path, summary):
+        from h2mare.storage.zarr_catalog import ZarrCatalog
+
+        with (
+            patch(
+                "h2mare.cli.catalog.get_settings", return_value=_mock_settings(tmp_path)
+            ),
+            patch.object(ZarrCatalog, "__init__", return_value=None),
+            patch.object(
+                ZarrCatalog,
+                "df",
+                new_callable=lambda: property(lambda s: pd.DataFrame()),
+            ),
+            patch.object(ZarrCatalog, "summary", return_value=summary),
+        ):
+            return _runner.invoke(catalog_app, ["sst"]).output
+
+    def test_store_bbox_is_printed(self, tmp_path):
+        out = self._output(
+            tmp_path,
+            {"num_files": 1, "store_bbox": BBox(-10.0, 30.0, 0.0, 40.0)},
+        )
+        assert "-10, 30 → 0, 40" in out
+        assert "10W-0E-30N-40N" in out
+
+    def test_config_bbox_shown_only_when_it_differs(self, tmp_path):
+        same = {
+            "num_files": 1,
+            "store_bbox": BBox(-10.0, 30.0, 0.0, 40.0),
+            "bbox": BBox(-10.0, 30.0, 0.0, 40.0),
+        }
+        assert "BBox (cfg)" not in self._output(tmp_path, same)
+
+        # Cell centres sit half a grid cell inside the requested edges — every
+        # variable would otherwise print a mismatch line that means nothing.
+        cell_centres = {
+            "num_files": 1,
+            "store_bbox": BBox(-9.975, 30.025, -0.025, 39.975),
+            "bbox": BBox(-10.0, 30.0, 0.0, 40.0),
+        }
+        assert "BBox (cfg)" not in self._output(tmp_path, cell_centres)
+
+        wider = {
+            "num_files": 1,
+            "store_bbox": BBox(-20.0, 20.0, 10.0, 50.0),
+            "bbox": BBox(-10.0, 30.0, 0.0, 40.0),
+        }
+        out = self._output(tmp_path, wider)
+        assert "BBox (cfg) : -10, 30 → 0, 40" in out
+
+    def test_falls_back_to_config_bbox_for_an_empty_store(self, tmp_path):
+        out = self._output(
+            tmp_path,
+            {"num_files": 0, "store_bbox": None, "bbox": BBox(-10.0, 30.0, 0.0, 40.0)},
+        )
+        assert "BBox (cfg) : -10, 30 → 0, 40" in out
+
+    def test_unknown_bbox_renders_as_a_dash(self, tmp_path):
+        # summary() writes the string "No data" into `bbox` when unset — it
+        # must not reach the formatter.
+        out = self._output(tmp_path, {"num_files": 0, "bbox": "No data"})
+        assert "BBox       : —" in out
 
 
 class TestAuditFindingCount:

@@ -23,8 +23,28 @@ import pandas as pd
 import typer
 
 from h2mare.config import get_settings
+from h2mare.types import BBox
 
 app = typer.Typer()
+
+
+# Half a degree: wider than the half-cell offset between a requested edge and
+# the first cell centre on any grid the pipeline handles (coarsest is 0.25°),
+# narrower than any mismatch worth reporting — those run to whole degrees.
+_BBOX_TOL_DEG = 0.5
+
+
+def _bbox_differs(a: BBox, b: BBox) -> bool:
+    """Whether two bboxes differ by more than grid-cell rounding."""
+    return any(abs(x - y) > _BBOX_TOL_DEG for x, y in zip(a.to_tuple(), b.to_tuple()))
+
+
+def _fmt_bbox(bbox: BBox) -> str:
+    """Render a bbox as numeric bounds plus the label used in filenames."""
+    return (
+        f"{bbox.xmin:g}, {bbox.ymin:g} → {bbox.xmax:g}, {bbox.ymax:g}"
+        f"  ({bbox.to_label()})"
+    )
 
 
 def _print_catalog(var_key: str, show_rows: bool) -> None:
@@ -52,6 +72,22 @@ def _print_catalog(var_key: str, show_rows: bool) -> None:
         typer.echo(f"  Coverage   : {cov.start.date()} → {cov.end.date()}")
     else:
         typer.echo("  Coverage   : No data")
+
+    store_bbox = summary.get("store_bbox")
+    config_bbox = summary.get("bbox")
+    config_bbox = config_bbox if isinstance(config_bbox, BBox) else None
+
+    if store_bbox is not None:
+        typer.echo(f"  BBox       : {_fmt_bbox(store_bbox)}")
+        # The configured bbox is what was *asked for*; the store reports cell
+        # centres, so it sits a half-cell inside the request on every variable.
+        # Only a difference beyond that is a request the store didn't honour.
+        if config_bbox is not None and _bbox_differs(config_bbox, store_bbox):
+            typer.echo(f"  BBox (cfg) : {_fmt_bbox(config_bbox)}")
+    elif config_bbox is not None:
+        typer.echo(f"  BBox (cfg) : {_fmt_bbox(config_bbox)}")
+    else:
+        typer.echo("  BBox       : —")
 
     variables = summary.get("variables") or set()
     typer.echo(f"  Variables  : {', '.join(sorted(variables)) if variables else '—'}")
@@ -86,7 +122,17 @@ def _print_catalog(var_key: str, show_rows: bool) -> None:
     if show_rows and not df.empty:
         cols = [
             c
-            for c in ["filename", "dataset", "start_date", "end_date", "num_timesteps"]
+            for c in [
+                "filename",
+                "dataset",
+                "start_date",
+                "end_date",
+                "num_timesteps",
+                "xmin",
+                "ymin",
+                "xmax",
+                "ymax",
+            ]
             if c in df.columns
         ]
         typer.echo(f"\n  Rows:\n{df[cols].to_string(index=False)}")

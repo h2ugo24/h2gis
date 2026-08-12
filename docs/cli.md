@@ -233,7 +233,12 @@ uv run h2mare catalog [VAR_KEY] [OPTIONS]
 |---|---|---|---|
 | `VAR_KEY` | text | — | Variable key to inspect (e.g. `sst`, `ssh`) |
 | `-a, --all` | flag | false | Show summary for all configured variables |
-| `-r, --rows` | flag | false | Print individual catalog rows (filename, dataset, dates, timesteps) |
+| `-r, --rows` | flag | false | Print individual catalog rows (filename, dataset, dates, timesteps, extent) |
+
+The `BBox` line is the extent the files actually hold, unioned across the store
+— cell centres, so it sits half a grid cell inside the requested edges. A
+`BBox (cfg)` line appears only when the bbox configured for the variable differs
+by more than that (or when the store is empty, where it is all there is).
 
 **Examples**
 
