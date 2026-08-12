@@ -916,6 +916,48 @@ class TestCatalogBbox:
         assert "BBox       : —" in out
 
 
+class TestAuditParquetFindingLocation:
+    """A finding has to say which file it is about.
+
+    Every partition in the store is a `part-N.parquet` and PARQUET_DIR holds
+    more than one store root, so the bare filename identified 1493 candidates.
+    """
+
+    def _run(self, tmp_path, nulls):
+        settings = _mock_settings(tmp_path)
+        with (
+            patch("h2mare.cli.audit.get_settings", return_value=settings),
+            patch("h2mare.storage.audit.audit_parquet_nulls", return_value=nulls),
+        ):
+            return _runner.invoke(audit_app, ["--parquet"]).output
+
+    def test_the_finding_names_the_store_and_partition(self, tmp_path):
+        path = (
+            tmp_path
+            / "parquet"
+            / "h2mare_compiled-data"
+            / "year=2025"
+            / "month=6"
+            / "part-0.parquet"
+        )
+        out = self._run(tmp_path, [(path, "mnkc_hmlmeso")])
+
+        assert "h2mare_compiled-data" in out
+        assert "year=2025" in out
+        assert "month=6" in out
+
+    def test_the_audited_root_is_named_up_front(self, tmp_path):
+        out = self._run(tmp_path, [])
+        assert str(tmp_path / "parquet") in out
+
+    def test_a_path_outside_the_root_still_prints(self, tmp_path):
+        # relative_to raises for anything not under PARQUET_DIR; the finding
+        # must survive that rather than take the command down.
+        stray = tmp_path / "elsewhere" / "part-0.parquet"
+        out = self._run(tmp_path, [(stray, "sst")])
+        assert str(stray) in out
+
+
 class TestAuditFindingCount:
     """The count has to match the lines printed, or it reads as a discrepancy."""
 

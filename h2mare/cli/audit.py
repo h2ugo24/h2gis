@@ -282,11 +282,21 @@ def audit(
             )
 
     if check_parquet:
-        typer.echo("\nAuditing Parquet store — wholly-null columns")
+        typer.echo(
+            f"\nAuditing Parquet store — wholly-null columns ({settings.PARQUET_DIR})"
+        )
         nulls = audit_parquet_nulls(settings.PARQUET_DIR)
         if nulls:
             for path, column in nulls:
-                typer.echo(f"  [FAIL] {column} is entirely null in {path.name}")
+                # The bare filename identifies nothing: every partition is a
+                # `part-N.parquet`, and PARQUET_DIR holds more than one store
+                # root. The path relative to it carries the store, the year and
+                # the month — which is the whole finding.
+                try:
+                    where = path.relative_to(settings.PARQUET_DIR)
+                except ValueError:
+                    where = path
+                typer.echo(f"  [FAIL] {column} is entirely null in {where}")
             findings += len(nulls)
         else:
             typer.echo("  [OK]   no wholly-null columns")
