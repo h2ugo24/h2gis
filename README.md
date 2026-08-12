@@ -90,7 +90,15 @@ uv run h2mare run -v sst --dry-run
 
 # Process all configured variables
 uv run h2mare run
+
+# Check the stores for days that went missing without failing anything
+uv run h2mare audit --all
 ```
+
+Coverage elsewhere in the pipeline is a frontier — a start date and an end date — so a year holding
+January 1st and December 31st reports itself complete however much is missing in between. `audit`
+reads the time axes and reports the holes. See [the CLI docs](https://h2ugoparra.github.io/h2mare/cli/)
+for the value check and for `known_gaps`, which excludes days the provider never published.
 
 ## Development
 
