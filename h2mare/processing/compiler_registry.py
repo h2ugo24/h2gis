@@ -36,7 +36,7 @@ CompileProcessor = Callable[
 
 
 def _open_or_warn(
-    catalog: ZarrCatalog,
+    catalog: ZarrCatalog | None,
     var_key: str,
     date_range: DateRange,
     bbox,
@@ -44,6 +44,15 @@ def _open_or_warn(
 ) -> xr.Dataset | None:
     """Open a dataset from the catalog, returning None and logging on missing data."""
     from loguru import logger
+
+    # CompileProcessor passes None for system variables (bathy, moon), but those
+    # have their own processors and never reach here — a None catalog means a
+    # non-system var_key was wired to one, which is a bug rather than missing data.
+    if catalog is None:
+        raise ValueError(
+            f"_open_or_warn requires a catalog, got None for '{var_key}'. "
+            f"System variables must not be dispatched to a catalog-reading processor."
+        )
 
     try:
         return catalog.open_dataset(
