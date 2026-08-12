@@ -137,6 +137,7 @@ def configure_logging(
     # is active.
     logger.configure(extra={"var": "-"})
 
+    file_sink_err: OSError | None = None
     try:
         add_file_logger(log_dir / "pipeline.log", level=level)
         file_sink_ok = True

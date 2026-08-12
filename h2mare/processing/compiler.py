@@ -491,20 +491,18 @@ class Compiler:
             compile_default,
         )
 
-        is_system = var_key in SYSTEM_VAR_KEYS
+        # System variables (bathy, moon) are generated rather than read from a
+        # store, so they get no catalog and skip the overlap check.
         # auto_refresh=False: the source store is stable during a compile (see
         # _catalog_cache note in __init__), so skip the per-access change check
         # that would otherwise re-stat the store directory on every df access.
-        catalog = (
-            None
-            if is_system
-            else self._catalog_cache.setdefault(
+        catalog: Optional[ZarrCatalog] = None
+        if var_key not in SYSTEM_VAR_KEYS:
+            catalog = self._catalog_cache.setdefault(
                 var_key, ZarrCatalog(var_key, auto_refresh=False)
             )
-        )
-
-        if not is_system and not self._has_overlap(var_key, date_range, catalog):
-            return None
+            if not self._has_overlap(var_key, date_range, catalog):
+                return None
 
         processor = COMPILE_PROCESSORS.get(var_key, compile_default)
         return processor(self, catalog, date_range)

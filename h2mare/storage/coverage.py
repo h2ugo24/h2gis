@@ -10,7 +10,7 @@ import pandas as pd
 from loguru import logger
 
 from h2mare.storage.zarr_catalog import get_zarr_time_coverage
-from h2mare.types import DateLike, DateRange, TimeResolution
+from h2mare.types import DateLike, DateRange, TimeResolution, to_datetime
 from h2mare.utils.datetime_utils import normalize_date
 
 
@@ -139,9 +139,12 @@ def resolve_date_range(
         ValueError: If no store exists and dates cannot be inferred, or
             if explicitly supplied dates produce start > end.
     """
-    start = normalize_date(start) if start else None
-    end = normalize_date(end) if end else None
-    inferred = start is None or end is None
+    # Separate locals from the DateLike parameters: past this point the values
+    # are always concrete datetimes, and reusing the parameter names would keep
+    # the broader declared type (which allows str) for the comparisons below.
+    start_ts = normalize_date(start) if start else None
+    end_ts = normalize_date(end) if end else None
+    inferred = start_ts is None or end_ts is None
 
     if inferred:
         store_coverage = get_store_coverage(var_key)
@@ -152,21 +155,24 @@ def resolve_date_range(
                 f"Please provide start and end dates explicitly."
             )
 
-        if start is None:
-            start = store_coverage.end + pd.Timedelta(days=1)
-        if end is None:
-            end = pd.Timestamp.now().normalize()
+        if start_ts is None:
+            # to_datetime() is a pass-through for datetime inputs; it is here to
+            # pin the result to datetime, which the pandas stubs otherwise widen
+            # with NaT (unreachable — store_coverage.end is always a real date).
+            start_ts = to_datetime(store_coverage.end + pd.Timedelta(days=1))
+        if end_ts is None:
+            end_ts = pd.Timestamp.now().normalize()
 
         logger.info(
             f"Date range in store: {store_coverage.start.date()} -> {store_coverage.end.date()}"
         )
 
-    assert start is not None and end is not None
-    if start > end:
+    assert start_ts is not None and end_ts is not None
+    if start_ts > end_ts:
         if inferred:
             return None
         raise ValueError(
-            f"Invalid date range: start ({start.date()}) > end ({end.date()})"
+            f"Invalid date range: start ({start_ts.date()}) > end ({end_ts.date()})"
         )
 
-    return DateRange(start=start, end=end)
+    return DateRange(start=start_ts, end=end_ts)

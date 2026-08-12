@@ -345,7 +345,9 @@ def _try_append_fast_path(ds_new: xr.Dataset, path: Path) -> bool:
             return False
 
         old_n = ds_old.sizes["time"]
-        chunk_sizes = {dim: sizes[0] for dim, sizes in ds_old.chunksizes.items()}
+        chunk_sizes: dict[str, int] = {
+            str(dim): sizes[0] for dim, sizes in ds_old.chunksizes.items()
+        }
     finally:
         ds_old.close()
 
@@ -363,7 +365,9 @@ def _try_append_fast_path(ds_new: xr.Dataset, path: Path) -> bool:
         time_chunks.append(min(tchunk, remaining))
         remaining -= time_chunks[-1]
 
-    target = {d: c for d, c in chunk_sizes.items() if d != "time" and d in ds_new.dims}
+    target: dict[str, int | tuple[int, ...]] = {
+        d: c for d, c in chunk_sizes.items() if d != "time" and d in ds_new.dims
+    }
     target["time"] = tuple(time_chunks)
     ds_append = ds_new.chunk(target)
     # Stale chunk encodings from whatever store ds_new was read from would
