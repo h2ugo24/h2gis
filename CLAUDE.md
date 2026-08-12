@@ -65,6 +65,10 @@ uv run h2mare compile                                                    # merge
 uv run h2mare parquet                                                    # Zarr → Parquet; dates inferred
 uv run h2mare catalog sst                                                # inspect ZarrCatalog metadata
 
+# Audit the stores for silently-missing days (exits non-zero on findings)
+uv run h2mare audit --all                                                # axis check, whole store, ~1 min
+uv run h2mare audit chl --values --since 2020-01-01                      # also read data for empty days (slow)
+
 # Tests
 uv run pytest tests/
 uv run pytest tests/ -k "test_name"
