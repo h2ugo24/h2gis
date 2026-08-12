@@ -117,8 +117,10 @@ def export_map_zarr(
             tmp = dst_dir / f".tmp_{src.name}"
             if tmp.exists():
                 shutil.rmtree(tmp)
-            # No consolidated metadata: matches the rest of the store, which is
-            # always written plain and read with consolidated=False.
+            # to_zarr writes consolidated metadata (xarray's default, and what
+            # every other write in the pipeline produces). h2mare never reads it
+            # — every open_zarr here passes consolidated=False — but leaving it
+            # costs nothing and makes the external viz app's open cheaper.
             ds.to_zarr(tmp, mode="w")
         finally:
             ds.close()

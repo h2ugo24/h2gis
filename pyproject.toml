@@ -92,6 +92,24 @@ ignore = ["E501"]
 [tool.ruff.format]
 quote-style = "double"
 
+[tool.pytest.ini_options]
+# Two known-benign warnings accounted for every one of the suite's ~207 warnings.
+# Pinning them by message keeps the output meaningful: anything that shows up now
+# is new and worth reading, rather than buried in known noise.
+filterwarnings = [
+    # zarr 3.x warns that consolidated metadata sits outside the Zarr v3 spec.
+    # Every to_zarr() writes it (xarray's default) and every read in h2mare
+    # passes consolidated=False, so we never depend on it; appends re-consolidate,
+    # so it cannot go stale either. Verified against the append path.
+    "ignore:Consolidated metadata is currently not part in the Zarr format 3 specification:zarr.errors.ZarrUserWarning",
+    # netCDF4's Cython extension reports a smaller compile-time ndarray struct
+    # than numpy 2.x provides at runtime. Cython only warns in this direction —
+    # it raises ImportError when the runtime struct is the smaller one — and the
+    # extension round-trips correctly. Drops out once netCDF4 ships a wheel built
+    # against numpy 2.4.
+    "ignore:numpy.ndarray size changed:RuntimeWarning",
+]
+
 [tool.tox]
 legacy_tox_ini = """
 [tox]
