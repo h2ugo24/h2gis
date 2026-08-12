@@ -615,6 +615,47 @@ class TestStoreExists:
         assert v.store_exists is True
 
 
+class TestExpectsStore:
+    """Which absences are news, and which are the normal state of things."""
+
+    class _Src:
+        def __init__(self, source):
+            self.source = source
+
+    def test_a_downloaded_variable_should_have_a_store(self):
+        from h2mare.storage.audit import expects_store
+
+        assert expects_store(self._Src("cmems")) is True
+        assert expects_store(self._Src("aviso")) is True
+        assert expects_store(self._Src("cds")) is True
+
+    def test_a_computed_variable_need_not(self):
+        """`moon` is written straight into h2ds and never gets a directory."""
+        from h2mare.storage.audit import expects_store
+
+        assert expects_store(self._Src("python")) is False
+
+    def test_the_shipped_config_marks_only_derived_keys_as_storeless(self):
+        """Pins the discriminator against the real config: if a downloaded
+        variable ever landed on the storeless side, a wrong STORE_ROOT would
+        stop being reported for it."""
+        import msgspec
+        import yaml
+
+        from h2mare.models import SYSTEM_VAR_KEYS, AppConfig
+        from h2mare.storage.audit import expects_store
+
+        raw = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
+        config = msgspec.convert(
+            {"variables": raw["variables"], "secrets": {}}, AppConfig, strict=False
+        )
+
+        storeless = {
+            key for key, cfg in config.variables.items() if not expects_store(cfg)
+        }
+        assert storeless == SYSTEM_VAR_KEYS
+
+
 class TestShippedKnownGaps:
     """Guard the suppression lists in the tracked config.yaml.
 

@@ -59,11 +59,21 @@ def _print_var_audit(audit, show_all: bool, show_known: bool = False) -> None:
                 typer.echo(f"             {block}")
 
     if not audit.store_exists:
-        # Not a pass: nothing was checked. `moon` is computed at compile time
-        # and has no store, but a missing store is also what a misconfigured
-        # STORE_ROOT or an unmounted drive looks like, and "[OK] 0 file(s)"
-        # would report both as healthy.
-        typer.echo(f"  [SKIP] {audit.var_key:<16} no store directory on disk")
+        # Not a pass either way: nothing was checked. `moon` is computed at
+        # compile time and has no store, which is fine. A *downloaded* variable
+        # without one is not fine — that is what a misconfigured STORE_ROOT or
+        # an unmounted drive looks like — and "[OK] 0 file(s)" would report
+        # both as healthy.
+        if audit.store_expected:
+            typer.echo(
+                f"  [FAIL] {audit.var_key:<16} no store directory on disk "
+                f"({audit.store_root})"
+            )
+        else:
+            typer.echo(
+                f"  [SKIP] {audit.var_key:<16} no store directory "
+                f"(nothing downloads this variable)"
+            )
         return
 
     if audit.ok:
@@ -101,6 +111,35 @@ def _print_var_audit(audit, show_all: bool, show_known: bool = False) -> None:
 
     for error in audit.errors:
         typer.echo(f"    ! {error}")
+
+
+def _scope(keys: list[str], n_checked: int, checks: str, check_parquet: bool) -> str:
+    """
+    Describe what this run actually looked at, for the closing line.
+
+    The verdict has to carry its own scope or it overclaims. "No gaps found"
+    reads as a statement about the store; what was checked may have been one
+    variable, or one variable since 2020, or — when stores are skipped — rather
+    fewer variables than were asked for. Naming the scope is what keeps the
+    pass honest, and it is the last line a scheduled run leaves in a log.
+
+    Which variables fell out of "15 of 16" is not repeated here: every skip
+    already printed its own line, with its own reason, in the body.
+
+    "key variable" rather than "variable" throughout: a var_key such as `eddies`
+    expands to ~15 columns, and a bare count reads as those.
+    """
+    parts: list[str] = []
+    if keys:
+        subject = (
+            f"key variable {keys[0]}"
+            if len(keys) == 1
+            else f"{n_checked} of {len(keys)} key variable(s)"
+        )
+        parts.append(f"{subject}, {checks}")
+    if check_parquet:
+        parts.append("the Parquet store")
+    return " and ".join(parts)
 
 
 def _blocks(dates, max_blocks: int = 12) -> list[str]:
@@ -194,11 +233,21 @@ def audit(
             typer.echo("--since only bounds --values; ignoring it.", err=True)
 
     n_gaps = n_slices = 0
+    n_checked = 0
+    # Counted as findings: a store that should be there and is not, and a
+    # variable whose audit raised. Neither is a pass — nothing was read — and
+    # leaving them at zero is how "No gaps found." could be printed under an
+    # unmounted STORE_ROOT, with exit 0, having opened nothing at all.
+    n_unchecked = 0
+
+    # One description of the checks, used by the opening line and the verdict,
+    # so the two cannot drift into reading like different runs.
+    checks = "axis + value check" if check_values else "axis check"
+    if check_values and value_window:
+        checks += f" since {value_window.start.date()}"
 
     if keys:
-        checks = "axis + value check" if check_values else "axis check"
-        bound = f", values since {value_window.start.date()}" if value_window else ""
-        typer.echo(f"\nAuditing {len(keys)} variable(s) — {checks}{bound}")
+        typer.echo(f"\nAuditing {len(keys)} key variable(s) — {checks}")
         for key in keys:
             try:
                 result = audit_var_key(
@@ -208,9 +257,19 @@ def audit(
                     progress=check_values,
                 )
             except Exception as e:
-                typer.echo(f"  [SKIP] {key:<16} {e}")
+                # Not a skip. The check did not run and nobody knows why, which
+                # is the one outcome that must never read as a clean result.
+                typer.echo(f"  [ERROR] {key:<16} audit could not run: {e}")
+                n_unchecked += 1
                 continue
             _print_var_audit(result, show_ok, show_known)
+            if not result.store_exists:
+                # Either way nothing was read, so this is not one of the
+                # variables the verdict may claim to have checked.
+                if result.store_expected:
+                    n_unchecked += 1
+                continue
+            n_checked += 1
             n_gaps += len(result.gaps)
             # Count the days shown, not the (variable, day) pairs behind them.
             # The display collapses a var_key's columns onto one line, so
@@ -232,12 +291,22 @@ def audit(
         else:
             typer.echo("  [OK]   no wholly-null columns")
 
+    findings += n_unchecked
+    scope = _scope(keys, n_checked, checks, check_parquet)
+
     if findings:
         # Advice per finding type. The two need opposite responses, and a
         # single hardcoded line told anyone looking at a value finding to
         # "re-run the download" — which cannot fix a day the provider never
         # published, and reads as confident while being exactly wrong.
-        typer.echo(f"\n{findings} finding(s).")
+        typer.echo(f"\nChecked {scope} — {findings} finding(s).")
+        if n_unchecked:
+            typer.echo(
+                "  A key variable that could not be checked counts as a "
+                "finding: an absent or unreadable store is not a store that "
+                "passed. Check STORE_ROOT points at the right drive and that "
+                "it is mounted."
+            )
         if n_gaps:
             typer.echo(
                 "  Days absent from the axis are pipeline defects: re-run the "
@@ -252,7 +321,17 @@ def audit(
             )
         raise typer.Exit(code=1)
 
-    typer.echo("\nNo gaps found.")
+    if keys and not n_checked:
+        # Every requested variable was skipped. There is no finding to report
+        # and nothing to report clean either, so say the only true thing. The
+        # per-variable lines above give the reason for each.
+        typer.echo(
+            f"\nNothing was checked — 0 of {len(keys)} key variable(s) "
+            f"had a store on disk."
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(f"\nChecked {scope} — no gaps found.")
 
 
 app.command()(audit)

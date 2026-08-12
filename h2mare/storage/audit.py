@@ -88,6 +88,9 @@ class VarAudit(NamedTuple):
     # empty-but-present store keeps "nothing was checked" from rendering as a
     # pass.
     store_exists: bool = True
+    # Whether a store *should* be there. Read together with store_exists: the
+    # pair separates "correctly has none" from "should have one and doesn't".
+    store_expected: bool = True
 
     @property
     def n_known_gaps(self) -> int:
@@ -100,6 +103,33 @@ class VarAudit(NamedTuple):
     @property
     def ok(self) -> bool:
         return not (self.gaps or self.slices or self.errors)
+
+
+def expects_store(var_config) -> bool:
+    """
+    Whether a missing store directory is news for this variable.
+
+    True when something downloads it. A variable with no registered downloader
+    is produced inside the pipeline — ``moon`` is computed in the compiler and
+    written straight into ``h2ds``, so it never gets a directory of its own —
+    and its absence is not evidence of anything. For a downloaded variable it
+    is: that store holds the only copy of what was fetched, and an absent one
+    means either nothing has ever run or ``STORE_ROOT`` points at the wrong,
+    or unmounted, drive.
+
+    This also treats the other two derived keys, ``bathy`` and ``h2ds``, as not
+    expected — they do have stores, but rebuildable ones, so a missing one says
+    a step has not been run rather than that data was lost. The case that must
+    not pass quietly is a bad ``STORE_ROOT``, and that still trips every
+    downloaded variable at once.
+
+    Imported inside the function because the downloader package reads from
+    ``storage`` (``cds_downloader`` calls ``get_store_coverage``), so a
+    module-level import here would close the cycle.
+    """
+    from h2mare.downloader.registry import DOWNLOADER_REGISTRY
+
+    return getattr(var_config, "source", None) in DOWNLOADER_REGISTRY
 
 
 def known_gap_days(var_config) -> pd.DatetimeIndex:
@@ -395,6 +425,7 @@ def audit_var_key(
         errors=errors,
         known_gaps=suppressed,
         store_exists=root.exists(),
+        store_expected=expects_store(config.variables[var_key]),
     )
 
 

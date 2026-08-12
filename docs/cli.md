@@ -288,6 +288,29 @@ switched off, and then it would protect nothing.
 A store whose tail stops short of today is ordinary provider lag and is never
 flagged; only the interior of a store's own span is checked.
 
+**What the verdict claims**
+
+The closing line names its own scope, because "no gaps found" would otherwise
+read as a statement about the whole store when it may have covered one variable,
+or one variable since 2020:
+
+```
+Auditing 16 key variable(s) — axis check
+  [SKIP] moon             no store directory (nothing downloads this variable)
+
+Checked 15 of 16 key variable(s), axis check — no gaps found.
+```
+
+*Key* variables: a `var_key` such as `eddies` expands to ~15 columns, so a bare
+count would read as those.
+
+A variable that could not be checked is never one of the passes. `moon` is
+computed at compile time and has no store of its own, so it is skipped and does
+not gate. A **downloaded** variable with no store is a finding — that is what an
+unmounted drive or a wrong `STORE_ROOT` looks like, and it would otherwise let
+the command exit 0 having opened nothing at all. So is a variable whose audit
+raised: the check did not run, and nobody knows why.
+
 Days the provider never published are a third case: they leave an axis hole
 that no amount of re-running can fill. Record them in `known_gaps` (see
 [Configuration](configuration.md)) and the audit excludes them, reporting how
