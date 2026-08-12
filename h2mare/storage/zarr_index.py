@@ -18,7 +18,7 @@ import pandas as pd
 from loguru import logger
 
 from h2mare.storage.zarr_scanner import ZarrDirectoryScanner
-from h2mare.types import DateLike, DateRange, TimeResolution
+from h2mare.types import BBox, DateLike, DateRange, TimeResolution
 from h2mare.utils.datetime_utils import normalize_dates
 
 
@@ -374,3 +374,35 @@ class ZarrIndex:
             start=df["start_date"].min(),
             end=df["end_date"].max(),
         )
+
+    def get_store_bbox(self) -> BBox | None:
+        """
+        Union of the geographic extents recorded for the catalogued files.
+
+        This is what the store actually holds, as scanned from each file's
+        lon/lat bounds — distinct from ``ZarrCatalog.get_bbox()``, which
+        reports the bbox *requested* in config.yaml.
+
+        Returns:
+            BBox spanning every file, or None if the catalog is empty, lacks
+            the extent columns, or holds a degenerate extent (a single-cell
+            store, which BBox rejects).
+        """
+        df = self.df
+
+        if df.empty or not {"xmin", "ymin", "xmax", "ymax"} <= set(df.columns):
+            return None
+
+        bounds = (
+            df["xmin"].min(),
+            df["ymin"].min(),
+            df["xmax"].max(),
+            df["ymax"].max(),
+        )
+        if any(pd.isna(b) for b in bounds):
+            return None
+
+        try:
+            return BBox(*(float(b) for b in bounds))
+        except ValueError:
+            return None

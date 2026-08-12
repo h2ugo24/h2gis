@@ -400,9 +400,23 @@ class ZarrCatalog:
         """Get overall time coverage across all files."""
         return self._index.get_time_coverage()
 
+    def get_store_bbox(self) -> BBox | None:
+        """
+        Geographic extent the store actually holds, unioned across its files.
+
+        Unlike :meth:`get_bbox` — which reports the bbox *requested* in
+        config.yaml — this comes from the lon/lat bounds scanned out of each
+        Zarr file, so it shows what was really written (a source delivering a
+        wider or coarser grid than requested shows up here).
+        """
+        return self._index.get_store_bbox()
+
     def get_bbox(self) -> BBox | None:
         """
-        Get overall geographic extent (bbox) across all files.
+        Get the configured geographic extent (bbox) for this variable.
+
+        This is the requested extent from config.yaml, not what the files
+        contain — see :meth:`get_store_bbox` for that.
         """
         bbox = self.var_config.bbox
         if bbox is None:
@@ -425,6 +439,7 @@ class ZarrCatalog:
                 "num_files": 0,
                 "time_coverage": None,
                 "bbox": "No data",
+                "store_bbox": None,
                 "period": self.time_resolution,
                 "variables": set(),
                 "total_timesteps": 0,
@@ -440,6 +455,7 @@ class ZarrCatalog:
             "num_files": df["path"].nunique(),
             "time_coverage": time_cov if time_cov is not None else "No data",
             "bbox": bbox if bbox is not None else "No data",
+            "store_bbox": self.get_store_bbox(),
             "period": self.time_resolution,
             "variables": self.get_variables(),
             "total_timesteps": (

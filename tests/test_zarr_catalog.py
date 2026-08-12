@@ -408,6 +408,64 @@ class TestGetBbox:
 
 
 # ---------------------------------------------------------------------------
+# get_store_bbox
+# ---------------------------------------------------------------------------
+
+
+def _df_with_extent(rows: Sequence[tuple[float, float, float, float]]) -> pd.DataFrame:
+    """Catalog df carrying only what the extent union reads."""
+    return pd.DataFrame(
+        [
+            {"path": f"f{i}.zarr", "xmin": x0, "ymin": y0, "xmax": x1, "ymax": y1}
+            for i, (x0, y0, x1, y1) in enumerate(rows)
+        ]
+    )
+
+
+class TestGetStoreBbox:
+    def test_returns_none_for_an_empty_catalog(self, tmp_path):
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = pd.DataFrame()
+        assert catalog.get_store_bbox() is None
+
+    def test_unions_the_extents_of_every_file(self, tmp_path):
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _df_with_extent(
+            [(-10.0, 30.0, 0.0, 40.0), (-5.0, 25.0, 10.0, 35.0)]
+        )
+        assert catalog.get_store_bbox() == BBox(-10.0, 25.0, 10.0, 40.0)
+
+    def test_reports_the_store_not_the_configured_bbox(self, tmp_path):
+        # The point of the method: config says what was asked for, the files
+        # say what arrived. A wider store must not be reported as the request.
+        catalog = _make_catalog(tmp_path)
+        catalog.var_config.bbox = BBox(-10.0, 30.0, 0.0, 40.0)
+        catalog._index._df_cache = _df_with_extent([(-20.0, 20.0, 10.0, 50.0)])
+
+        assert catalog.get_store_bbox() == BBox(-20.0, 20.0, 10.0, 50.0)
+        assert catalog.get_bbox() == BBox(-10.0, 30.0, 0.0, 40.0)
+
+    def test_returns_none_when_the_extent_columns_are_absent(self, tmp_path):
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _df_for_zarr(
+            tmp_path / "h2ds_2026.zarr", ["sst"], "2026-05-15"
+        )
+        assert catalog.get_store_bbox() is None
+
+    def test_returns_none_for_a_degenerate_extent(self, tmp_path):
+        # A single-cell store has xmin == xmax, which BBox rejects; the
+        # inspector must degrade to "unknown" rather than raise.
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _df_with_extent([(0.0, 0.0, 0.0, 0.0)])
+        assert catalog.get_store_bbox() is None
+
+    def test_returns_none_when_extents_are_nan(self, tmp_path):
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _df_with_extent([(float("nan"), 30.0, 0.0, 40.0)])
+        assert catalog.get_store_bbox() is None
+
+
+# ---------------------------------------------------------------------------
 # Catalog cache semantics (_df_cache / auto_refresh)
 #
 # Characterization tests over ZarrIndex, driven through the ZarrCatalog facade
