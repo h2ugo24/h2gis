@@ -2,9 +2,26 @@
 Classes representing Data models for spatial and variable configurations.
 """
 
+from enum import Enum
 from typing import Optional
 
 import msgspec
+
+
+class TimeStep(str, Enum):
+    """
+    Native cadence of a variable's stored Zarr — how far apart its time steps are.
+
+    Distinct from :class:`h2mare.types.TimeResolution`, which selects the *file*
+    period a store is split into (one Zarr per year or per month). A store can be
+    hourly and still be written one file per year.
+
+    Also distinct from ``expect_daily``, which asks whether the axis is allowed to
+    skip a day, not how finely it is sampled.
+    """
+
+    DAILY = "daily"
+    HOURLY = "hourly"
 
 
 class KeyVarConfigEntry(msgspec.Struct):
@@ -92,6 +109,15 @@ class KeyVarConfigEntry(msgspec.Struct):
     # of anything. This is about the *axis*, not the values: a day present but
     # entirely null is a source gap and is deliberately not flagged.
     expect_daily: bool = True
+    # Cadence of this variable's stored Zarr. DAILY (the default, and what every
+    # existing store is) means one step per calendar day. HOURLY keeps the
+    # source's sub-daily axis instead of aggregating it away at convert time —
+    # for ERA5 that preserves the native resolution the raw GRIB already has.
+    #
+    # Read paths normalize a DAILY store's stamps to midnight (sources often
+    # publish at 12:00); doing that to an HOURLY store would collapse 24 steps
+    # onto one timestamp, so the normalization is skipped for it.
+    time_step: TimeStep = TimeStep.DAILY
     # Days the provider never published, which therefore cannot be downloaded,
     # converted or backfilled. Each entry is either "YYYY-MM-DD" or a closed
     # interval "YYYY-MM-DD/YYYY-MM-DD".

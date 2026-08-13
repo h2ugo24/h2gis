@@ -15,6 +15,7 @@ import pandas as pd
 import xarray as xr
 from loguru import logger
 
+from h2mare.models import TimeStep
 from h2mare.storage.zarr_index import ZarrIndex
 from h2mare.types import BBox, DateLike, DateRange
 from h2mare.utils.datetime_utils import normalize_dates
@@ -274,19 +275,42 @@ class ZarrReader:
 
     def _normalize_time(self, ds: xr.Dataset) -> xr.Dataset:
         """
-        Normalize time coordinates to midnight (00:00:00).
+        Normalize time coordinates to midnight (00:00:00), for daily stores only.
+
+        Daily products are often published stamped at 12:00, and callers select
+        by calendar day, so snapping to midnight is what makes ``sel`` and the
+        date bookkeeping line up.
+
+        Skipped for an ``HOURLY`` store: there the sub-daily stamps *are* the
+        data, and snapping them would map all 24 steps of a day onto one
+        timestamp — 8784 steps collapsing to 366 duplicated stamps for a year,
+        silently and without error.
 
         Args:
             ds: Dataset with time coordinate
 
         Returns:
-            Dataset with normalized time
+            Dataset with normalized time, or *ds* unchanged for an hourly store.
         """
         if "time" not in ds.coords:
             return ds
 
+        if self._time_step is TimeStep.HOURLY:
+            return ds
+
         normalized_time = pd.to_datetime(ds["time"].values).normalize()
         return ds.assign_coords(time=normalized_time)
+
+    @property
+    def _time_step(self) -> TimeStep:
+        """
+        Configured cadence for this store, defaulting to DAILY.
+
+        Read from the index's ``var_config`` rather than global settings so an
+        injected ``app_config`` is honoured. Defaults when the entry is a
+        stand-in without the field, keeping config-free reads on the old path.
+        """
+        return getattr(self._index.var_config, "time_step", TimeStep.DAILY)
 
     def _preprocess_dataset(
         self,
