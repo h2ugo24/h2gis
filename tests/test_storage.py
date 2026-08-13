@@ -521,7 +521,7 @@ class TestOverlapResolution:
 
 
 # ---------------------------------------------------------------------------
-# Sub-daily (hourly) axes — the rewrite path is not sub-daily safe
+# Sub-daily (hourly) axes — the rewrite path resolves boundaries by instant
 # ---------------------------------------------------------------------------
 
 
@@ -548,38 +548,57 @@ def _noon_ds(start: str, n_days: int, seed: int = 0) -> xr.Dataset:
     return ds.assign_coords(time=ds.time.to_index() + pd.Timedelta(hours=12))
 
 
-class TestSubDailyRewriteGuard:
+class TestSubDailyRewrite:
     """
-    The overlap-rewrite path resolves its retained head and tail in whole days
-    (``_resolve_overlap`` via a normalizing DateRange, and a ``new_end + 1 day``
-    tail slice). On an hourly axis that silently deletes 23 steps per boundary,
-    so an overlapping write must be refused rather than performed.
+    The overlap rewrite resolves its retained head and tail by *instant*, not by
+    whole day. Day-granular boundaries used to delete 23 steps per boundary on
+    an hourly axis — silently, since the surviving values were all correct.
     """
 
-    def test_overlapping_subdaily_write_is_refused(self, tmp_path):
+    def test_overlapping_subdaily_write_keeps_every_step(self, tmp_path):
         path = tmp_path / "sst.zarr"
         write_append_zarr("sst", _make_hourly_ds("2020-01-01", n_hours=96), path)
 
         # Overlaps the middle of the stored window — the rewrite path.
-        with pytest.raises(ValueError, match="sub-daily"):
-            write_append_zarr("sst", _make_hourly_ds("2020-01-02", n_hours=48), path)
-
-    def test_refusal_leaves_the_store_intact(self, tmp_path):
-        """The guard must fire before any destructive work."""
-        path = tmp_path / "sst.zarr"
-        write_append_zarr("sst", _make_hourly_ds("2020-01-01", n_hours=96), path)
-
-        with pytest.raises(ValueError, match="sub-daily"):
-            write_append_zarr("sst", _make_hourly_ds("2020-01-02", n_hours=48), path)
+        write_append_zarr("sst", _make_hourly_ds("2020-01-02", n_hours=48), path)
 
         ds = xr.open_zarr(path, consolidated=False)
         times = pd.DatetimeIndex(ds.time.values)
-        assert len(times) == 96, "store was modified despite the refusal"
-        assert times.is_unique
+        ds.close()
+        expected = pd.date_range("2020-01-01", periods=96, freq="h")
+        assert times.is_unique and times.is_monotonic_increasing
+        assert len(times) == 96, f"lost {96 - len(times)} step(s)"
+        assert list(times) == list(expected)
+
+    def test_overlapping_subdaily_write_keeps_the_tail(self, tmp_path):
+        """Stored steps later the same day as the incoming end must survive."""
+        path = tmp_path / "sst.zarr"
+        write_append_zarr("sst", _make_hourly_ds("2020-01-01", n_hours=96), path)
+        # Ends mid-day (Jan 2 11:00), so the tail resumes at Jan 2 12:00.
+        write_append_zarr("sst", _make_hourly_ds("2020-01-02", n_hours=12), path)
+
+        ds = xr.open_zarr(path, consolidated=False)
+        times = pd.DatetimeIndex(ds.time.values)
+        ds.close()
+        assert len(times) == 96
+        assert pd.Timestamp("2020-01-02 12:00") in times
+
+    def test_incoming_wins_inside_its_window(self, tmp_path):
+        """Merge semantics are unchanged: incoming data wins where it has rows."""
+        path = tmp_path / "sst.zarr"
+        write_append_zarr("sst", _make_hourly_ds("2020-01-01", n_hours=96), path)
+        incoming = _make_hourly_ds("2020-01-02", n_hours=48, seed=7)
+        write_append_zarr("sst", incoming, path)
+
+        ds = xr.open_zarr(path, consolidated=False)
+        np.testing.assert_allclose(
+            ds.sst.sel(time="2020-01-02T05:00").values,
+            incoming.sst.sel(time="2020-01-02T05:00").values,
+        )
         ds.close()
 
     def test_subdaily_strictly_after_append_still_works(self, tmp_path):
-        """The fast path is sub-daily safe, so the guard must not fire on it."""
+        """The fast path stays in play for a clean trailing append."""
         path = tmp_path / "sst.zarr"
         write_append_zarr("sst", _make_hourly_ds("2020-01-01", n_hours=48), path)
         write_append_zarr(
@@ -593,7 +612,7 @@ class TestSubDailyRewriteGuard:
         ds.close()
 
     def test_daily_overlap_is_unaffected(self, tmp_path):
-        """Daily merge semantics are deliberate — the guard must not touch them."""
+        """Daily merge semantics are deliberate and must not move."""
         path = tmp_path / "sst.zarr"
         write_append_zarr("sst", _make_ds("2020-01-01", n_days=10), path)
         write_append_zarr("sst", _make_ds("2020-01-05", n_days=5, seed=1), path)
@@ -604,28 +623,12 @@ class TestSubDailyRewriteGuard:
         assert times.is_unique
         ds.close()
 
-    def test_noon_stamped_daily_store_is_not_treated_as_subdaily(self, tmp_path):
-        """
-        One step per day at 12:00 is daily, not sub-daily, so the guard must not
-        fire on it — noon-stamped products are common and the daily merge path
-        is the intended one for them.
-        """
-        path = tmp_path / "sst.zarr"
-        write_append_zarr("sst", _noon_ds("2020-01-01", 10), path)
-
-        # Must not raise: this is a daily axis, whatever its time-of-day stamp.
-        write_append_zarr("sst", _noon_ds("2020-01-05", 5, seed=1), path)
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Pre-existing, separate from the sub-daily guard: _resolve_overlap "
-            "compares normalized DateRanges, so the head is cut at midnight and "
-            "a noon-stamped store loses the day before the incoming window. "
-            "Fixing it needs half-open windowing, not a refusal."
-        ),
-    )
     def test_noon_stamped_daily_overlap_keeps_every_day(self, tmp_path):
+        """
+        Regression for a defect the instant-based boundaries also fix: with a
+        normalized head cutoff, a noon-stamped store lost the day before the
+        incoming window (2020-01-04T12:00 fell after the midnight cutoff).
+        """
         path = tmp_path / "sst.zarr"
         write_append_zarr("sst", _noon_ds("2020-01-01", 10), path)
         write_append_zarr("sst", _noon_ds("2020-01-05", 5, seed=1), path)
