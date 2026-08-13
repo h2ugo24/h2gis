@@ -724,3 +724,77 @@ class TestRootAttrsSurviveAppend:
         ds = xr.open_zarr(path)
         assert len(ds.time) == 10
         ds.close()
+
+
+# ---------------------------------------------------------------------------
+# int16 store encoding (opt-in)
+# ---------------------------------------------------------------------------
+
+
+class TestInt16Encoding:
+    """Packing is opt-in and must survive both append paths."""
+
+    @staticmethod
+    def _on_disk_dtype(path, var="sst"):
+        import zarr
+
+        return zarr.open_group(str(path), mode="r")[var].dtype
+
+    def test_default_write_is_unchanged(self, tmp_path):
+        path = tmp_path / "sst.zarr"
+        write_append_zarr("sst", _make_ds("2020-01-01", 5), path)
+        assert self._on_disk_dtype(path) == np.dtype("float64")
+
+    def test_encoding_is_applied_on_first_write(self, tmp_path):
+        from h2mare.storage.xarray_helpers import int16_encoding
+
+        path = tmp_path / "sst.zarr"
+        ds = _make_ds("2020-01-01", 5)
+        write_append_zarr("sst", ds, path, encoding=int16_encoding(ds))
+        assert self._on_disk_dtype(path) == np.dtype("int16")
+
+    def test_values_survive_the_round_trip(self, tmp_path):
+        from h2mare.storage.xarray_helpers import int16_encoding
+
+        path = tmp_path / "sst.zarr"
+        ds = _make_ds("2020-01-01", 5)
+        write_append_zarr("sst", ds, path, encoding=int16_encoding(ds))
+
+        back = xr.open_zarr(path, consolidated=False)
+        err = float(np.abs(back.sst - ds.sst).max())
+        rng = float(ds.sst.max() - ds.sst.min())
+        back.close()
+        assert err / rng < 1e-4, f"quantisation error too large: {err}"
+
+    def test_encoding_survives_a_strictly_after_append(self, tmp_path):
+        from h2mare.storage.xarray_helpers import int16_encoding
+
+        path = tmp_path / "sst.zarr"
+        ds = _make_ds("2020-01-01", 5)
+        write_append_zarr("sst", ds, path, encoding=int16_encoding(ds))
+        write_append_zarr("sst", _make_ds("2020-01-06", 5, seed=1), path)
+
+        assert self._on_disk_dtype(path) == np.dtype("int16")
+        back = xr.open_zarr(path, consolidated=False)
+        assert back.sizes["time"] == 10
+        back.close()
+
+    def test_encoding_survives_an_overlapping_rewrite(self, tmp_path):
+        from h2mare.storage.xarray_helpers import int16_encoding
+
+        path = tmp_path / "sst.zarr"
+        ds = _make_ds("2020-01-01", 10)
+        write_append_zarr("sst", ds, path, encoding=int16_encoding(ds))
+        write_append_zarr("sst", _make_ds("2020-01-05", 5, seed=1), path)
+
+        assert self._on_disk_dtype(path) == np.dtype("int16"), (
+            "the rewrite path dropped the packing"
+        )
+
+    def test_degenerate_variable_is_left_alone(self, tmp_path):
+        """A constant field has no range to scale, so packing is skipped."""
+        from h2mare.storage.xarray_helpers import int16_encoding
+
+        ds = _make_ds("2020-01-01", 3)
+        ds["sst"] = ds["sst"] * 0 + 7.0
+        assert int16_encoding(ds) == {}

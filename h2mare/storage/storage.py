@@ -55,6 +55,7 @@ def write_append_zarr(
     var_key: str,
     ds: xr.Dataset,
     path: Path,
+    encoding: Optional[dict] = None,
 ) -> None:
     """
     Write dataset, checking temporal overlap and appending data if path exists.
@@ -63,6 +64,10 @@ def write_append_zarr(
         var_key: Variable key, must exist in app_config.variables (used for overlap resolution)
         ds: New dataset to write/append
         path: Destination zarr path, built by the caller via ``ZarrCatalog.build_file_path()``
+        encoding: Per-variable zarr encoding, applied only when *path* does not
+            exist yet. An existing store keeps the encoding it was created with:
+            appends inherit it from disk, and passing one to an append is an
+            error. None (the default) writes exactly what it always has.
     """
     # Canonicalize grid labels before any write/append so float-noise drift —
     # between a source's reprocessed periods, or between new data and a legacy
@@ -106,7 +111,7 @@ def write_append_zarr(
         tmp_path = path.with_name(path.name + ".tmp")
         shutil.rmtree(tmp_path, ignore_errors=True)
         try:
-            ds.to_zarr(tmp_path)
+            ds.to_zarr(tmp_path, encoding=encoding or None)
             xr.open_zarr(tmp_path, consolidated=False).close()
         except Exception as e:
             shutil.rmtree(tmp_path, ignore_errors=True)

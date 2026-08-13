@@ -18,7 +18,7 @@ from loguru import logger
 
 from h2mare.config import AppConfig, get_settings
 from h2mare.format_converters.base import BaseConverter
-from h2mare.models import step_freq
+from h2mare.models import StoreDtype, step_freq
 from h2mare.processing.registry import PROCESSORS
 from h2mare.storage.audit import format_date_blocks, known_gap_days
 from h2mare.storage.provenance import (
@@ -28,7 +28,12 @@ from h2mare.storage.provenance import (
 )
 from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
-from h2mare.storage.xarray_helpers import chunk_dataset, rename_dims, snap_grid_coords
+from h2mare.storage.xarray_helpers import (
+    chunk_dataset,
+    int16_encoding,
+    rename_dims,
+    snap_grid_coords,
+)
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import DateLike, DateRange, TimeResolution
 from h2mare.utils.datetime_utils import normalize_date
@@ -198,6 +203,17 @@ class Netcdf2Zarr(BaseConverter):
 
         self.catalog = ZarrCatalog(self.var_key, store_root=store_root)
         self.store_root = self.catalog.store_root
+
+    def _encoding(self, ds: xr.Dataset) -> Optional[dict]:
+        """
+        Encoding for a store being created, or None to write as always.
+
+        Only consulted on a first write: write_append_zarr ignores it when the
+        path exists, because an append inherits the store's own encoding.
+        """
+        if self.var_config.store_dtype is not StoreDtype.INT16:
+            return None
+        return int16_encoding(ds)
 
     @property
     def _step_freq(self) -> str:
@@ -634,7 +650,7 @@ class Netcdf2Zarr(BaseConverter):
             path = self.catalog.build_file_path(ds, self.date_format)
             # Read the axis before the write: write_append_zarr closes ds.
             written = _dataset_dates(ds, self._step_freq)
-            write_append_zarr(self.var_key, ds, path)
+            write_append_zarr(self.var_key, ds, path, encoding=self._encoding(ds))
             # Deliberately before _archive_raw_files and _cleanup_period_files:
             # a failure here must leave the raw files where they are, so the
             # period can simply be re-converted once the gap is understood.

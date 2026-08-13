@@ -16,7 +16,7 @@ import pandas as pd
 import xarray as xr
 from loguru import logger
 
-from h2mare.models import TimeStep
+from h2mare.models import StoreDtype, TimeStep
 from h2mare.storage.zarr_index import ZarrIndex
 from h2mare.types import BBox, DateLike, DateRange
 from h2mare.utils.datetime_utils import normalize_date, normalize_dates
@@ -185,7 +185,7 @@ class ZarrReader:
             raise RuntimeError(f"Failed to open zarr files: {e}") from e
 
         # Normalize time coordinates
-        ds = self._normalize_time(ds)
+        ds = self._undo_decode_widening(self._normalize_time(ds))
 
         # Select only requested dates
         requested_dates = pd.DatetimeIndex(date_list).normalize()
@@ -289,7 +289,7 @@ class ZarrReader:
             raise RuntimeError(f"Failed to open zarr files: {e}") from e
 
         # Normalize time
-        ds = self._normalize_time(ds)
+        ds = self._undo_decode_widening(self._normalize_time(ds))
 
         # Select time range. `end` names a calendar day, so the window runs to
         # the *end* of that day, not to its midnight stamp: an inclusive slice
@@ -325,6 +325,26 @@ class ZarrReader:
 
         normalized_time = pd.to_datetime(ds["time"].values).normalize()
         return ds.assign_coords(time=normalized_time)
+
+    def _undo_decode_widening(self, ds: xr.Dataset) -> xr.Dataset:
+        """
+        Bring an int16 store's variables back to float32 after CF decoding.
+
+        scale_factor/add_offset decoding promotes to float64 regardless of the
+        stored dtype — zarr attributes round-trip through JSON, so the scale
+        loses its own dtype on the way out. Left alone, an int16 store would cost
+        twice the memory of the float32 one it replaced. Only applied to stores
+        declared int16, so nothing else is touched.
+        """
+        cfg = self._index.var_config
+        if getattr(cfg, "store_dtype", None) is not StoreDtype.INT16:
+            return ds
+        casts = {
+            name: da.astype("float32")
+            for name, da in ds.data_vars.items()
+            if da.dtype == "float64"
+        }
+        return ds.assign(casts) if casts else ds
 
     @property
     def _time_step(self) -> TimeStep:

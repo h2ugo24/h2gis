@@ -24,6 +24,23 @@ class TimeStep(str, Enum):
     HOURLY = "hourly"
 
 
+class StoreDtype(str, Enum):
+    """
+    On-disk encoding for a variable's Zarr.
+
+    ``FLOAT32`` (the default) writes what the pipeline has always written and is
+    byte-identical to it. ``INT16`` stores scale/offset-packed integers instead,
+    matching the ~16-bit packing ERA5's GRIB already uses — so it discards
+    quantisation noise rather than signal, at roughly two thirds the size.
+
+    Opt-in per variable: a store keeps whatever encoding it was created with,
+    and appends inherit it.
+    """
+
+    FLOAT32 = "float32"
+    INT16 = "int16"
+
+
 def step_freq(var_config) -> str:
     """
     Pandas frequency alias matching a variable's cadence — ``"h"`` or ``"D"``.
@@ -132,6 +149,10 @@ class KeyVarConfigEntry(msgspec.Struct):
     # publish at 12:00); doing that to an HOURLY store would collapse 24 steps
     # onto one timestamp, so the normalization is skipped for it.
     time_step: TimeStep = TimeStep.DAILY
+    # On-disk encoding. Default writes exactly what it always has; INT16 packs
+    # to scale/offset integers (see StoreDtype). Only consulted when a store is
+    # first created — an existing store keeps its own encoding through appends.
+    store_dtype: StoreDtype = StoreDtype.FLOAT32
     # Days the provider never published, which therefore cannot be downloaded,
     # converted or backfilled. Each entry is either "YYYY-MM-DD" or a closed
     # interval "YYYY-MM-DD/YYYY-MM-DD".
