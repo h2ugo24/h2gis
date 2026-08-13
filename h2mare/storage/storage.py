@@ -136,6 +136,40 @@ def _restore_orphaned_backup(path: Path) -> None:
         shutil.move(str(backup_path), str(path))
 
 
+def _is_subdaily(times: Optional[pd.DatetimeIndex]) -> bool:
+    """
+    True when *times* carries more than one step per calendar day.
+
+    Deliberately not "any non-midnight stamp": daily products stamped at 12:00
+    are common and supported (see the noon-stamped store in
+    ``tests/test_zarr_catalog.py``), and whole-day arithmetic handles them
+    correctly. Only genuine sub-daily sampling breaks the rewrite path.
+    """
+    if times is None or len(times) < 2:
+        return False
+    unique = times.unique()
+    return len(unique) > len(unique.normalize().unique())
+
+
+def _reject_subdaily_rewrite(
+    old_times: Optional[pd.DatetimeIndex], ds_new: xr.Dataset, path: Path
+) -> None:
+    """Refuse an overlap rewrite when either side is sub-daily (see the caller)."""
+    new_times = (
+        pd.DatetimeIndex(ds_new.time.values) if "time" in ds_new.coords else None
+    )
+    if not (_is_subdaily(old_times) or _is_subdaily(new_times)):
+        return
+    raise ValueError(
+        f"Refusing to rewrite {path.name}: the incoming window overlaps stored "
+        "data and at least one side has a sub-daily time axis. The overlap merge "
+        "resolves its retained head and tail in whole days, so it would silently "
+        "drop the sub-daily steps either side of the rewritten window (23 hours "
+        "per boundary on hourly data). Delete the affected period and write it "
+        "fresh instead — fresh writes and strictly-after appends are sub-daily safe."
+    )
+
+
 def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
     """
     Append new data to existing zarr file, handling two distinct cases:
@@ -188,6 +222,9 @@ def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
         # redundant open handle (zarr stores are lazy so this is safe).
         missing_vars = sorted(ds_old_vars - ds_new_vars)
         old_chunk_sizes = {dim: sizes[0] for dim, sizes in ds_old.chunksizes.items()}
+        old_times = (
+            pd.DatetimeIndex(ds_old.time.values) if "time" in ds_old.coords else None
+        )
         ds_old.close()
 
         # Clean trailing append (same vars, same grid, strictly after the
@@ -195,6 +232,15 @@ def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
         # path would otherwise copy ~a full year of data per incremental run.
         if _try_append_fast_path(ds_new, path):
             return None
+
+        # Past the fast path this is a rewrite, and the rewrite resolves what to
+        # retain in whole days: _resolve_overlap compares DateRanges (which
+        # normalize to midnight) for the head, and the tail slice below starts at
+        # new_end + 1 day. On a sub-daily axis both round away the steps either
+        # side of the rewritten window — measured at 23 hours per boundary on
+        # hourly data — and nothing reports it. Refuse rather than delete data
+        # the caller cannot see go missing.
+        _reject_subdaily_rewrite(old_times, ds_new, path)
 
         ds_resolved = _resolve_overlap(ds_new, path)
 
