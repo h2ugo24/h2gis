@@ -76,6 +76,28 @@ class TestInteriorGaps:
         dropped = _JAN.drop(pd.date_range("2020-01-04", "2020-01-07"))
         assert len(interior_gaps(dropped)) == 4
 
+    def test_hourly_freq_finds_a_missing_hour(self):
+        """An hourly store's gaps are hours; the daily grid cannot see them."""
+        hours = pd.date_range("2020-01-01", periods=48, freq="h")
+        dropped = hours.drop(pd.Timestamp("2020-01-01 07:00"))
+
+        assert list(interior_gaps(dropped, freq="h")) == [
+            pd.Timestamp("2020-01-01 07:00")
+        ]
+        # The same axis on a daily grid: the day is still present, so nothing
+        # is reported — which is exactly why the cadence has to be passed in.
+        assert len(interior_gaps(dropped, freq="D")) == 0
+
+    def test_hourly_freq_does_not_invent_gaps_in_a_complete_axis(self):
+        hours = pd.date_range("2020-01-01", periods=48, freq="h")
+        assert len(interior_gaps(hours, freq="h")) == 0
+
+    def test_daily_axis_on_the_daily_grid_is_unchanged(self):
+        """Default stays daily, so existing callers keep their behaviour."""
+        assert list(interior_gaps(_JAN.drop(pd.Timestamp("2020-01-05")))) == [
+            pd.Timestamp("2020-01-05")
+        ]
+
     def test_single_date_is_never_a_gap(self):
         assert len(interior_gaps(pd.DatetimeIndex(["2020-01-01"]))) == 0
 

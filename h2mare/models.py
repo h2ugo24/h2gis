@@ -24,6 +24,20 @@ class TimeStep(str, Enum):
     HOURLY = "hourly"
 
 
+def step_freq(var_config) -> str:
+    """
+    Pandas frequency alias matching a variable's cadence — ``"h"`` or ``"D"``.
+
+    Used by the gap checks so they compare a store against a calendar at its own
+    resolution: a daily grid cannot see a missing hour, and an hourly grid built
+    for a daily store would report 23 phantom gaps per day.
+
+    Takes any object with a ``time_step`` attribute and defaults to daily, so
+    stand-in configs and entries predating the field keep the old behaviour.
+    """
+    return "h" if getattr(var_config, "time_step", None) is TimeStep.HOURLY else "D"
+
+
 class KeyVarConfigEntry(msgspec.Struct):
     """Configuration for a single Key variable/dataset."""
 
