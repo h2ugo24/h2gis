@@ -487,6 +487,12 @@ def uv_to_direction(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
     direction has to go through the components: degrees wrap, so the arithmetic
     mean of 350° and 10° is 180° — the opposite heading — and a linear
     interpolation between them sweeps the long way round.
+
+    Known and accepted: when the averaged directions nearly cancel, the
+    resultant approaches zero and this returns 0° (north) rather than "no
+    coherent direction". Rare for real swell, and the alternatives — nulling
+    below a resultant-length threshold, or carrying the length as a coherence
+    column — both change what downstream sees, so the convention stands.
     """
     return np.rad2deg(np.arctan2(v, u)) % 360
 
