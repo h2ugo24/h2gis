@@ -479,6 +479,18 @@ def add_engineered_ekman(da: xr.DataArray, var_key: str):
 # ----------------
 # ---- Waves ----
 # ----------------
+def uv_to_direction(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
+    """
+    Recombine unit-vector components into a direction in degrees (0–360).
+
+    Inverse of :func:`direction_to_uv`. Any averaging or interpolation of a
+    direction has to go through the components: degrees wrap, so the arithmetic
+    mean of 350° and 10° is 180° — the opposite heading — and a linear
+    interpolation between them sweeps the long way round.
+    """
+    return np.rad2deg(np.arctan2(v, u)) % 360
+
+
 def direction_to_uv(da: xr.DataArray) -> xr.Dataset:
     """
     Convert directional variable (degrees) into vector components.
@@ -542,15 +554,15 @@ def daily_waves(
     if time_dim not in ds.dims:
         raise ValueError(f"Dataset does not have dimension '{time_dim}'")
 
-    da_h = ds[swell_height_name]
-    da_d = ds[swell_direction_name]
-    out = xr.Dataset(
-        {
-            swell_height_name: da_h,  # .resample({time_dim: "1D"}).mean(),
-            swell_direction_name: da_d,  # .resample({time_dim: "1D"}).mean()
-        }
+    # Height is a magnitude and averages directly. Direction does not: it is
+    # degrees on a circle, so the daily mean is taken over unit vectors and
+    # recombined. A plain mean of 350° and 10° gives 180°, the opposite heading.
+    out = resample_daily_mean(xr.Dataset({swell_height_name: ds[swell_height_name]}))
+    components = (
+        direction_to_uv(ds[swell_direction_name]).resample({time_dim: "1D"}).mean()
     )
-    out = resample_daily_mean(out)
+    out[swell_direction_name] = uv_to_direction(components["u_ts"], components["v_ts"])
+    out[swell_direction_name].attrs.update(ds[swell_direction_name].attrs)
     out.attrs.update(ds.attrs)
     return drop_dims(out)
 

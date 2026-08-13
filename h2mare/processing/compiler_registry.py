@@ -168,14 +168,28 @@ def _compile_waves(
     happens here — through the same ``daily_waves`` the daily path has always
     used, so both cadences yield identical h2ds columns.
     """
-    from h2mare.processing.core.cds import daily_waves
+    from h2mare.processing.core.cds import (
+        daily_waves,
+        direction_to_uv,
+        uv_to_direction,
+    )
 
     ds = _open_or_warn(catalog, "waves", date_range, compiler.var_config.bbox)
     if ds is None:
         return None
     if step_freq(compiler.app_config.variables["waves"]) == "h":
         ds = daily_waves(ds)
-    return ds.interp_like(compiler.base_grid, method="linear", assume_sorted=True)
+
+    # mdts is a direction in degrees, so it cannot be regridded by a weighted
+    # average: interpolating between 350° and 10° sweeps the long way round and
+    # lands on 180°. Interpolate the unit-vector components instead, then
+    # recombine. swh is a magnitude and interpolates directly.
+    components = direction_to_uv(ds["mdts"])
+    to_interp = ds[["swh"]].assign(u_ts=components["u_ts"], v_ts=components["v_ts"])
+    out = to_interp.interp_like(compiler.base_grid, method="linear", assume_sorted=True)
+    out["mdts"] = uv_to_direction(out["u_ts"], out["v_ts"])
+    out["mdts"].attrs.update(ds["mdts"].attrs)
+    return out.drop_vars(["u_ts", "v_ts"])
 
 
 def _compile_sst(
