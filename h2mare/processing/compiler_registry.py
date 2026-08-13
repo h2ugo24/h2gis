@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from h2mare.models import step_freq
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import DateRange
 from h2mare.utils.spatial import clip_land_data
@@ -155,6 +156,28 @@ def _compile_atm_accum_avg(
     return ds.interp_like(compiler.base_grid, method="linear", assume_sorted=True)
 
 
+def _compile_waves(
+    compiler: Compiler,
+    catalog: ZarrCatalog | None,
+    date_range: DateRange,
+) -> xr.Dataset | None:
+    """
+    h2ds stays daily whatever cadence the waves store is kept at.
+
+    With ``time_step: hourly`` the convert step leaves the resample undone, so it
+    happens here — through the same ``daily_waves`` the daily path has always
+    used, so both cadences yield identical h2ds columns.
+    """
+    from h2mare.processing.core.cds import daily_waves
+
+    ds = _open_or_warn(catalog, "waves", date_range, compiler.var_config.bbox)
+    if ds is None:
+        return None
+    if step_freq(compiler.app_config.variables["waves"]) == "h":
+        ds = daily_waves(ds)
+    return ds.interp_like(compiler.base_grid, method="linear", assume_sorted=True)
+
+
 def _compile_sst(
     compiler: Compiler,
     catalog: ZarrCatalog | None,
@@ -211,4 +234,5 @@ COMPILE_PROCESSORS: dict[str, CompileProcessor] = {
     "thetao": _compile_depth_var,
     "atm-accum-avg": _compile_atm_accum_avg,
     "sst": _compile_sst,
+    "waves": _compile_waves,
 }

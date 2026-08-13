@@ -15,7 +15,7 @@ import xarray as xr
 from loguru import logger
 
 from h2mare import get_settings
-from h2mare.models import KeyVarConfigEntry
+from h2mare.models import KeyVarConfigEntry, step_freq
 from h2mare.storage.xarray_helpers import rename_dims, unified_time_chunk
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.utils.spatial import clip_land_data
@@ -610,13 +610,47 @@ def process_radiation(
     return merged.isel(lat=slice(None, None, -1))
 
 
+def hourly_waves(
+    ds: xr.Dataset,
+    swell_height_name: str = "swh",
+    swell_direction_name: str = "mdts",
+    time_dim: str = "time",
+) -> xr.Dataset:
+    """
+    Wave fields at the source's own cadence — :func:`daily_waves` without the
+    resample.
+
+    Deliberately a sibling rather than a flag on ``daily_waves``: the daily path
+    feeds every existing store and h2ds column, so it is left byte-identical.
+    """
+    if time_dim not in ds.dims:
+        raise ValueError(f"Dataset does not have dimension '{time_dim}'")
+
+    out = xr.Dataset(
+        {
+            swell_height_name: ds[swell_height_name],
+            swell_direction_name: ds[swell_direction_name],
+        }
+    )
+    out.attrs.update(ds.attrs)
+    return drop_dims(out)
+
+
 def process_waves(
     ds: xr.Dataset,
     var_config: Optional[KeyVarConfigEntry] = None,
     var_key: str | None = None,
 ) -> xr.Dataset:
+    """
+    Prepare the wave fields, aggregating to daily only for a daily store.
+
+    With ``time_step: hourly`` the resample is skipped here and happens at
+    compile instead (see ``compiler_registry._compile_waves``), so the store
+    keeps ERA5's native hourly axis while h2ds stays daily.
+    """
     ds = rename_dims(ds)
     ds = ds.chunk(
         {"time": unified_time_chunk(ds), "lat": len(ds.lat), "lon": len(ds.lon)}
     )
-    return daily_waves(ds).isel(lat=slice(None, None, -1))
+    build = hourly_waves if step_freq(var_config) == "h" else daily_waves
+    return build(ds).isel(lat=slice(None, None, -1))
