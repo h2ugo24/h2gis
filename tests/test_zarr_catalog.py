@@ -1,6 +1,7 @@
 """Tests for ZarrCatalog: build_file_path, dataset column, and provenance sidecars."""
 
 import json
+from types import SimpleNamespace
 from typing import Sequence
 from unittest.mock import MagicMock
 
@@ -29,17 +30,17 @@ _ENTRY = {
 }
 
 
-def _make_app_config() -> AppConfig:
+def _make_app_config(time_step: str = "daily") -> AppConfig:
     return msgspec.convert(
-        {"variables": {"sst": _ENTRY}, "secrets": {}},
+        {"variables": {"sst": {**_ENTRY, "time_step": time_step}}, "secrets": {}},
         AppConfig,
     )
 
 
-def _make_catalog(tmp_path) -> ZarrCatalog:
+def _make_catalog(tmp_path, time_step: str = "daily") -> ZarrCatalog:
     return ZarrCatalog(
         "sst",
-        app_config=_make_app_config(),
+        app_config=_make_app_config(time_step),
         store_root=tmp_path,
         auto_refresh=False,
     )
@@ -1009,6 +1010,38 @@ class TestOpenDatasetIntegration:
         )
         ds = catalog.open_dataset(start_date="2020-01-01", end_date="2020-01-03")
         assert all(pd.Timestamp(t).hour == 0 for t in ds.time.values)
+
+    def test_hourly_store_keeps_its_sub_daily_stamps(self, tmp_path):
+        """
+        time_step=hourly must skip the midnight snap. Normalizing an hourly axis
+        maps all 24 steps of a day onto one stamp — a year of 8784 steps becomes
+        366 duplicated timestamps, silently.
+        """
+        catalog = _make_catalog(tmp_path, time_step="hourly")
+        ds = xr.Dataset(
+            {"sst": (["time"], np.arange(48.0))},
+            coords={"time": pd.date_range("2020-01-01", periods=48, freq="h")},
+        )
+
+        out = catalog._reader._normalize_time(ds)
+        times = pd.DatetimeIndex(out.time.values)
+        assert len(times) == 48
+        assert times.is_unique, "hourly stamps were collapsed"
+        assert sorted({t.hour for t in times}) == list(range(24))
+
+    def test_daily_store_is_still_normalised(self, tmp_path):
+        """The default cadence keeps the existing midnight snap."""
+        catalog = _make_catalog(tmp_path)  # time_step defaults to daily
+        out = catalog._reader._normalize_time(_grid_ds("2020-01-01", 3, hour=12))
+        assert all(pd.Timestamp(t).hour == 0 for t in out.time.values)
+
+    def test_var_config_without_time_step_defaults_to_daily(self, tmp_path):
+        """A stand-in config predating the field must keep the old behaviour."""
+        catalog = _make_catalog(tmp_path)
+        catalog._reader._index.var_config = SimpleNamespace()  # no time_step
+
+        out = catalog._reader._normalize_time(_grid_ds("2020-01-01", 3, hour=12))
+        assert all(pd.Timestamp(t).hour == 0 for t in out.time.values)
 
     def test_normalize_time_passes_through_without_time_coord(self, tmp_path):
         """Static fields (e.g. bathy) have no time axis and must survive intact."""
