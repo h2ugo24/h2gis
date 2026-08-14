@@ -144,15 +144,73 @@ def _compile_depth_var(
     )
 
 
+def _atm_accum_from_hourly(
+    compiler: Compiler,
+    catalog: ZarrCatalog | None,
+    date_range: DateRange,
+) -> xr.Dataset | None:
+    """
+    Derive the daily ekman/rain features from an hourly atm-accum-avg store.
+
+    The window is widened by ``_EKMAN_WARMUP_DAYS`` so the rolling features start
+    warm, which replaces ``get_previous_dates_da``'s trip to the store: there is
+    no stored daily ``ekman_pumping`` to seed from once the store is hourly, and
+    reading real hours is strictly better than reading back a previous day's
+    output. The warm-up days are trimmed off before the result is returned.
+    """
+    from h2mare.processing.core.cds import (
+        _EKMAN_WARMUP_DAYS,
+        add_engineered_ekman,
+        compute_curl_and_ekman,
+        daily_total_rain,
+    )
+
+    warm = DateRange(
+        date_range.start - pd.Timedelta(days=_EKMAN_WARMUP_DAYS),
+        date_range.end,
+    )
+    ds = _open_or_warn(catalog, "atm-accum-avg", warm, compiler.var_config.bbox)
+    if ds is None:
+        return None
+
+    # Both of these already take hourly in and give daily out — they are the
+    # same functions the daily convert path calls, just later.
+    ds_ekman = compute_curl_and_ekman(ds)
+    features = add_engineered_ekman(
+        ds_ekman["ekman_pumping"], var_key="atm-accum-avg", seed_from_store=False
+    )
+    merged = xr.merge(
+        [ds_ekman, features, daily_total_rain(ds)], compat="override", join="outer"
+    )
+    return merged.sel(time=slice(date_range.start, date_range.end))
+
+
 def _compile_atm_accum_avg(
     compiler: Compiler,
     catalog: ZarrCatalog | None,
     date_range: DateRange,
 ) -> xr.Dataset | None:
-    ds = _open_or_warn(catalog, "atm-accum-avg", date_range, compiler.var_config.bbox)
+    """
+    h2ds stays daily whatever cadence the atm-accum-avg store is kept at.
+
+    A daily store already holds the derived features, so this only regrids. An
+    hourly store holds raw stress and precipitation, so the whole ekman chain is
+    computed here instead — yielding the same h2ds columns either way.
+    """
+    # .get, not [...]: step_freq already treats a missing entry as daily, which
+    # keeps stand-in configs on the path every existing store actually uses.
+    var_config = compiler.app_config.variables.get("atm-accum-avg")
+    if step_freq(var_config) == "h":
+        ds = _atm_accum_from_hourly(compiler, catalog, date_range)
+    else:
+        ds = _open_or_warn(
+            catalog, "atm-accum-avg", date_range, compiler.var_config.bbox
+        )
     if ds is None:
         return None
-    ds = ds.drop_vars(["dayofyear", "month", "quantile"])
+    # Coords ride along from the climatology alignment (.sel on dayofyear/month)
+    # whether the features came off disk or were just computed.
+    ds = ds.drop_vars(["dayofyear", "month", "quantile"], errors="ignore")
     return ds.interp_like(compiler.base_grid, method="linear", assume_sorted=True)
 
 

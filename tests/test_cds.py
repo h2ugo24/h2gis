@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 import xarray as xr
 
+from h2mare.models import TimeStep
 from h2mare.processing.core import cds
 from h2mare.processing.core.cds import (
     _get_ds_for_month,
@@ -479,6 +480,54 @@ class TestEkmanSeedWindow:
         seen = self._capture_requested_span(monkeypatch, t0)
 
         assert seen["end"] == t0 - pd.Timedelta(days=1)
+
+    def test_hourly_store_keeps_the_native_axis_and_raw_fields_only(self):
+        """
+        With ``time_step: hourly`` the convert step stores raw ERA5 and derives
+        nothing — the ekman chain is daily by construction and moves to compile.
+        """
+        n_days = 3
+        ds = _hourly_ds(
+            n_days=n_days,
+            avg_iews=np.ones((n_days * 24, 2, 2)),
+            avg_inss=np.ones((n_days * 24, 2, 2)),
+            tp=np.ones((n_days * 24, 2, 2)),
+        )
+        cfg = SimpleNamespace(time_step=TimeStep.HOURLY)
+
+        out = cds.process_atm_accum_avg(ds, cfg, "atm-accum-avg")
+
+        assert out.sizes["time"] == n_days * 24, "hourly axis must not be resampled"
+        assert set(out.data_vars) == {"avg_iews", "avg_inss", "tp"}
+        assert not [v for v in out.data_vars if "ekman" in v or "upwell" in v]
+
+    def test_hourly_store_drops_fields_the_pipeline_does_not_publish(self):
+        ds = _hourly_ds(
+            n_days=1,
+            avg_iews=np.ones((24, 2, 2)),
+            avg_inss=np.ones((24, 2, 2)),
+            tp=np.ones((24, 2, 2)),
+            stray=np.ones((24, 2, 2)),
+        )
+        out = cds.process_atm_accum_avg(
+            ds, SimpleNamespace(time_step=TimeStep.HOURLY), "atm-accum-avg"
+        )
+
+        assert "stray" not in out.data_vars
+
+    def test_hourly_store_matches_the_daily_stores_lat_orientation(self):
+        """Both cadences must write ascending lat, or compile regrids upside down."""
+        ds = _hourly_ds(
+            n_days=1,
+            avg_iews=np.ones((24, 2, 2)),
+            avg_inss=np.ones((24, 2, 2)),
+            tp=np.ones((24, 2, 2)),
+        )
+        out = cds.process_atm_accum_avg(
+            ds, SimpleNamespace(time_step=TimeStep.HOURLY), "atm-accum-avg"
+        )
+
+        assert list(out.lat.values) == list(ds.lat.values)[::-1]
 
     def test_warmup_is_derived_from_the_declared_depths(self):
         """
