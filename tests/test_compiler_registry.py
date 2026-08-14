@@ -589,3 +589,149 @@ class TestProcessVariableDispatch:
             result = compiler._process_variable("ssh", _DR)
 
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Hourly reduction slabbing
+# ---------------------------------------------------------------------------
+
+
+def _fake_hourly(start: str, end: str, n_vars: int = 1) -> xr.Dataset:
+    """Hourly dataset over a whole-day span, shaped like the atm-accum store."""
+    times = pd.date_range(start, pd.Timestamp(end) + pd.Timedelta(hours=23), freq="h")
+    lat, lon = [30.0, 31.0, 32.0, 33.0], [-10.0, -9.0, -8.0, -7.0, -6.0]
+    shape = (len(times), len(lat), len(lon))
+    return xr.Dataset(
+        {
+            f"v{i}": (["time", "lat", "lon"], np.ones(shape, dtype="float32"))
+            for i in range(n_vars)
+        },
+        coords={"time": times, "lat": lat, "lon": lon},
+    )
+
+
+class TestSlabs:
+    def test_slabs_tile_the_range_without_gap_or_overlap(self):
+        dr = DateRange("2020-01-01", "2020-01-31")
+        slabs = compiler_registry._slabs(dr, 10)
+
+        assert slabs[0].start == dr.start
+        assert slabs[-1].end == dr.end
+        for prev, nxt in zip(slabs, slabs[1:]):
+            assert nxt.start == prev.end + pd.Timedelta(days=1)
+
+    def test_no_slab_exceeds_the_requested_length(self):
+        slabs = compiler_registry._slabs(DateRange("2020-01-01", "2020-01-31"), 10)
+        assert all((s.end - s.start).days + 1 <= 10 for s in slabs)
+
+    def test_range_shorter_than_a_slab_stays_whole(self):
+        dr = DateRange("2020-01-01", "2020-01-05")
+        assert compiler_registry._slabs(dr, 30) == [dr]
+
+
+class TestSlabDays:
+    def test_derived_from_data_volume_not_machine(self, monkeypatch):
+        ds = _fake_hourly("2020-01-01", "2020-01-31")
+        cells = ds.sizes["lat"] * ds.sizes["lon"]
+        per_day = cells * 4 * 24  # one float32 var, hourly
+
+        monkeypatch.setattr(
+            compiler_registry, "_SLAB_SOURCE_BUDGET_BYTES", per_day * 10
+        )
+        assert compiler_registry._slab_days(ds) == 10
+
+    def test_more_variables_means_shorter_slabs(self, monkeypatch):
+        monkeypatch.setattr(compiler_registry, "_SLAB_SOURCE_BUDGET_BYTES", 10**7)
+        one = compiler_registry._slab_days(_fake_hourly("2020-01-01", "2020-01-31", 1))
+        four = compiler_registry._slab_days(_fake_hourly("2020-01-01", "2020-01-31", 4))
+
+        assert four < one, "slab length must shrink as h2ds grows"
+
+    def test_never_returns_zero_days(self, monkeypatch):
+        """A budget smaller than a single day must still make progress."""
+        monkeypatch.setattr(compiler_registry, "_SLAB_SOURCE_BUDGET_BYTES", 1)
+        assert (
+            compiler_registry._slab_days(_fake_hourly("2020-01-01", "2020-01-05")) == 1
+        )
+
+
+class TestEndOfDay:
+    def test_covers_the_final_hourly_step(self):
+        """A midnight end bound would drop that day's other 23 steps."""
+        got = compiler_registry._end_of_day("2020-01-31")
+
+        assert got > pd.Timestamp("2020-01-31 23:00")
+        assert got < pd.Timestamp("2020-02-01")
+
+
+class TestAtmAccumSlabbing:
+    """The reduction must run slab by slab, each warmed independently."""
+
+    @staticmethod
+    def _capture_slabs(monkeypatch, ds: xr.Dataset) -> list[DateRange]:
+        seen: list[DateRange] = []
+
+        def _fake_open(catalog, var_key, date_range, bbox, **kwargs):
+            return ds
+
+        def _fake_slab(ds_hourly, slab):
+            seen.append(slab)
+            times = pd.date_range(slab.start, slab.end, freq="D")
+            return xr.Dataset(
+                {"ekman_anom": (["time"], np.ones(len(times), dtype="float32"))},
+                coords={"time": times},
+            )
+
+        monkeypatch.setattr(compiler_registry, "_open_or_warn", _fake_open)
+        monkeypatch.setattr(compiler_registry, "_daily_features_for_slab", _fake_slab)
+        return seen
+
+    def test_range_is_processed_in_multiple_slabs(self, tmp_path, monkeypatch):
+        ds = _fake_hourly("2019-12-12", "2020-01-31")
+        seen = self._capture_slabs(monkeypatch, ds)
+        cells = ds.sizes["lat"] * ds.sizes["lon"]
+        monkeypatch.setattr(
+            compiler_registry, "_SLAB_SOURCE_BUDGET_BYTES", cells * 4 * 24 * 10
+        )
+
+        dr = DateRange("2020-01-01", "2020-01-31")
+        out = compiler_registry._atm_accum_from_hourly(
+            _make_compiler(tmp_path), _make_catalog(None), dr
+        )
+
+        assert len(seen) > 1, "a long range must not be reduced in one graph"
+        assert seen[0].start == dr.start and seen[-1].end == dr.end
+        assert out is not None
+        assert out.sizes["time"] == 31, "slabs must concatenate to the full range"
+
+    def test_result_covers_every_requested_day_exactly_once(
+        self, tmp_path, monkeypatch
+    ):
+        ds = _fake_hourly("2019-12-12", "2020-01-31")
+        self._capture_slabs(monkeypatch, ds)
+        cells = ds.sizes["lat"] * ds.sizes["lon"]
+        monkeypatch.setattr(
+            compiler_registry, "_SLAB_SOURCE_BUDGET_BYTES", cells * 4 * 24 * 7
+        )
+
+        out = compiler_registry._atm_accum_from_hourly(
+            _make_compiler(tmp_path),
+            _make_catalog(None),
+            DateRange("2020-01-01", "2020-01-31"),
+        )
+
+        assert out is not None
+        times = pd.DatetimeIndex(out.time.values)
+        assert times.is_monotonic_increasing
+        assert not times.duplicated().any()
+
+    def test_missing_source_still_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            compiler_registry,
+            "_open_or_warn",
+            lambda catalog, var_key, date_range, bbox, **kw: None,
+        )
+        out = compiler_registry._atm_accum_from_hourly(
+            _make_compiler(tmp_path), _make_catalog(None), _DR
+        )
+        assert out is None

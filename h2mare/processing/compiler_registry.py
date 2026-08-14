@@ -144,6 +144,86 @@ def _compile_depth_var(
     )
 
 
+#: Decoded source bytes to aim for per slab of the hourly reduction.
+#:
+#: Reducing a whole year in one graph needs ~10.7 GB of hourly source before the
+#: curl's stencil temporaries, which does not fit a 16 GB machine — it thrashed
+#: at 0.3 cores and emitted no chunks. Slabbing caps the source in flight at
+#: roughly this figure regardless of how long a range was asked for.
+_SLAB_SOURCE_BUDGET_BYTES = 1024**3
+
+
+def _end_of_day(ts) -> pd.Timestamp:
+    """Last instant of ``ts``'s calendar day.
+
+    Slicing an hourly axis with a midnight-stamped end would drop that day's
+    other 23 steps. ``ZarrCatalog`` resolves whole days on the way in, but a
+    ``.sel`` against an already-open hourly dataset has to do it itself.
+    """
+    return pd.Timestamp(ts) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+
+
+def _slab_days(ds: xr.Dataset) -> int:
+    """Days per slab that keep the decoded source read near the budget.
+
+    Derived from the data rather than from machine memory, so the choice is
+    deterministic and adapts on its own as variables or resolution change.
+    """
+    cells = ds.sizes["lat"] * ds.sizes["lon"]
+    per_step = sum(cells * ds[v].dtype.itemsize for v in ds.data_vars)
+
+    # Distinct calendar days, not the first-to-last timedelta: a whole month of
+    # hourly steps spans 30 days 23 h, which would report 24.8 steps per day.
+    times = pd.DatetimeIndex(ds.time.values)
+    span_days = max(len(times.normalize().unique()), 1)
+    steps_per_day = max(ds.sizes["time"] / span_days, 1.0)
+
+    per_day = per_step * steps_per_day
+    return max(int(_SLAB_SOURCE_BUDGET_BYTES // per_day), 1)
+
+
+def _slabs(date_range: DateRange, days: int) -> list[DateRange]:
+    """Split a range into consecutive slabs of at most ``days`` days."""
+    out: list[DateRange] = []
+    start = pd.Timestamp(date_range.start)
+    end = pd.Timestamp(date_range.end)
+    while start <= end:
+        stop = min(start + pd.Timedelta(days=days - 1), end)
+        out.append(DateRange(start, stop))
+        start = stop + pd.Timedelta(days=1)
+    return out
+
+
+def _daily_features_for_slab(ds_hourly: xr.Dataset, slab: DateRange) -> xr.Dataset:
+    """
+    Reduce one slab of hourly source to its daily features, materialised.
+
+    Computed eagerly rather than returned lazy: holding the whole range as one
+    graph is exactly what does not fit, and the daily result is ~1/24 the size,
+    so paying it slab by slab is what bounds peak memory.
+    """
+    from h2mare.processing.core.cds import (
+        _EKMAN_WARMUP_DAYS,
+        add_engineered_ekman,
+        compute_curl_and_ekman,
+        daily_total_rain,
+    )
+
+    warm_start = pd.Timestamp(slab.start) - pd.Timedelta(days=_EKMAN_WARMUP_DAYS)
+    sub = ds_hourly.sel(time=slice(warm_start, _end_of_day(slab.end)))
+
+    # Both of these already take hourly in and give daily out — they are the
+    # same functions the daily convert path calls, just later.
+    ds_ekman = compute_curl_and_ekman(sub)
+    features = add_engineered_ekman(
+        ds_ekman["ekman_pumping"], var_key="atm-accum-avg", seed_from_store=False
+    )
+    merged = xr.merge(
+        [ds_ekman, features, daily_total_rain(sub)], compat="override", join="outer"
+    )
+    return merged.sel(time=slice(slab.start, slab.end)).compute()
+
+
 def _atm_accum_from_hourly(
     compiler: Compiler,
     catalog: ZarrCatalog | None,
@@ -152,18 +232,20 @@ def _atm_accum_from_hourly(
     """
     Derive the daily ekman/rain features from an hourly atm-accum-avg store.
 
-    The window is widened by ``_EKMAN_WARMUP_DAYS`` so the rolling features start
+    Each slab is widened by ``_EKMAN_WARMUP_DAYS`` so its rolling features start
     warm, which replaces ``get_previous_dates_da``'s trip to the store: there is
     no stored daily ``ekman_pumping`` to seed from once the store is hourly, and
     reading real hours is strictly better than reading back a previous day's
-    output. The warm-up days are trimmed off before the result is returned.
+    output. Warm-up days are trimmed off each slab before it is kept.
+
+    The reduction runs slab by slab so peak memory follows
+    ``_SLAB_SOURCE_BUDGET_BYTES`` rather than the length of the requested range.
+    That keeps it to one write per output period: shrinking the *compile* window
+    instead would rewrite the whole yearly h2ds file once per window.
     """
-    from h2mare.processing.core.cds import (
-        _EKMAN_WARMUP_DAYS,
-        add_engineered_ekman,
-        compute_curl_and_ekman,
-        daily_total_rain,
-    )
+    from loguru import logger
+
+    from h2mare.processing.core.cds import _EKMAN_WARMUP_DAYS
 
     warm = DateRange(
         date_range.start - pd.Timedelta(days=_EKMAN_WARMUP_DAYS),
@@ -173,16 +255,21 @@ def _atm_accum_from_hourly(
     if ds is None:
         return None
 
-    # Both of these already take hourly in and give daily out — they are the
-    # same functions the daily convert path calls, just later.
-    ds_ekman = compute_curl_and_ekman(ds)
-    features = add_engineered_ekman(
-        ds_ekman["ekman_pumping"], var_key="atm-accum-avg", seed_from_store=False
+    slabs = _slabs(date_range, _slab_days(ds))
+    logger.debug(
+        f"[atm-accum-avg] hourly reduction in {len(slabs)} slab(s) of up to "
+        f"{_slab_days(ds)} day(s)"
     )
-    merged = xr.merge(
-        [ds_ekman, features, daily_total_rain(ds)], compat="override", join="outer"
-    )
-    return merged.sel(time=slice(date_range.start, date_range.end))
+
+    parts = [_daily_features_for_slab(ds, slab) for slab in slabs]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    # join="exact": every slab comes off the same store, so lat/lon must match
+    # exactly. A silent outer join would NaN-fill a slab that somehow differed
+    # instead of surfacing it.
+    return xr.concat(parts, dim="time", join="exact")
 
 
 def _compile_atm_accum_avg(
