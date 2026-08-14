@@ -1,6 +1,8 @@
 """Tests for Extractor — focused on logic that doesn't need external data."""
 
 import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import geopandas as gpd
 import numpy as np
@@ -9,12 +11,17 @@ import pytest
 import xarray as xr
 from shapely.geometry import box
 
+from h2mare.models import TimeStep
+from h2mare.processing import extractor as extractor_module
 from h2mare.processing.extractor import (
     Extractor,
     _keys_path,
     _save_completed_keys,
     ensure_row_id,
+    resolve_extraction_vars,
+    warn_on_subdaily_store,
 )
+from h2mare.types import BBox, DateRange
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -463,3 +470,144 @@ class TestResolveIndex:
         ext = Extractor(df, index_col="event_id")
         assert ext.data.index.tolist() == [101, 102]
         assert ext.data.index.name == "event_id"
+
+
+# ---------------------------------------------------------------------------
+# Store contents vs what a var_key publishes
+# ---------------------------------------------------------------------------
+
+
+def _atm_config(*, hourly: bool = True) -> SimpleNamespace:
+    """atm-accum-avg-shaped config: publishes 3 stored + 2 compile-derived vars."""
+    return SimpleNamespace(
+        compiled_vars=[
+            "avg_iews",
+            "avg_inss",
+            "tp",
+            "ekman_anom",
+            "n_upwell_events_3d",
+        ],
+        time_step=TimeStep.HOURLY if hourly else TimeStep.DAILY,
+        extract_depth_slices=None,
+    )
+
+
+_STORED = ["avg_iews", "avg_inss", "tp"]
+
+
+class TestResolveExtractionVars:
+    """
+    Once features are derived at compile time the store holds less than the
+    var_key publishes. Both ways of hitting that gap used to be quiet.
+    """
+
+    def test_implicit_all_vars_refuses_a_thinner_store(self):
+        """vars=None used to return 3 columns where 5 were published, silently."""
+        with pytest.raises(ValueError) as err:
+            resolve_extraction_vars(_STORED, None, "atm-accum-avg", _atm_config())
+
+        msg = str(err.value)
+        assert "ekman_anom" in msg and "n_upwell_events_3d" in msg
+        assert "compile" in msg.lower()
+
+    def test_implicit_all_vars_passes_when_store_is_complete(self):
+        """A daily store holds everything it publishes — behaviour unchanged."""
+        cfg = SimpleNamespace(compiled_vars=_STORED, time_step=TimeStep.DAILY)
+        assert resolve_extraction_vars(_STORED, None, "atm-accum-avg", cfg) is None
+
+    def test_named_compile_derived_var_says_where_it_went(self):
+        """Previously a bare KeyError from ds[vars], naming no destination."""
+        with pytest.raises(ValueError) as err:
+            resolve_extraction_vars(
+                _STORED, ["ekman_anom"], "atm-accum-avg", _atm_config()
+            )
+
+        msg = str(err.value)
+        assert "ekman_anom" in msg
+        assert "h2ds" in msg or "Parquet" in msg
+
+    def test_unrecognised_var_is_distinguished_from_a_moved_one(self):
+        with pytest.raises(ValueError) as err:
+            resolve_extraction_vars(
+                _STORED, ["not_a_var"], "atm-accum-avg", _atm_config()
+            )
+
+        assert "not variables of" in str(err.value)
+
+    def test_satisfiable_request_is_returned_unchanged(self):
+        got = resolve_extraction_vars(_STORED, ["tp"], "atm-accum-avg", _atm_config())
+        assert got == ["tp"]
+
+    def test_var_key_without_compiled_vars_is_unaffected(self):
+        """Most var_keys do not declare compiled_vars; they must not start failing."""
+        cfg = SimpleNamespace(compiled_vars=None, time_step=TimeStep.DAILY)
+        assert resolve_extraction_vars(_STORED, None, "sst", cfg) is None
+
+
+class TestWarnOnSubdailyStore:
+    @staticmethod
+    def _capture(monkeypatch) -> list[str]:
+        seen: list[str] = []
+        monkeypatch.setattr(
+            extractor_module.logger, "warning", lambda m, *a, **k: seen.append(str(m))
+        )
+        return seen
+
+    def _ds(self, units: str = "m") -> xr.Dataset:
+        ds = _make_spatiotemporal_ds()
+        ds["sst"].attrs["units"] = units
+        return ds
+
+    def test_hourly_store_warns_about_instantaneous_values(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+        warn_on_subdaily_store("atm-accum-avg", _atm_config(), self._ds())
+
+        assert len(seen) == 1
+        assert "00:00" in seen[0]
+
+    def test_hourly_warning_reports_stored_units(self, monkeypatch):
+        """The m-vs-mm trap is invisible in the numbers, so surface the units."""
+        seen = self._capture(monkeypatch)
+        warn_on_subdaily_store("atm-accum-avg", _atm_config(), self._ds(units="m"))
+
+        assert "'sst': 'm'" in seen[0] or "sst" in seen[0]
+
+    def test_daily_store_is_silent(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+        warn_on_subdaily_store("atm-accum-avg", _atm_config(hourly=False), self._ds())
+
+        assert seen == []
+
+
+class TestProcessSingleVarkeyGuards:
+    """The guards must sit on the real extraction path, not just be importable."""
+
+    def _patched_catalog(self, monkeypatch, ds: xr.Dataset) -> MagicMock:
+        catalog = MagicMock()
+        catalog.var_key = "atm-accum-avg"
+        catalog.get_time_coverage.return_value = DateRange("2020-01-01", "2020-01-05")
+        catalog.get_bbox.return_value = BBox(-20.0, 30.0, 20.0, 50.0)
+        catalog.open_dataset.return_value = ds
+        monkeypatch.setattr(extractor_module, "ZarrCatalog", lambda _vk: catalog)
+        return catalog
+
+    def _extractor_for(self, cfg) -> Extractor:
+        # Distinct lon/lat: a single repeated point yields a degenerate bbox.
+        df = pd.DataFrame(
+            {
+                "time": ["2020-01-01", "2020-01-02"],
+                "lon": [9.0, 11.0],
+                "lat": [39.0, 41.0],
+            }
+        )
+        ext = _extractor(df, time_col="time")
+        ext.app_config = SimpleNamespace(variables={"atm-accum-avg": cfg})
+        return ext
+
+    def test_raises_before_returning_a_thinner_frame(self, monkeypatch):
+        ds = _make_spatiotemporal_ds().rename({"sst": "tp"})
+        self._patched_catalog(monkeypatch, ds)
+        ext = self._extractor_for(_atm_config())
+
+        with pytest.raises(ValueError, match="ekman_anom"):
+            ext.process_single_varkey("atm-accum-avg")
