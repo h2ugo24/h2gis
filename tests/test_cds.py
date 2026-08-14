@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 import xarray as xr
 
+from h2mare.processing.core import cds
 from h2mare.processing.core.cds import (
     _get_ds_for_month,
     daily_cloud_cover,
@@ -406,3 +407,87 @@ class TestWaveDirectionIsCircular:
         comp = direction_to_uv(da)
         back = uv_to_direction(comp["u_ts"], comp["v_ts"])
         np.testing.assert_allclose(back.values, da.values, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# get_previous_dates_da — rolling-feature warm-up
+# ---------------------------------------------------------------------------
+
+
+class TestEkmanSeedWindow:
+    """
+    The seed prepended before a range decides whether the deep rolling features
+    start warm. Nothing downstream can detect a short seed: ``min_periods=1``
+    accepts a partial window and emits a plausible wrong number instead of
+    raising, so these assertions are the only guard.
+    """
+
+    @staticmethod
+    def _capture_requested_span(monkeypatch, t0: pd.Timestamp) -> dict:
+        seen: dict[str, pd.Timestamp] = {}
+
+        class _FakeCatalog:
+            def __init__(self, var_key):
+                pass
+
+            def open_dataset(self, start_date, end_date):
+                seen["start"] = pd.Timestamp(start_date)
+                seen["end"] = pd.Timestamp(end_date)
+                return None  # early-return path; only the request matters here
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(cds, "ZarrCatalog", _FakeCatalog)
+
+        da = xr.DataArray(
+            np.zeros(5),
+            dims=["time"],
+            coords={"time": pd.date_range(t0, periods=5, freq="D")},
+        )
+        cds.get_previous_dates_da(da, "atm-accum-avg")
+        return seen
+
+    def test_seed_covers_the_deepest_lagged_feature(self, monkeypatch):
+        """
+        ekman_anom_lag14 reads the anomaly 14 days back, and that anomaly is
+        itself a 7-day rolling mean — so the first output day needs 14 + 7 - 1
+        days of real history behind it. The original 15-day seed was 5 short,
+        which silently corrupted lag14 for the first weeks of every isolated
+        range.
+        """
+        t0 = pd.Timestamp("2020-01-01")
+        seen = self._capture_requested_span(monkeypatch, t0)
+
+        needed = max(cds._EKMAN_LAGS) + cds._EKMAN_ROLL_DAYS - 1
+        assert (t0 - seen["start"]).days >= needed, (
+            f"seed spans {(t0 - seen['start']).days} days but lag"
+            f"{max(cds._EKMAN_LAGS)} needs {needed}"
+        )
+
+    def test_seed_covers_the_deepest_event_window(self, monkeypatch):
+        """n_upwell_events_14d sums exceedances back to t-13, each needing 7."""
+        t0 = pd.Timestamp("2020-01-01")
+        seen = self._capture_requested_span(monkeypatch, t0)
+
+        needed = max(cds._EKMAN_EVENT_WINDOWS) - 1 + cds._EKMAN_ROLL_DAYS - 1
+        assert (t0 - seen["start"]).days >= needed
+
+    def test_seed_stops_the_day_before_the_range(self, monkeypatch):
+        """The seed must abut the range, never overlap it."""
+        t0 = pd.Timestamp("2020-01-01")
+        seen = self._capture_requested_span(monkeypatch, t0)
+
+        assert seen["end"] == t0 - pd.Timedelta(days=1)
+
+    def test_warmup_is_derived_from_the_declared_depths(self):
+        """
+        Adding a deeper lag must widen the seed automatically — the constant is
+        computed from the tuples, so this fails if someone reverts it to a
+        literal and then adds lag21.
+        """
+        assert cds._EKMAN_WARMUP_DAYS >= max(cds._EKMAN_LAGS) + cds._EKMAN_ROLL_DAYS - 1
+        assert (
+            cds._EKMAN_WARMUP_DAYS
+            >= max(cds._EKMAN_EVENT_WINDOWS) - 1 + cds._EKMAN_ROLL_DAYS - 1
+        )

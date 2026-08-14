@@ -25,6 +25,27 @@ warnings.filterwarnings("ignore")
 _EKMAN_P90_FILE = "cds_ekman-monthly-90thquantile_80W-10E-0N-70N_1998-2017.nc"
 _EKMAN_DOY_FILE = "cds_ekman-doy-mean_80W-10E-0N-70N_1998-2017.nc"
 
+# Rolling window behind ekman_7d, and the feature depths layered on top of it.
+_EKMAN_ROLL_DAYS = 7
+_EKMAN_LAGS = (3, 7, 14)
+_EKMAN_EVENT_WINDOWS = (3, 7, 14)
+
+# Days of real history that must sit in front of the first output day.
+#
+# ekman_anom is a 7-day rolling mean minus climatology, so it is only right once
+# 7 days are behind it. A lag-N anomaly reads that value at t-N and therefore
+# needs N + 7 - 1 days; an N-day event count sums exceedances back to t-(N-1),
+# needing (N-1) + 7 - 1. Derived from the tuples above rather than written as a
+# literal so adding a deeper lag cannot silently outrun the seed.
+#
+# Seeding less than this does not fail — rolling(min_periods=1) fills the
+# shortfall with a partial window — so the deficit shows up only as wrong values
+# in the first weeks of a range.
+_EKMAN_WARMUP_DAYS = max(
+    max(_EKMAN_LAGS) + _EKMAN_ROLL_DAYS - 1,
+    max(_EKMAN_EVENT_WINDOWS) - 1 + _EKMAN_ROLL_DAYS - 1,
+)
+
 
 # ----------------------------
 #   ---- Helpers ----
@@ -369,12 +390,19 @@ def compute_curl_and_ekman(
 
 
 def get_previous_dates_da(da: xr.DataArray, var_key: str):
-    """Get previous 15-days for ekman lag calculation"""
+    """
+    Prepend the stored days preceding ``da`` so the rolling features start warm.
+
+    Fetches :data:`_EKMAN_WARMUP_DAYS` days, which is what the deepest feature
+    (``ekman_anom_lag14``) needs. A shorter seed still produces output, because
+    ``rolling(min_periods=1)`` accepts a partial window — the values are simply
+    wrong for the first weeks, which is invisible downstream.
+    """
     da_dt_ini = da.time.values[0]
 
     repo = ZarrCatalog(var_key)
 
-    date_prev = pd.to_datetime(da_dt_ini) - pd.Timedelta(days=15)
+    date_prev = pd.to_datetime(da_dt_ini) - pd.Timedelta(days=_EKMAN_WARMUP_DAYS)
     ds_prev = repo.open_dataset(
         start_date=date_prev, end_date=da_dt_ini - pd.Timedelta(days=1)
     )
@@ -420,7 +448,7 @@ def add_engineered_ekman(da: xr.DataArray, var_key: str):
     da = da.chunk({"time": 30, "lat": 200, "lon": 200})
 
     # Get 7-day rolling mean of Ekman pumping (Since files are yearly, the first 6days of the year are not complete)
-    ekman_7d = da.rolling(time=7, min_periods=1).mean()
+    ekman_7d = da.rolling(time=_EKMAN_ROLL_DAYS, min_periods=1).mean()
     clim_align = clim_doy.sel(dayofyear=ekman_7d["time"].dt.dayofyear)
     anom = ekman_7d - clim_align
 
@@ -442,7 +470,7 @@ def add_engineered_ekman(da: xr.DataArray, var_key: str):
     )
 
     # Create lag anomalies
-    for lag in [3, 7, 14]:
+    for lag in _EKMAN_LAGS:
         ds_ekman[f"ekman_anom_lag{lag}"] = ds_ekman["ekman_anom"].shift(time=lag)
         ds_ekman[f"ekman_anom_lag{lag}"].attrs.update(
             {
@@ -459,7 +487,7 @@ def add_engineered_ekman(da: xr.DataArray, var_key: str):
     exceed = ds_ekman["ekman_anom"] > p90_aligned
 
     # Rolling counts for 3, 7, 14 days
-    for w in [3, 7, 14]:
+    for w in _EKMAN_EVENT_WINDOWS:
         ds_ekman[f"n_upwell_events_{w}d"] = exceed.rolling(time=w, min_periods=1).sum()
         ds_ekman[f"n_upwell_events_{w}d"].attrs.update(
             {
