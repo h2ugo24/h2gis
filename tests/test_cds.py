@@ -540,3 +540,67 @@ class TestEkmanSeedWindow:
             cds._EKMAN_WARMUP_DAYS
             >= max(cds._EKMAN_EVENT_WINDOWS) - 1 + cds._EKMAN_ROLL_DAYS - 1
         )
+
+
+# ---------------------------------------------------------------------------
+# compute_curl_and_ekman — spatial stencil chunking
+# ---------------------------------------------------------------------------
+
+
+class TestCurlStencilChunking:
+    """The curl rolls along lat/lon, so those axes must not be tiled."""
+
+    def test_curl_runs_on_lat_lon_contiguous_chunks(self):
+        """
+        The curl is a spatial stencil, so lat/lon must sit in one chunk each.
+
+        A store written with the "timeseries" layout is spatially tiled; rolling
+        across those tiles shuffles every chunk and the circular wrap couples
+        opposite ends of the axis, which is what stalled a real compile. Values
+        are unaffected either way, so only the chunking can catch it.
+        """
+        n_lat, n_lon = 12, 16
+        times = pd.date_range("2020-01-01", periods=48, freq="h")
+        shape = (len(times), n_lat, n_lon)
+        ds = xr.Dataset(
+            {
+                "avg_iews": (["time", "lat", "lon"], np.ones(shape)),
+                "avg_inss": (["time", "lat", "lon"], np.ones(shape)),
+            },
+            coords={
+                "time": times,
+                "lat": np.linspace(30.0, 41.0, n_lat),
+                "lon": np.linspace(-10.0, 5.0, n_lon),
+            },
+        )
+        # Tile the spatial dims the way the on-disk timeseries layout does.
+        tiled = ds.chunk({"time": 24, "lat": n_lat // 2, "lon": n_lon // 2})
+        assert len(tiled["avg_iews"].chunks[1]) > 1, "fixture must be tiled"
+
+        out = cds.compute_curl_and_ekman(tiled)
+
+        lat_chunks = out["ekman_pumping"].chunks[out["ekman_pumping"].dims.index("lat")]
+        lon_chunks = out["ekman_pumping"].chunks[out["ekman_pumping"].dims.index("lon")]
+        assert len(lat_chunks) == 1, f"lat still tiled: {lat_chunks}"
+        assert len(lon_chunks) == 1, f"lon still tiled: {lon_chunks}"
+
+    def test_curl_leaves_unchunked_input_unchunked(self):
+        """A numpy-backed dataset must not be forced into dask by the rechunk."""
+        n_lat, n_lon = 12, 16
+        times = pd.date_range("2020-01-01", periods=24, freq="h")
+        shape = (len(times), n_lat, n_lon)
+        ds = xr.Dataset(
+            {
+                "avg_iews": (["time", "lat", "lon"], np.ones(shape)),
+                "avg_inss": (["time", "lat", "lon"], np.ones(shape)),
+            },
+            coords={
+                "time": times,
+                "lat": np.linspace(30.0, 41.0, n_lat),
+                "lon": np.linspace(-10.0, 5.0, n_lon),
+            },
+        )
+
+        out = cds.compute_curl_and_ekman(ds)
+
+        assert out["ekman_pumping"].chunks is None

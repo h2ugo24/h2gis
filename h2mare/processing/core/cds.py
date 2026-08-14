@@ -25,6 +25,11 @@ warnings.filterwarnings("ignore")
 _EKMAN_P90_FILE = "cds_ekman-monthly-90thquantile_80W-10E-0N-70N_1998-2017.nc"
 _EKMAN_DOY_FILE = "cds_ekman-doy-mean_80W-10E-0N-70N_1998-2017.nc"
 
+#: Time chunk used while the curl stencil runs. Matches the GRIB read the
+#: convert path has always used (`chunks={"time": 168, ...}`), which keeps each
+#: chunk ~68 MB with lat/lon whole and lets time chunks stream independently.
+_CURL_TIME_CHUNK = 168
+
 # Rolling window behind ekman_7d, and the feature depths layered on top of it.
 _EKMAN_ROLL_DAYS = 7
 _EKMAN_LAGS = (3, 7, 14)
@@ -330,6 +335,18 @@ def compute_curl_and_ekman(
     R = 6_371_000.0  # earth radius (m)
     Omega = 7.2921159e-5  # s^-1
     rho_w = 1025.0  # seawater density kg m^-3
+
+    # The curl below is a spatial stencil (roll along lat and lon). Tiled
+    # spatial chunks make it shuffle across every tile boundary, and because
+    # roll is circular the last tile wraps onto the first — coupling opposite
+    # ends of each axis into one graph that neither streams nor fits in memory.
+    #
+    # Reading from GRIB always handed this lat/lon-contiguous, so it never came
+    # up. A store written with the "timeseries" layout is tiled by design, so
+    # since the ekman chain moved to compile time the layout has to be restored
+    # here rather than assumed of the caller.
+    if ds.chunks:
+        ds = ds.chunk({"time": _CURL_TIME_CHUNK, "lat": -1, "lon": -1})
 
     # Clip land cells
     ds = clip_land_data(ds)
