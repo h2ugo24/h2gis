@@ -604,3 +604,106 @@ class TestCurlStencilChunking:
         out = cds.compute_curl_and_ekman(ds)
 
         assert out["ekman_pumping"].chunks is None
+
+
+# ---------------------------------------------------------------------------
+# add_engineered_ekman — partial windows at the start of the archive
+# ---------------------------------------------------------------------------
+
+
+class TestUpwellEventPartialWindow:
+    """
+    An N-day event count must not answer before N days of history exist.
+
+    The lagged anomalies already report missing history as NaN, because shift
+    fills its leading positions. The counts used min_periods=1, so they emitted
+    a count over however many days happened to be there — a silent under-count
+    indistinguishable from a genuinely quiet period.
+    """
+
+    # Mid-Atlantic, so clip_land_data does not blank the fixture.
+    _LATS = [30.0, 30.25]
+    _LONS = [-40.0, -39.75]
+
+    def _write_climatology(self, tmp_path):
+        """Zero climatology, so every day counts as an exceedance."""
+        shape2d = (len(self._LATS), len(self._LONS))
+        xr.Dataset(
+            {
+                "ekman_pumping_anom": (
+                    ["month", "lat", "lon"],
+                    np.zeros((12, *shape2d)),
+                )
+            },
+            coords={
+                "month": np.arange(1, 13),
+                "lat": self._LATS,
+                "lon": self._LONS,
+            },
+        ).to_netcdf(tmp_path / cds._EKMAN_P90_FILE)
+
+        xr.Dataset(
+            {
+                "ekman_pumping": (
+                    ["dayofyear", "lat", "lon"],
+                    np.zeros((366, *shape2d)),
+                )
+            },
+            coords={
+                "dayofyear": np.arange(1, 367),
+                "lat": self._LATS,
+                "lon": self._LONS,
+            },
+        ).to_netcdf(tmp_path / cds._EKMAN_DOY_FILE)
+
+    def _features(self, tmp_path, monkeypatch, n_days: int = 30):
+        self._write_climatology(tmp_path)
+        monkeypatch.setattr(
+            cds, "get_settings", lambda: SimpleNamespace(CLIMATOLOGY_DIR=tmp_path)
+        )
+
+        times = pd.date_range("2020-01-01", periods=n_days, freq="D")
+        da = xr.DataArray(
+            np.ones((n_days, len(self._LATS), len(self._LONS))),
+            dims=["time", "lat", "lon"],
+            coords={"time": times, "lat": self._LATS, "lon": self._LONS},
+            name="ekman_pumping",
+        )
+        # seed_from_store=False: no store here, and it is the compile path.
+        return cds.add_engineered_ekman(da, "atm-accum-avg", seed_from_store=False)
+
+    def test_count_is_nan_until_its_window_is_full(self, tmp_path, monkeypatch):
+        out = self._features(tmp_path, monkeypatch)
+
+        for w in cds._EKMAN_EVENT_WINDOWS:
+            series = out[f"n_upwell_events_{w}d"].isel(lat=0, lon=0).values
+            assert np.isnan(series[: w - 1]).all(), (
+                f"n_upwell_events_{w}d answered before {w} days existed: "
+                f"{series[: w - 1]}"
+            )
+
+    def test_count_reports_the_full_window_once_warm(self, tmp_path, monkeypatch):
+        out = self._features(tmp_path, monkeypatch)
+
+        for w in cds._EKMAN_EVENT_WINDOWS:
+            series = out[f"n_upwell_events_{w}d"].isel(lat=0, lon=0).values
+            assert series[w - 1] == w, f"n_upwell_events_{w}d should saturate at {w}"
+            assert (series[w - 1 :] == w).all()
+
+    def test_counts_no_longer_ramp_from_one(self, tmp_path, monkeypatch):
+        """
+        The old signature: 1, 2, 3 … w. Each of those was a count over fewer
+        than w days wearing the name of a w-day count.
+        """
+        out = self._features(tmp_path, monkeypatch)
+        series = out["n_upwell_events_14d"].isel(lat=0, lon=0).values
+
+        assert not np.array_equal(series[:3], np.array([1.0, 2.0, 3.0]))
+
+    def test_lagged_anomaly_still_nan_over_the_same_gap(self, tmp_path, monkeypatch):
+        """The two families should now agree about what is missing."""
+        out = self._features(tmp_path, monkeypatch)
+
+        for lag in cds._EKMAN_LAGS:
+            series = out[f"ekman_anom_lag{lag}"].isel(lat=0, lon=0).values
+            assert np.isnan(series[:lag]).all()

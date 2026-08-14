@@ -512,16 +512,25 @@ def add_engineered_ekman(
     # Exceedances: anomaly > local monthly p90
     exceed = ds_ekman["ekman_anom"] > p90_aligned
 
-    # Rolling counts for 3, 7, 14 days
+    # Rolling counts for 3, 7, 14 days.
+    #
+    # min_periods=w, not 1: a partial window returns a count over however many
+    # days exist, which is indistinguishable downstream from a genuine low
+    # count. The lagged anomalies above already report missing history as NaN
+    # (shift fills the leading positions), so this keeps the two families
+    # honest in the same way. Everywhere the range is warmed the NaN edge falls
+    # inside the warm-up and is trimmed off; it survives only where there is
+    # genuinely no prior data, i.e. the first days of the archive.
     for w in _EKMAN_EVENT_WINDOWS:
-        ds_ekman[f"n_upwell_events_{w}d"] = exceed.rolling(time=w, min_periods=1).sum()
+        ds_ekman[f"n_upwell_events_{w}d"] = exceed.rolling(time=w, min_periods=w).sum()
         ds_ekman[f"n_upwell_events_{w}d"].attrs.update(
             {
                 "long_name": f"Number of Ekman pumping upwelling events within {w}-days",
                 "units": "count",
                 "description": f"Daily count of events where Ekman pumping anomaly exceeded the 90th percentile "
                 f"threshold from the 1998 to 2017 monthly climatology computed for each grid cell and accumulated within a rolling {w}-day window. "
-                f"Values range from 0 (no events) to {w} (all days in the window exceed threshold). Note: values dont represent days but frequency of events.",
+                f"Values range from 0 (no events) to {w} (all days in the window exceed threshold), and are NaN until {w} days of history exist. "
+                f"Note: values dont represent days but frequency of events.",
             }
         )
 
