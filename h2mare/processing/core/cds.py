@@ -421,10 +421,18 @@ def get_previous_dates_da(da: xr.DataArray, var_key: str):
         return da
 
 
-def add_engineered_ekman(da: xr.DataArray, var_key: str):
+def add_engineered_ekman(
+    da: xr.DataArray, var_key: str, *, seed_from_store: bool = True
+):
     """Compute Ekman pumping related variables.
+
     Args:
         da: (xarray.DataArray) DataArray with variable 'ekman_pumping'
+        var_key: variable key, used to reach the store for warm-up history
+        seed_from_store: fetch :data:`_EKMAN_WARMUP_DAYS` of history from the
+            stored daily Zarr. The hourly path passes ``False``: it computes
+            ``ekman_pumping`` on the fly from an already-widened window, so
+            there is no stored daily ``ekman_pumping`` to read and none needed.
     """
     clim_dir = get_settings().CLIMATOLOGY_DIR
     if clim_dir is None:
@@ -442,7 +450,8 @@ def add_engineered_ekman(da: xr.DataArray, var_key: str):
     da_dt_ini = da.time.values[0]
     da_dt_fin = da.time.values[-1]
 
-    da = get_previous_dates_da(da, var_key)
+    if seed_from_store:
+        da = get_previous_dates_da(da, var_key)
 
     # Try to make it more efficient
     da = da.chunk({"time": 30, "lat": 200, "lon": 200})
@@ -606,12 +615,41 @@ def daily_waves(
 # -----------------------------------------
 
 
+#: Raw ERA5 fields kept as-is by the hourly store. Everything else this variable
+#: publishes (ekman_*, n_upwell_events_*, daily tp) is derived at compile time.
+_ATM_ACCUM_HOURLY_VARS = ("avg_iews", "avg_inss", "tp")
+
+
+def store_hourly_atm_accum(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Keep ERA5's native hourly stress and precipitation, deriving nothing.
+
+    The ekman chain cannot live here: it is daily by construction (a 7-day
+    rolling mean, day-lagged anomalies, per-day event counts), and computing it
+    at convert time is what forced the store to be daily. With ``time_step:
+    hourly`` those features move to ``compiler_registry._compile_atm_accum_avg``.
+
+    Left unclipped and in native units — ``compute_curl_and_ekman`` clips land
+    itself, and ``daily_total_rain`` does the m→mm conversion, so both still see
+    exactly the input they saw when they ran at convert time.
+    """
+    ds = rename_dims(ds)
+    ds = ds.chunk(
+        {"time": unified_time_chunk(ds), "lat": len(ds.lat), "lon": len(ds.lon)}
+    )
+    keep = [v for v in _ATM_ACCUM_HOURLY_VARS if v in ds.data_vars]
+    return ds[keep].isel(lat=slice(None, None, -1))
+
+
 def process_atm_accum_avg(
     ds: xr.Dataset,
     var_config: Optional[KeyVarConfigEntry] = None,
     var_key: str | None = None,
 ) -> xr.Dataset:
     """A first preprocessing is done in processor.py because data overlap at adjacent days in monthly grib files"""
+    if step_freq(var_config) == "h":
+        return store_hourly_atm_accum(ds)
+
     ds_ekman = compute_curl_and_ekman(ds)
     datasets = [
         ds_ekman,

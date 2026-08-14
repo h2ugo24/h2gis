@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -10,6 +11,8 @@ import pandas as pd
 import pytest
 import xarray as xr
 
+from h2mare.models import TimeStep
+from h2mare.processing import compiler_registry
 from h2mare.processing.compiler_registry import (
     COMPILE_PROCESSORS,
     _compile_atm_accum_avg,
@@ -19,6 +22,7 @@ from h2mare.processing.compiler_registry import (
     _compile_sst,
     compile_default,
 )
+from h2mare.processing.core.cds import _EKMAN_WARMUP_DAYS
 from h2mare.types import BBox, DateRange
 
 # ---------------------------------------------------------------------------
@@ -333,6 +337,86 @@ class TestCompileAtmAccumAvg:
         result = _compile_atm_accum_avg(compiler, catalog, _DR)
         assert result is not None
         assert "precip" in result.data_vars
+
+    def test_daily_store_reads_exactly_the_requested_window(self, tmp_path):
+        """The daily store already holds the features, so no warm-up is needed."""
+        compiler = _make_compiler(tmp_path)
+        catalog = _make_catalog(self._make_atm_ds())
+        _compile_atm_accum_avg(compiler, catalog, _DR)
+
+        kwargs = catalog.open_dataset.call_args.kwargs
+        assert kwargs["start_date"] == _DR.start
+
+
+class TestCompileAtmAccumAvgHourly:
+    """
+    With an hourly store the ekman chain is computed at compile time, so the
+    read has to reach back far enough to start the rolling features warm.
+    """
+
+    @staticmethod
+    def _capture_window(monkeypatch) -> dict:
+        seen: dict = {}
+
+        def _fake_open(catalog, var_key, date_range, bbox, **kwargs):
+            seen["range"] = date_range
+            return None  # short-circuits before any climatology is touched
+
+        monkeypatch.setattr(compiler_registry, "_open_or_warn", _fake_open)
+        return seen
+
+    def test_widens_the_read_by_the_ekman_warmup(self, tmp_path, monkeypatch):
+        seen = self._capture_window(monkeypatch)
+        compiler = _make_compiler(tmp_path)
+
+        result = compiler_registry._atm_accum_from_hourly(
+            compiler, _make_catalog(None), _DR
+        )
+
+        assert result is None
+        assert (_DR.start - seen["range"].start).days == _EKMAN_WARMUP_DAYS, (
+            "hourly compile must reach back far enough to warm ekman_anom_lag14"
+        )
+
+    def test_widening_extends_backwards_only(self, tmp_path, monkeypatch):
+        """The end must not move, or compile would emit days it was not asked for."""
+        seen = self._capture_window(monkeypatch)
+        compiler_registry._atm_accum_from_hourly(
+            _make_compiler(tmp_path), _make_catalog(None), _DR
+        )
+
+        assert seen["range"].end == _DR.end
+
+    def test_hourly_config_dispatches_to_the_hourly_path(self, tmp_path, monkeypatch):
+        called = {}
+
+        def _fake_hourly(compiler, catalog, date_range):
+            called["yes"] = True
+            return None
+
+        monkeypatch.setattr(compiler_registry, "_atm_accum_from_hourly", _fake_hourly)
+        compiler = _make_compiler(tmp_path)
+        compiler.app_config.variables = {
+            "atm-accum-avg": SimpleNamespace(time_step=TimeStep.HOURLY)
+        }
+
+        _compile_atm_accum_avg(compiler, _make_catalog(None), _DR)
+
+        assert called.get("yes"), "time_step: hourly must not read the daily path"
+
+    def test_daily_config_does_not_dispatch_to_the_hourly_path(
+        self, tmp_path, monkeypatch
+    ):
+        def _boom(compiler, catalog, date_range):
+            raise AssertionError("daily store must not take the hourly path")
+
+        monkeypatch.setattr(compiler_registry, "_atm_accum_from_hourly", _boom)
+        compiler = _make_compiler(tmp_path)
+        compiler.app_config.variables = {
+            "atm-accum-avg": SimpleNamespace(time_step=TimeStep.DAILY)
+        }
+
+        _compile_atm_accum_avg(compiler, _make_catalog(None), _DR)
 
 
 # ---------------------------------------------------------------------------
