@@ -18,6 +18,7 @@ from loguru import logger
 
 from h2mare.config import AppConfig, get_settings
 from h2mare.format_converters.base import BaseConverter
+from h2mare.models import StoreDtype, step_freq
 from h2mare.processing.registry import PROCESSORS
 from h2mare.storage.audit import format_date_blocks, known_gap_days
 from h2mare.storage.provenance import (
@@ -27,9 +28,15 @@ from h2mare.storage.provenance import (
 )
 from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
-from h2mare.storage.xarray_helpers import chunk_dataset, rename_dims, snap_grid_coords
+from h2mare.storage.xarray_helpers import (
+    chunk_dataset,
+    int16_encoding,
+    rename_dims,
+    snap_grid_coords,
+)
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import DateLike, DateRange, TimeResolution
+from h2mare.utils.datetime_utils import normalize_date
 from h2mare.utils.files_io import filter_raw_files, safe_move_files, safe_rmtree
 from h2mare.utils.paths import resolve_download_path
 from h2mare.validators import validate_time_resolution, validate_var_key
@@ -48,11 +55,35 @@ def _close_all(*datasets: Optional[xr.Dataset]) -> None:
             logger.debug(f"Ignoring error while closing dataset: {e}")
 
 
-def _dataset_dates(ds: xr.Dataset) -> pd.DatetimeIndex:
-    """Unique calendar days on a dataset's time axis, sorted. Empty if time-less."""
+def _dataset_dates(ds: xr.Dataset, freq: str = "D") -> pd.DatetimeIndex:
+    """
+    Unique time steps on a dataset's axis, sorted. Empty if time-less.
+
+    A daily axis is normalized first, so a product publishing at 12:00 counts as
+    its calendar day. An hourly axis is left as-is: normalizing it would collapse
+    24 steps onto one and make the date checks blind to a missing hour.
+    """
     if "time" not in ds.coords:
         return pd.DatetimeIndex([])
-    return pd.DatetimeIndex(ds.time.values).normalize().unique().sort_values()
+    times = pd.DatetimeIndex(ds.time.values)
+    if freq == "D":
+        times = times.normalize()
+    return times.unique().sort_values()
+
+
+def _span_end(end: DateLike, freq: str) -> pd.Timestamp:
+    """
+    Last step of *end*'s day at *freq*.
+
+    Manifest spans are date-level, so on an hourly cadence a range ending at the
+    end date's midnight would expect one step of the final day and report the
+    other 23 as undelivered.
+
+    Both sources of *end* (a DateRange bound and a manifest date string) are
+    already at midnight, so the normalize is a no-op that only pins the type.
+    """
+    ts = normalize_date(end)
+    return ts if freq == "D" else ts + pd.Timedelta(hours=23)
 
 
 def convert_netcdf_to_zarr(
@@ -172,6 +203,22 @@ class Netcdf2Zarr(BaseConverter):
 
         self.catalog = ZarrCatalog(self.var_key, store_root=store_root)
         self.store_root = self.catalog.store_root
+
+    def _encoding(self, ds: xr.Dataset) -> Optional[dict]:
+        """
+        Encoding for a store being created, or None to write as always.
+
+        Only consulted on a first write: write_append_zarr ignores it when the
+        path exists, because an append inherits the store's own encoding.
+        """
+        if self.var_config.store_dtype is not StoreDtype.INT16:
+            return None
+        return int16_encoding(ds)
+
+    @property
+    def _step_freq(self) -> str:
+        """Cadence of this variable's store, as a pandas frequency alias."""
+        return step_freq(self.var_config)
 
     def run(
         self,
@@ -602,8 +649,8 @@ class Netcdf2Zarr(BaseConverter):
             ds = self.process_dataset(ds_raw)
             path = self.catalog.build_file_path(ds, self.date_format)
             # Read the axis before the write: write_append_zarr closes ds.
-            written = _dataset_dates(ds)
-            write_append_zarr(self.var_key, ds, path)
+            written = _dataset_dates(ds, self._step_freq)
+            write_append_zarr(self.var_key, ds, path, encoding=self._encoding(ds))
             # Deliberately before _archive_raw_files and _cleanup_period_files:
             # a failure here must leave the raw files where they are, so the
             # period can simply be re-converted once the gap is understood.
@@ -676,13 +723,15 @@ class Netcdf2Zarr(BaseConverter):
         end = min(max(e for _, e in spans), bounds.end)
         if start > end:
             return pd.DatetimeIndex([])
-        return pd.date_range(start, end, freq="D")
+        return pd.date_range(
+            start, _span_end(end, self._step_freq), freq=self._step_freq
+        )
 
     def _stored_dates(self, path: Path) -> pd.DatetimeIndex:
         """Time axis of the Zarr just written. Coordinate read only — no data."""
         try:
             with xr.open_zarr(path, consolidated=False) as stored:
-                return _dataset_dates(stored)
+                return _dataset_dates(stored, self._step_freq)
         except Exception as e:
             logger.warning(f"Could not read back the time axis of {path.name}: {e}")
             return pd.DatetimeIndex([])
@@ -726,10 +775,15 @@ class Netcdf2Zarr(BaseConverter):
             return
 
         span_start, span_end = written[0], written[-1]
-        missing = pd.date_range(span_start, span_end, freq="D").difference(stored)
+        missing = pd.date_range(span_start, span_end, freq=self._step_freq).difference(
+            stored
+        )
         # Days the provider never published are not the pipeline's doing, and
         # failing on them would make a whole period permanently unconvertible.
-        missing = missing.difference(known_gap_days(self.var_config))
+        # known_gaps are whole days: match a missing step by its day, or an
+        # hourly axis would keep reporting the 23 non-midnight steps forever.
+        gap_days = known_gap_days(self.var_config)
+        missing = missing[~missing.normalize().isin(gap_days)]
         if len(missing):
             raise RuntimeError(
                 f"[{self.var_key}] period {period}: {len(missing)} day(s) missing "

@@ -1,5 +1,7 @@
 """Tests for processing/core/cds.py pure transformation functions."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -315,3 +317,92 @@ class TestProcessWaves:
         result = process_waves(ds)
         assert len(result.time) == 2
         assert list(result.lat.values) == list(reversed(ds.lat.values))
+
+
+# ---------------------------------------------------------------------------
+# process_waves — cadence selected by config
+# ---------------------------------------------------------------------------
+
+
+class TestProcessWavesCadence:
+    """
+    time_step decides whether convert aggregates. The signal reaches the
+    processor through var_config, which every processor already receives.
+    """
+
+    @staticmethod
+    def _ds():
+        shape = (48, 2, 2)
+        return _hourly_ds(
+            2,
+            swh=np.full(shape, 1.5),
+            mdts=np.full(shape, 180.0),
+        )
+
+    def test_daily_config_aggregates_as_before(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_waves
+
+        cfg = SimpleNamespace(time_step=TimeStep.DAILY)
+        out = process_waves(self._ds(), cfg, "waves")
+
+        assert out.sizes["time"] == 2, "daily store must still be one step per day"
+        assert set(out.data_vars) == {"swh", "mdts"}
+
+    def test_hourly_config_keeps_the_native_axis(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_waves
+
+        cfg = SimpleNamespace(time_step=TimeStep.HOURLY)
+        out = process_waves(self._ds(), cfg, "waves")
+
+        assert out.sizes["time"] == 48, "hourly store must keep every step"
+        assert set(out.data_vars) == {"swh", "mdts"}
+
+    def test_missing_config_defaults_to_daily(self):
+        """A processor called without config keeps the historical behaviour."""
+        from h2mare.processing.core.cds import process_waves
+
+        out = process_waves(self._ds(), None, "waves")
+        assert out.sizes["time"] == 2
+
+
+# ---------------------------------------------------------------------------
+# mdts is a direction — circular, not linear
+# ---------------------------------------------------------------------------
+
+
+class TestWaveDirectionIsCircular:
+    """
+    Averaging degrees arithmetically is wrong across the 0/360 wrap: 350° and
+    10° are 20° apart and average to 0°, not 180°.
+    """
+
+    @staticmethod
+    def _wrapping_ds():
+        """One day whose directions straddle north: half at 350°, half at 10°."""
+        shape = (24, 2, 2)
+        mdts = np.full(shape, 350.0)
+        mdts[12:] = 10.0
+        return _hourly_ds(1, swh=np.full(shape, 2.0), mdts=mdts)
+
+    def test_daily_mean_direction_does_not_flip_across_north(self):
+        out = daily_waves(self._wrapping_ds())
+        got = float(out["mdts"].isel(time=0, lat=0, lon=0))
+
+        # 0/360 are the same heading, so accept either end.
+        assert min(got, 360.0 - got) < 1e-6, (
+            f"expected ~0/360 (north), got {got} — arithmetic mean would give 180"
+        )
+
+    def test_height_still_averages_arithmetically(self):
+        out = daily_waves(self._wrapping_ds())
+        assert float(out["swh"].isel(time=0, lat=0, lon=0)) == pytest.approx(2.0)
+
+    def test_uv_round_trip_preserves_direction(self):
+        from h2mare.processing.core.cds import uv_to_direction
+
+        da = xr.DataArray([0.0, 10.0, 90.0, 180.0, 350.0], dims="time")
+        comp = direction_to_uv(da)
+        back = uv_to_direction(comp["u_ts"], comp["v_ts"])
+        np.testing.assert_allclose(back.values, da.values, atol=1e-9)

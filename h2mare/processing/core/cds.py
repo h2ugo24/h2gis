@@ -15,7 +15,7 @@ import xarray as xr
 from loguru import logger
 
 from h2mare import get_settings
-from h2mare.models import KeyVarConfigEntry
+from h2mare.models import KeyVarConfigEntry, step_freq
 from h2mare.storage.xarray_helpers import rename_dims, unified_time_chunk
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.utils.spatial import clip_land_data
@@ -479,6 +479,24 @@ def add_engineered_ekman(da: xr.DataArray, var_key: str):
 # ----------------
 # ---- Waves ----
 # ----------------
+def uv_to_direction(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
+    """
+    Recombine unit-vector components into a direction in degrees (0–360).
+
+    Inverse of :func:`direction_to_uv`. Any averaging or interpolation of a
+    direction has to go through the components: degrees wrap, so the arithmetic
+    mean of 350° and 10° is 180° — the opposite heading — and a linear
+    interpolation between them sweeps the long way round.
+
+    Known and accepted: when the averaged directions nearly cancel, the
+    resultant approaches zero and this returns 0° (north) rather than "no
+    coherent direction". Rare for real swell, and the alternatives — nulling
+    below a resultant-length threshold, or carrying the length as a coherence
+    column — both change what downstream sees, so the convention stands.
+    """
+    return np.rad2deg(np.arctan2(v, u)) % 360
+
+
 def direction_to_uv(da: xr.DataArray) -> xr.Dataset:
     """
     Convert directional variable (degrees) into vector components.
@@ -542,15 +560,15 @@ def daily_waves(
     if time_dim not in ds.dims:
         raise ValueError(f"Dataset does not have dimension '{time_dim}'")
 
-    da_h = ds[swell_height_name]
-    da_d = ds[swell_direction_name]
-    out = xr.Dataset(
-        {
-            swell_height_name: da_h,  # .resample({time_dim: "1D"}).mean(),
-            swell_direction_name: da_d,  # .resample({time_dim: "1D"}).mean()
-        }
+    # Height is a magnitude and averages directly. Direction does not: it is
+    # degrees on a circle, so the daily mean is taken over unit vectors and
+    # recombined. A plain mean of 350° and 10° gives 180°, the opposite heading.
+    out = resample_daily_mean(xr.Dataset({swell_height_name: ds[swell_height_name]}))
+    components = (
+        direction_to_uv(ds[swell_direction_name]).resample({time_dim: "1D"}).mean()
     )
-    out = resample_daily_mean(out)
+    out[swell_direction_name] = uv_to_direction(components["u_ts"], components["v_ts"])
+    out[swell_direction_name].attrs.update(ds[swell_direction_name].attrs)
     out.attrs.update(ds.attrs)
     return drop_dims(out)
 
@@ -610,13 +628,47 @@ def process_radiation(
     return merged.isel(lat=slice(None, None, -1))
 
 
+def hourly_waves(
+    ds: xr.Dataset,
+    swell_height_name: str = "swh",
+    swell_direction_name: str = "mdts",
+    time_dim: str = "time",
+) -> xr.Dataset:
+    """
+    Wave fields at the source's own cadence — :func:`daily_waves` without the
+    resample.
+
+    Deliberately a sibling rather than a flag on ``daily_waves``: the daily path
+    feeds every existing store and h2ds column, so it is left byte-identical.
+    """
+    if time_dim not in ds.dims:
+        raise ValueError(f"Dataset does not have dimension '{time_dim}'")
+
+    out = xr.Dataset(
+        {
+            swell_height_name: ds[swell_height_name],
+            swell_direction_name: ds[swell_direction_name],
+        }
+    )
+    out.attrs.update(ds.attrs)
+    return drop_dims(out)
+
+
 def process_waves(
     ds: xr.Dataset,
     var_config: Optional[KeyVarConfigEntry] = None,
     var_key: str | None = None,
 ) -> xr.Dataset:
+    """
+    Prepare the wave fields, aggregating to daily only for a daily store.
+
+    With ``time_step: hourly`` the resample is skipped here and happens at
+    compile instead (see ``compiler_registry._compile_waves``), so the store
+    keeps ERA5's native hourly axis while h2ds stays daily.
+    """
     ds = rename_dims(ds)
     ds = ds.chunk(
         {"time": unified_time_chunk(ds), "lat": len(ds.lat), "lon": len(ds.lon)}
     )
-    return daily_waves(ds).isel(lat=slice(None, None, -1))
+    build = hourly_waves if step_freq(var_config) == "h" else daily_waves
+    return build(ds).isel(lat=slice(None, None, -1))

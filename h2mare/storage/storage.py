@@ -16,7 +16,7 @@ import xarray as xr
 from loguru import logger
 
 from h2mare.storage.xarray_helpers import snap_grid_coords
-from h2mare.types import BBox, DateRange
+from h2mare.types import BBox
 
 
 def _read_root_attrs(path: Path) -> dict:
@@ -55,6 +55,7 @@ def write_append_zarr(
     var_key: str,
     ds: xr.Dataset,
     path: Path,
+    encoding: Optional[dict] = None,
 ) -> None:
     """
     Write dataset, checking temporal overlap and appending data if path exists.
@@ -63,6 +64,10 @@ def write_append_zarr(
         var_key: Variable key, must exist in app_config.variables (used for overlap resolution)
         ds: New dataset to write/append
         path: Destination zarr path, built by the caller via ``ZarrCatalog.build_file_path()``
+        encoding: Per-variable zarr encoding, applied only when *path* does not
+            exist yet. An existing store keeps the encoding it was created with:
+            appends inherit it from disk, and passing one to an append is an
+            error. None (the default) writes exactly what it always has.
     """
     # Canonicalize grid labels before any write/append so float-noise drift —
     # between a source's reprocessed periods, or between new data and a legacy
@@ -106,7 +111,7 @@ def write_append_zarr(
         tmp_path = path.with_name(path.name + ".tmp")
         shutil.rmtree(tmp_path, ignore_errors=True)
         try:
-            ds.to_zarr(tmp_path)
+            ds.to_zarr(tmp_path, encoding=encoding or None)
             xr.open_zarr(tmp_path, consolidated=False).close()
         except Exception as e:
             shutil.rmtree(tmp_path, ignore_errors=True)
@@ -136,38 +141,16 @@ def _restore_orphaned_backup(path: Path) -> None:
         shutil.move(str(backup_path), str(path))
 
 
-def _is_subdaily(times: Optional[pd.DatetimeIndex]) -> bool:
-    """
-    True when *times* carries more than one step per calendar day.
-
-    Deliberately not "any non-midnight stamp": daily products stamped at 12:00
-    are common and supported (see the noon-stamped store in
-    ``tests/test_zarr_catalog.py``), and whole-day arithmetic handles them
-    correctly. Only genuine sub-daily sampling breaks the rewrite path.
-    """
-    if times is None or len(times) < 2:
-        return False
-    unique = times.unique()
-    return len(unique) > len(unique.normalize().unique())
+# Smallest step pandas can represent at datetime64[ns], so `t - _ONE_TICK` is
+# the largest instant strictly before t. Used to make a window boundary
+# exclusive without assuming anything about the axis's cadence.
+_ONE_TICK = pd.Timedelta(nanoseconds=1)
 
 
-def _reject_subdaily_rewrite(
-    old_times: Optional[pd.DatetimeIndex], ds_new: xr.Dataset, path: Path
-) -> None:
-    """Refuse an overlap rewrite when either side is sub-daily (see the caller)."""
-    new_times = (
-        pd.DatetimeIndex(ds_new.time.values) if "time" in ds_new.coords else None
-    )
-    if not (_is_subdaily(old_times) or _is_subdaily(new_times)):
-        return
-    raise ValueError(
-        f"Refusing to rewrite {path.name}: the incoming window overlaps stored "
-        "data and at least one side has a sub-daily time axis. The overlap merge "
-        "resolves its retained head and tail in whole days, so it would silently "
-        "drop the sub-daily steps either side of the rewritten window (23 hours "
-        "per boundary on hourly data). Delete the affected period and write it "
-        "fresh instead — fresh writes and strictly-after appends are sub-daily safe."
-    )
+def _time_bounds(ds: xr.Dataset) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """First and last actual timestamps on *ds*'s time axis."""
+    times = ds.time.values
+    return pd.Timestamp(times[0]), pd.Timestamp(times[-1])
 
 
 def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
@@ -222,9 +205,6 @@ def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
         # redundant open handle (zarr stores are lazy so this is safe).
         missing_vars = sorted(ds_old_vars - ds_new_vars)
         old_chunk_sizes = {dim: sizes[0] for dim, sizes in ds_old.chunksizes.items()}
-        old_times = (
-            pd.DatetimeIndex(ds_old.time.values) if "time" in ds_old.coords else None
-        )
         ds_old.close()
 
         # Clean trailing append (same vars, same grid, strictly after the
@@ -232,15 +212,6 @@ def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
         # path would otherwise copy ~a full year of data per incremental run.
         if _try_append_fast_path(ds_new, path):
             return None
-
-        # Past the fast path this is a rewrite, and the rewrite resolves what to
-        # retain in whole days: _resolve_overlap compares DateRanges (which
-        # normalize to midnight) for the head, and the tail slice below starts at
-        # new_end + 1 day. On a sub-daily axis both round away the steps either
-        # side of the rewritten window — measured at 23 hours per boundary on
-        # hourly data — and nothing reports it. Refuse rather than delete data
-        # the caller cannot see go missing.
-        _reject_subdaily_rewrite(old_times, ds_new, path)
 
         ds_resolved = _resolve_overlap(ds_new, path)
 
@@ -269,7 +240,10 @@ def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
         # file that extends through June) would otherwise drop April-June.
         new_end = pd.Timestamp(ds_new.time.values[-1])
         ds_old_tail = xr.open_zarr(path, consolidated=False)
-        tail = ds_old_tail.sel(time=slice(new_end + pd.Timedelta(days=1), None))
+        # Strictly after the incoming window's last instant. A `+ 1 day` bound
+        # here would skip every stored step falling later the same day as
+        # new_end — 23 of them on an hourly axis.
+        tail = ds_old_tail.sel(time=slice(new_end + _ONE_TICK, None))
         if tail.sizes.get("time", 0):
             parts.append(_shared_time_vars(snap_grid_coords(tail)))
             src_to_close.append(ds_old_tail)
@@ -486,8 +460,12 @@ def _resolve_overlap(ds_new: xr.Dataset, path: Path) -> Optional[xr.Dataset]:
                 f"{len(only_in_old)} not in new data."
             )
 
-    daterange_old = DateRange.from_dataset(ds_old)
-    daterange_new = DateRange.from_dataset(ds_new)
+    # Boundaries come from the actual timestamps, not from DateRange, which
+    # normalizes both ends to midnight. Day-granular boundaries silently drop
+    # data whenever a store's stamps are not at midnight: 23 hours per boundary
+    # on an hourly axis, and the whole preceding day on a noon-stamped daily one.
+    old_first, old_last = _time_bounds(ds_old)
+    new_first, new_last = _time_bounds(ds_new)
 
     if not BBox.from_dataset(ds_old).overlaps(BBox.from_dataset(ds_new)):
         # A plain ValueError (not assert — assertions vanish under `python -O`)
@@ -502,26 +480,24 @@ def _resolve_overlap(ds_new: xr.Dataset, path: Path) -> Optional[xr.Dataset]:
             "bbox changed since this store was written?"
         )
 
-    if daterange_old == daterange_new and ds_old_vars == ds_new_vars:
+    if (old_first, old_last) == (new_first, new_last) and ds_old_vars == ds_new_vars:
         logger.info(f"Full overlap with {path.name} — replacing entirely.")
         ds_old.close()
         return None
 
-    if daterange_old.overlaps(daterange_new):
+    if old_first <= new_last and old_last >= new_first:
         logger.debug(f"Temporal overlap with {path.name} — merging.")
 
-        if (
-            daterange_new.start <= daterange_old.start
-            and daterange_new.end >= daterange_old.end
-        ):
+        if new_first <= old_first and new_last >= old_last:
             logger.info("New data fully contains existing data — replacing entirely.")
             ds_old.close()
             return None
 
-        # Keep the non-overlapping head of ds_old — slice directly, no second zarr open
-        cutoff_date = daterange_new.start - pd.Timedelta(days=1)
-        start_date = min(daterange_old.start, daterange_new.start)
-        ds_subset = ds_old.sel(time=slice(start_date, cutoff_date))
+        # Keep the head of ds_old that sits strictly before the incoming window
+        # — slice directly, no second zarr open. The bound is one tick short of
+        # new_first rather than a day short, so a step on the same day as the
+        # incoming start but earlier than it is retained rather than discarded.
+        ds_subset = ds_old.sel(time=slice(None, new_first - _ONE_TICK))
         return ds_subset if len(ds_subset.time) > 0 else None
 
     return ds_old

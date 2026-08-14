@@ -2,9 +2,57 @@
 Classes representing Data models for spatial and variable configurations.
 """
 
+from enum import Enum
 from typing import Optional
 
 import msgspec
+
+
+class TimeStep(str, Enum):
+    """
+    Native cadence of a variable's stored Zarr — how far apart its time steps are.
+
+    Distinct from :class:`h2mare.types.TimeResolution`, which selects the *file*
+    period a store is split into (one Zarr per year or per month). A store can be
+    hourly and still be written one file per year.
+
+    Also distinct from ``expect_daily``, which asks whether the axis is allowed to
+    skip a day, not how finely it is sampled.
+    """
+
+    DAILY = "daily"
+    HOURLY = "hourly"
+
+
+class StoreDtype(str, Enum):
+    """
+    On-disk encoding for a variable's Zarr.
+
+    ``FLOAT32`` (the default) writes what the pipeline has always written and is
+    byte-identical to it. ``INT16`` stores scale/offset-packed integers instead,
+    matching the ~16-bit packing ERA5's GRIB already uses — so it discards
+    quantisation noise rather than signal, at roughly two thirds the size.
+
+    Opt-in per variable: a store keeps whatever encoding it was created with,
+    and appends inherit it.
+    """
+
+    FLOAT32 = "float32"
+    INT16 = "int16"
+
+
+def step_freq(var_config) -> str:
+    """
+    Pandas frequency alias matching a variable's cadence — ``"h"`` or ``"D"``.
+
+    Used by the gap checks so they compare a store against a calendar at its own
+    resolution: a daily grid cannot see a missing hour, and an hourly grid built
+    for a daily store would report 23 phantom gaps per day.
+
+    Takes any object with a ``time_step`` attribute and defaults to daily, so
+    stand-in configs and entries predating the field keep the old behaviour.
+    """
+    return "h" if getattr(var_config, "time_step", None) is TimeStep.HOURLY else "D"
 
 
 class KeyVarConfigEntry(msgspec.Struct):
@@ -92,6 +140,19 @@ class KeyVarConfigEntry(msgspec.Struct):
     # of anything. This is about the *axis*, not the values: a day present but
     # entirely null is a source gap and is deliberately not flagged.
     expect_daily: bool = True
+    # Cadence of this variable's stored Zarr. DAILY (the default, and what every
+    # existing store is) means one step per calendar day. HOURLY keeps the
+    # source's sub-daily axis instead of aggregating it away at convert time —
+    # for ERA5 that preserves the native resolution the raw GRIB already has.
+    #
+    # Read paths normalize a DAILY store's stamps to midnight (sources often
+    # publish at 12:00); doing that to an HOURLY store would collapse 24 steps
+    # onto one timestamp, so the normalization is skipped for it.
+    time_step: TimeStep = TimeStep.DAILY
+    # On-disk encoding. Default writes exactly what it always has; INT16 packs
+    # to scale/offset integers (see StoreDtype). Only consulted when a store is
+    # first created — an existing store keeps its own encoding through appends.
+    store_dtype: StoreDtype = StoreDtype.FLOAT32
     # Days the provider never published, which therefore cannot be downloaded,
     # converted or backfilled. Each entry is either "YYYY-MM-DD" or a closed
     # interval "YYYY-MM-DD/YYYY-MM-DD".

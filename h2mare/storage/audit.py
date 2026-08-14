@@ -46,6 +46,7 @@ import xarray as xr
 from loguru import logger
 
 from h2mare.config import AppConfig, get_settings
+from h2mare.models import step_freq
 from h2mare.types import DateRange
 from h2mare.utils.paths import resolve_store_path
 from h2mare.validators import validate_var_key
@@ -200,9 +201,9 @@ def format_date_blocks(dates: pd.DatetimeIndex, max_blocks: int = 8) -> str:
     return ", ".join(shown)
 
 
-def interior_gaps(dates: pd.DatetimeIndex) -> pd.DatetimeIndex:
+def interior_gaps(dates: pd.DatetimeIndex, freq: str = "D") -> pd.DatetimeIndex:
     """
-    Days absent from *dates*, strictly between its own first and last entry.
+    Steps absent from *dates*, strictly between its own first and last entry.
 
     Restricting to the interior is what makes this usable without an allowlist.
     A store whose tail stops short of today is ordinary provider lag; a day the
@@ -210,11 +211,19 @@ def interior_gaps(dates: pd.DatetimeIndex) -> pd.DatetimeIndex:
     not. Across all 435 files of the production store this rule produced two
     findings and no false positives — chl's null days included, since they are
     on the axis.
+
+    *freq* is the store's own cadence (see :func:`h2mare.models.step_freq`).
+    Daily stamps are normalized first, so a product publishing at 12:00 counts
+    as its calendar day; an hourly axis is compared as-is, because normalizing
+    it would hide every missing hour behind the day that survives.
     """
     if len(dates) < 2:
         return pd.DatetimeIndex([])
-    dates = pd.DatetimeIndex(dates).normalize().unique().sort_values()
-    return pd.date_range(dates[0], dates[-1], freq="D").difference(dates)
+    dates = pd.DatetimeIndex(dates)
+    if freq == "D":
+        dates = dates.normalize()
+    dates = dates.unique().sort_values()
+    return pd.date_range(dates[0], dates[-1], freq=freq).difference(dates)
 
 
 def check_slice_health(
@@ -305,6 +314,7 @@ def audit_zarr_file(
     check_values: bool = False,
     known_gaps: Optional[pd.DatetimeIndex] = None,
     value_window: Optional[DateRange] = None,
+    freq: str = "D",
 ) -> tuple[
     Optional[AxisGap],
     list[SliceIssue],
@@ -327,10 +337,16 @@ def audit_zarr_file(
         if "time" not in ds.coords:
             return None, [], None
 
-        dates = pd.DatetimeIndex(ds.time.values).normalize().unique().sort_values()
-        missing = interior_gaps(dates)
+        dates = pd.DatetimeIndex(ds.time.values)
+        if freq == "D":
+            dates = dates.normalize()
+        dates = dates.unique().sort_values()
+        missing = interior_gaps(dates, freq=freq)
         if known_gaps is not None and len(missing):
-            missing = missing.difference(known_gaps)
+            # known_gaps are whole days, so drop a missing step whose *day* is
+            # listed — on an hourly axis a day-level difference() matches only
+            # the 00:00 step and would leave the other 23 reported forever.
+            missing = missing[~missing.normalize().isin(known_gaps)]
         gap = (
             AxisGap(path=path, span=(dates[0], dates[-1]), missing=missing)
             if len(missing)
@@ -388,6 +404,9 @@ def audit_var_key(
     errors: list[str] = []
 
     suppressed = known_gap_days(config.variables[var_key])
+    # Compare each store against a calendar at its own cadence: a daily grid
+    # cannot see a missing hour in an hourly store.
+    freq = step_freq(config.variables[var_key])
 
     files = sorted(root.glob("*.zarr")) if root.exists() else []
 
@@ -409,6 +428,7 @@ def audit_var_key(
             check_values=check_values,
             known_gaps=suppressed,
             value_window=value_window,
+            freq=freq,
         )
         if gap:
             gaps.append(gap)

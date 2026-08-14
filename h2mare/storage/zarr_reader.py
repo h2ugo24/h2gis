@@ -11,14 +11,31 @@ from __future__ import annotations
 
 from typing import Sequence
 
+import numpy as np
 import pandas as pd
 import xarray as xr
 from loguru import logger
 
+from h2mare.models import StoreDtype, TimeStep
 from h2mare.storage.zarr_index import ZarrIndex
 from h2mare.types import BBox, DateLike, DateRange
-from h2mare.utils.datetime_utils import normalize_dates
+from h2mare.utils.datetime_utils import normalize_date, normalize_dates
 from h2mare.utils.spatial import sel_padded_bbox
+
+# One nanosecond short of the next midnight — pandas' datetime64[ns] resolution,
+# so nothing can fall between this and the following day.
+_LAST_INSTANT_OF_DAY = pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+
+
+def _end_of_day(ts: pd.Timestamp) -> pd.Timestamp:
+    """
+    Last representable instant of *ts*'s calendar day.
+
+    Turns a date-level upper bound into one that covers the whole day, so an
+    inclusive ``slice`` keeps every sub-daily step of the final day instead of
+    stopping at its midnight stamp.
+    """
+    return normalize_date(ts) + _LAST_INSTANT_OF_DAY
 
 
 class ZarrReader:
@@ -168,11 +185,12 @@ class ZarrReader:
             raise RuntimeError(f"Failed to open zarr files: {e}") from e
 
         # Normalize time coordinates
-        ds = self._normalize_time(ds)
+        ds = self._undo_decode_widening(self._normalize_time(ds))
 
         # Select only requested dates
         requested_dates = pd.DatetimeIndex(date_list).normalize()
-        available_dates = pd.DatetimeIndex(ds.time.values).normalize()
+        day_of_step = pd.DatetimeIndex(ds.time.values).normalize()
+        available_dates = day_of_step.unique()
 
         valid_dates = requested_dates.intersection(available_dates)
 
@@ -187,7 +205,11 @@ class ZarrReader:
             missing = requested_dates.difference(available_dates)
             self._log("warning", f"Missing dates: {missing.tolist()}")
 
-        return ds.sel(time=valid_dates.tolist())
+        # Select by calendar day rather than exact timestamp: on a sub-daily
+        # axis only the midnight step matches a normalized date, so exact
+        # selection would return one hour per requested day. Equivalent to the
+        # old timestamp selection for a daily store.
+        return ds.isel(time=np.flatnonzero(day_of_step.isin(valid_dates)))
 
     def _open_date_range(
         self,
@@ -267,26 +289,73 @@ class ZarrReader:
             raise RuntimeError(f"Failed to open zarr files: {e}") from e
 
         # Normalize time
-        ds = self._normalize_time(ds)
+        ds = self._undo_decode_widening(self._normalize_time(ds))
 
-        # Select time range
-        return ds.sel(time=slice(start, end))
+        # Select time range. `end` names a calendar day, so the window runs to
+        # the *end* of that day, not to its midnight stamp: an inclusive slice
+        # at midnight returns only the first step of the final day on a
+        # sub-daily axis, silently dropping the other 23 hours. Identical to
+        # slice(start, end) for a daily store, whose stamps are all midnight.
+        return ds.sel(time=slice(start, _end_of_day(end)))
 
     def _normalize_time(self, ds: xr.Dataset) -> xr.Dataset:
         """
-        Normalize time coordinates to midnight (00:00:00).
+        Normalize time coordinates to midnight (00:00:00), for daily stores only.
+
+        Daily products are often published stamped at 12:00, and callers select
+        by calendar day, so snapping to midnight is what makes ``sel`` and the
+        date bookkeeping line up.
+
+        Skipped for an ``HOURLY`` store: there the sub-daily stamps *are* the
+        data, and snapping them would map all 24 steps of a day onto one
+        timestamp — 8784 steps collapsing to 366 duplicated stamps for a year,
+        silently and without error.
 
         Args:
             ds: Dataset with time coordinate
 
         Returns:
-            Dataset with normalized time
+            Dataset with normalized time, or *ds* unchanged for an hourly store.
         """
         if "time" not in ds.coords:
             return ds
 
+        if self._time_step is TimeStep.HOURLY:
+            return ds
+
         normalized_time = pd.to_datetime(ds["time"].values).normalize()
         return ds.assign_coords(time=normalized_time)
+
+    def _undo_decode_widening(self, ds: xr.Dataset) -> xr.Dataset:
+        """
+        Bring an int16 store's variables back to float32 after CF decoding.
+
+        scale_factor/add_offset decoding promotes to float64 regardless of the
+        stored dtype — zarr attributes round-trip through JSON, so the scale
+        loses its own dtype on the way out. Left alone, an int16 store would cost
+        twice the memory of the float32 one it replaced. Only applied to stores
+        declared int16, so nothing else is touched.
+        """
+        cfg = self._index.var_config
+        if getattr(cfg, "store_dtype", None) is not StoreDtype.INT16:
+            return ds
+        casts = {
+            name: da.astype("float32")
+            for name, da in ds.data_vars.items()
+            if da.dtype == "float64"
+        }
+        return ds.assign(casts) if casts else ds
+
+    @property
+    def _time_step(self) -> TimeStep:
+        """
+        Configured cadence for this store, defaulting to DAILY.
+
+        Read from the index's ``var_config`` rather than global settings so an
+        injected ``app_config`` is honoured. Defaults when the entry is a
+        stand-in without the field, keeping config-free reads on the old path.
+        """
+        return getattr(self._index.var_config, "time_step", TimeStep.DAILY)
 
     def _preprocess_dataset(
         self,

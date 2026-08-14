@@ -16,6 +16,38 @@ def xr_float64_to_float32(ds: xr.Dataset) -> xr.Dataset:
 ds_float64_to_float32 = xr_float64_to_float32
 
 
+def int16_encoding(ds: xr.Dataset, level: int = 9) -> dict:
+    """
+    Scale/offset int16 encoding, one scale per data variable.
+
+    The scale spans each variable's own range over 65000 levels, which for ERA5
+    lands well inside the source's own precision (msl ~0.15 Pa, wind ~0.001 m/s).
+    NaN — land, or a gap — round-trips through ``_FillValue``.
+
+    Computing the range forces one pass over the data. That is deliberate: a
+    fixed guess would clip, and clipping is silent.
+    """
+    import zarr
+
+    encoding: dict = {}
+    for name, da in ds.data_vars.items():
+        lo = float(da.min().compute())
+        hi = float(da.max().compute())
+        span = hi - lo
+        if not np.isfinite(span) or span == 0:
+            # Degenerate or all-NaN: packing buys nothing and the scale would be
+            # zero or non-finite, so leave this variable on the default encoding.
+            continue
+        encoding[name] = {
+            "dtype": "int16",
+            "scale_factor": span / 65000.0,
+            "add_offset": (hi + lo) / 2.0,
+            "_FillValue": -32767,
+            "compressors": [zarr.codecs.ZstdCodec(level=level)],
+        }
+    return encoding
+
+
 def get_dataset_encoding(ds: xr.Dataset) -> dict:
     """
     Get the chunking configuration for all variables in a Dataset. To be fed to function to_zarr encoding argument.
