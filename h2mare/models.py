@@ -16,8 +16,8 @@ class TimeStep(str, Enum):
     period a store is split into (one Zarr per year or per month). A store can be
     hourly and still be written one file per year.
 
-    Also distinct from ``expect_daily``, which asks whether the axis is allowed to
-    skip a day, not how finely it is sampled.
+    Also distinct from ``expect_contiguous_time``, which asks whether the axis is
+    allowed to skip a step, not how finely it is sampled.
     """
 
     DAILY = "daily"
@@ -133,13 +133,13 @@ class KeyVarConfigEntry(msgspec.Struct):
     # var_key. Used to select only these columns when adding a variable to an
     # existing Parquet store (--add-var). None means not yet declared.
     compiled_vars: Optional[list[str]] = None
-    # Whether this product publishes one time step per calendar day. True
-    # (default) lets the convert step reject a Zarr whose time axis skips a day
-    # inside the range it just wrote. Set False only for products with a
-    # coarser or irregular native cadence, where a missing day is not evidence
-    # of anything. This is about the *axis*, not the values: a day present but
-    # entirely null is a source gap and is deliberately not flagged.
-    expect_daily: bool = True
+    # Whether this product publishes an unbroken time axis at its own cadence
+    # (see ``time_step``). True (default) lets the convert step reject a Zarr
+    # whose axis skips a step inside the range it just wrote. Set False only for
+    # products with an irregular native cadence, where a missing step is not
+    # evidence of anything. This is about the *axis*, not the values: a step
+    # present but entirely null is a source gap and is deliberately not flagged.
+    expect_contiguous_time: bool = True
     # Cadence of this variable's stored Zarr. DAILY (the default, and what every
     # existing store is) means one step per calendar day. HOURLY keeps the
     # source's sub-daily axis instead of aggregating it away at convert time —

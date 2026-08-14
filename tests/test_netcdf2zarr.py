@@ -695,8 +695,8 @@ class TestVerifyWrittenDates:
 
         conv._process_period(2020, paths)  # must not raise
 
-    def test_expect_daily_false_skips_the_check(self, tmp_path):
-        conv = _period_converter(tmp_path, expect_daily=False)
+    def test_expect_contiguous_time_false_skips_the_check(self, tmp_path):
+        conv = _period_converter(tmp_path, expect_contiguous_time=False)
         paths = _write_raw_days(conv, _JAN.drop(pd.Timestamp("2020-01-05")))
 
         conv._process_period(2020, paths)  # must not raise
