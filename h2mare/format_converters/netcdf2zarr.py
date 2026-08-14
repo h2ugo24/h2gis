@@ -888,13 +888,44 @@ class Netcdf2Zarr(BaseConverter):
                 logger.debug(f"Could not remove raw file {p}: {e}")
 
     def _cleanup_downloads(self) -> None:
-        """Remove raw data from dowloads folder if download_root is different from store_root to avoid cluttering downloads with raw files."""
-        if self.download_root != self.store_root:
-            try:
-                logger.debug(f"Removing raw files from {self.download_root}")
-                safe_rmtree(self.download_root)
-            except OSError:
-                logger.exception(f"Could not remove {self.download_root}")
+        """
+        Remove the downloads folder, but only once this run has consumed it.
+
+        Everything this run converted is already gone by the time we get here:
+        :meth:`_archive_raw_files` moved it into the store, or
+        :meth:`_cleanup_period_files` deleted it. So whatever is left was *not*
+        converted — a period outside the requested window, or a file the date
+        pattern skipped — and removing the tree wholesale would delete raw data
+        this run never looked at. Re-converting a single year would take every
+        other year's downloads with it.
+
+        Left in place when downloads live in the store itself; there the raw
+        files *are* the archive.
+        """
+        if self.download_root == self.store_root:
+            return
+        if not self.download_root.exists():
+            return
+
+        # The converter's own notion of a raw file, so leftover .idx sidecars
+        # and the download manifest do not keep an otherwise-spent folder alive.
+        try:
+            remaining = self._get_downloaded_files()
+        except FileNotFoundError:
+            remaining = []
+
+        if remaining:
+            logger.debug(
+                f"Leaving {self.download_root} in place: {len(remaining)} raw "
+                "file(s) there were not converted by this run."
+            )
+            return
+
+        try:
+            logger.debug(f"Removing spent downloads folder {self.download_root}")
+            safe_rmtree(self.download_root)
+        except OSError:
+            logger.exception(f"Could not remove {self.download_root}")
 
     def _resolve_string(self, period: int | tuple[int, int]) -> str:
         """

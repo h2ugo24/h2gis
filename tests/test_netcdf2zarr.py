@@ -1087,3 +1087,47 @@ class TestArchiveRawReleasesFileHandles:
         dest.mkdir()
         shutil.move(str(paths[0]), str(dest / paths[0].name))  # must not raise
         assert (dest / paths[0].name).exists()
+
+
+# ---------------------------------------------------------------------------
+# _cleanup_downloads — scoped to what the run actually consumed
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupDownloadsScope:
+    """
+    The folder is only removed once a run has consumed it. Anything left was not
+    converted — a period outside the window, or a file the pattern skipped — and
+    used to be deleted anyway, so re-converting one year took the rest with it.
+    """
+
+    def test_windowed_run_leaves_other_periods_alone(self, tmp_path):
+        conv = _period_converter(tmp_path)
+        paths = _write_raw_days(conv, _JAN)  # Jan 1–10
+
+        conv.run(start_date="2020-01-01", end_date="2020-01-05")
+
+        survivors = [p for p in paths if p.exists()]
+        assert len(survivors) == 5, (
+            f"expected the 5 out-of-window files to survive, got {len(survivors)}"
+        )
+        assert conv.download_root.exists()
+
+    def test_full_run_removes_the_spent_folder(self, tmp_path):
+        """The tidy-up still happens once nothing is left to convert."""
+        conv = _period_converter(tmp_path)
+        _write_raw_days(conv, _JAN)
+
+        conv.run()
+
+        assert not conv.download_root.exists()
+
+    def test_sidecars_do_not_keep_a_spent_folder_alive(self, tmp_path):
+        """Only raw inputs count; a manifest left behind must not block cleanup."""
+        conv = _period_converter(tmp_path)
+        _write_raw_days(conv, _JAN)
+        (conv.download_root / "h2mare_manifest.json").write_text("[]")
+
+        conv.run()
+
+        assert not conv.download_root.exists()
