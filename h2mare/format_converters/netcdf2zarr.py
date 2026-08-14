@@ -764,8 +764,10 @@ class Netcdf2Zarr(BaseConverter):
         Raises:
             RuntimeError: If a day is missing from inside the written span.
         """
-        if not self.var_config.expect_daily:
-            logger.debug(f"[{self.var_key}] expect_daily=False — skipping date check")
+        if not self.var_config.expect_contiguous_time:
+            logger.debug(
+                f"[{self.var_key}] expect_contiguous_time=False — skipping date check"
+            )
             return
         if len(written) < 2:
             return
