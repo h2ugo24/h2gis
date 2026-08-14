@@ -20,6 +20,7 @@ from loguru import logger
 from scipy.spatial import KDTree
 
 from h2mare import AppConfig, get_settings
+from h2mare.models import step_freq
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import BBox, DateRange
 from h2mare.utils.logging import configure_extraction_logging, log_time
@@ -160,6 +161,93 @@ def _extract_geometry_bathy(
         nan_result[f"{single_var_name}_std"] = float("nan")
 
     return nan_result
+
+
+def _declared_vars(var_config) -> list[str]:
+    """Variables this var_key publishes, per ``compiled_vars`` in config."""
+    return list(getattr(var_config, "compiled_vars", None) or [])
+
+
+def warn_on_subdaily_store(var_key: str, var_config, ds: xr.Dataset) -> None:
+    """
+    Say out loud that an hourly store does not extract like a daily one.
+
+    Extraction snaps each sample to the nearest stored step. Against a daily
+    store that is the day's aggregate; against an hourly store it is one
+    instantaneous hour, and a date-only input row silently lands on 00:00.
+    Units differ too, because an hourly store holds the raw source rather than
+    the pipeline's daily reduction — so the stored units are reported here
+    instead of being left for the caller to discover in the numbers.
+    """
+    if step_freq(var_config) != "h":
+        return
+
+    units = {str(v): ds[v].attrs.get("units", "?") for v in ds.data_vars}
+    logger.warning(
+        f"[{var_key}] hourly store: each sample snaps to the nearest hour and "
+        f"returns that instantaneous value, NOT a daily aggregate — a date-only "
+        f"timestamp lands on 00:00. Units are the raw source's and may differ "
+        f"from the daily store: {units}"
+    )
+
+
+def resolve_extraction_vars(
+    available: list[str],
+    requested: list[str] | None,
+    var_key: str,
+    var_config,
+) -> list[str] | None:
+    """
+    Reconcile what was asked for against what the store actually holds.
+
+    A var_key's ``compiled_vars`` are what it *publishes*; once features are
+    derived at compile time the store holds strictly less than that. Both ways
+    of hitting the gap used to pass silently or unhelpfully: ``requested=None``
+    returned a thinner frame with no complaint, and a named missing variable
+    raised a bare ``KeyError`` that said nothing about where it went.
+
+    Returns the requested selection unchanged when it is satisfiable.
+
+    Raises:
+        ValueError: if the store cannot satisfy the request, naming which
+            variables moved to compile time and where to read them instead.
+    """
+    declared = _declared_vars(var_config)
+    missing = sorted(v for v in declared if v not in available)
+
+    if requested is None:
+        if missing:
+            raise ValueError(
+                f"[{var_key}] store holds {sorted(available)}, but this variable "
+                f"publishes {len(declared)}. Absent: {missing}. Those are derived "
+                f"at compile time and never written to the per-variable Zarr — "
+                f"read them from the compiled h2ds (Extractor.extract_from_dataset) "
+                f"or the Parquet store (ParquetIndexer.scan). To extract only the "
+                f"stored fields, pass vars={sorted(available)} explicitly."
+            )
+        return requested
+
+    unknown = [v for v in requested if v not in available]
+    if not unknown:
+        return requested
+
+    compile_time = sorted(v for v in unknown if v in declared)
+    unrecognised = sorted(v for v in unknown if v not in declared)
+
+    detail = []
+    if compile_time:
+        detail.append(
+            f"{compile_time} are derived at compile time — read them from the "
+            f"compiled h2ds or the Parquet store, not the per-variable Zarr."
+        )
+    if unrecognised:
+        detail.append(f"{unrecognised} are not variables of '{var_key}'.")
+
+    raise ValueError(
+        f"[{var_key}] cannot extract {sorted(unknown)} from the store. "
+        + " ".join(detail)
+        + f" Store holds: {sorted(available)}."
+    )
 
 
 @log_time
@@ -521,12 +609,18 @@ class Extractor:
         ## Get datasets covering the dates values and bounds
         ds = vr_catalog.open_dataset(dates=dates_resolved, bbox=bounds)
 
+        var_cfg = self.app_config.variables[var_key]
+
+        # A store no longer necessarily holds everything its var_key publishes:
+        # once features are derived at compile time they live only in h2ds. Say
+        # so before extracting, rather than returning a quietly thinner frame.
+        warn_on_subdaily_store(var_key, var_cfg, ds)
+        vars = resolve_extraction_vars(list(ds.data_vars), vars, var_key, var_cfg)
+
         if vars:
             ds = ds[vars]
 
         ds = ds.sortby("time")
-
-        var_cfg = self.app_config.variables[var_key]
 
         depth_slices = var_cfg.extract_depth_slices
         if depth_slices is not None:
