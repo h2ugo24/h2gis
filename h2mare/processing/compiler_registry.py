@@ -187,11 +187,64 @@ def _slabs(date_range: DateRange, days: int) -> list[DateRange]:
     out: list[DateRange] = []
     start = pd.Timestamp(date_range.start)
     end = pd.Timestamp(date_range.end)
+
+    # A slab can never usefully outrun the range. Without this a small enough
+    # store — a narrow bbox, few variables — divides the budget into a day count
+    # that overflows pd.Timedelta rather than simply yielding one slab.
+    days = max(min(days, int((end - start).days) + 1), 1)
+
     while start <= end:
         stop = min(start + pd.Timedelta(days=days - 1), end)
         out.append(DateRange(start, stop))
         start = stop + pd.Timedelta(days=1)
     return out
+
+
+def _reduce_hourly_in_slabs(
+    catalog: ZarrCatalog | None,
+    var_key: str,
+    bbox,
+    date_range: DateRange,
+    reduce_slab: Callable[[xr.Dataset, DateRange], xr.Dataset],
+    warmup_days: int = 0,
+) -> xr.Dataset | None:
+    """
+    Read an hourly store once, then reduce it to daily slab by slab.
+
+    Peak memory follows ``_SLAB_SOURCE_BUDGET_BYTES`` rather than the length of
+    the requested range. That keeps it to one write per output period: shrinking
+    the *compile* window instead would rewrite the whole yearly h2ds file once
+    per window.
+
+    ``warmup_days`` widens the read backwards for reductions with rolling state;
+    each slab widens by the same amount so it starts warm, and ``reduce_slab``
+    is responsible for trimming the warm-up back off.
+    """
+    from loguru import logger
+
+    warm = DateRange(
+        date_range.start - pd.Timedelta(days=warmup_days),
+        date_range.end,
+    )
+    ds = _open_or_warn(catalog, var_key, warm, bbox)
+    if ds is None:
+        return None
+
+    days = _slab_days(ds)
+    slabs = _slabs(date_range, days)
+    logger.debug(
+        f"[{var_key}] hourly reduction in {len(slabs)} slab(s) of up to {days} day(s)"
+    )
+
+    parts = [reduce_slab(ds, slab) for slab in slabs]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    # join="exact": every slab comes off the same store, so lat/lon must match
+    # exactly. A silent outer join would NaN-fill a slab that somehow differed
+    # instead of surfacing it.
+    return xr.concat(parts, dim="time", join="exact")
 
 
 def _daily_features_for_slab(ds_hourly: xr.Dataset, slab: DateRange) -> xr.Dataset:
@@ -237,39 +290,18 @@ def _atm_accum_from_hourly(
     no stored daily ``ekman_pumping`` to seed from once the store is hourly, and
     reading real hours is strictly better than reading back a previous day's
     output. Warm-up days are trimmed off each slab before it is kept.
-
-    The reduction runs slab by slab so peak memory follows
-    ``_SLAB_SOURCE_BUDGET_BYTES`` rather than the length of the requested range.
-    That keeps it to one write per output period: shrinking the *compile* window
-    instead would rewrite the whole yearly h2ds file once per window.
     """
-    from loguru import logger
-
     from h2mare.processing.core.cds import _EKMAN_WARMUP_DAYS
 
-    warm = DateRange(
-        date_range.start - pd.Timedelta(days=_EKMAN_WARMUP_DAYS),
-        date_range.end,
+    return _reduce_hourly_in_slabs(
+        catalog,
+        "atm-accum-avg",
+        compiler.var_config.bbox,
+        date_range,
+        # Indirect so monkeypatching the module attribute still takes effect.
+        lambda ds, slab: _daily_features_for_slab(ds, slab),
+        warmup_days=_EKMAN_WARMUP_DAYS,
     )
-    ds = _open_or_warn(catalog, "atm-accum-avg", warm, compiler.var_config.bbox)
-    if ds is None:
-        return None
-
-    slabs = _slabs(date_range, _slab_days(ds))
-    logger.debug(
-        f"[atm-accum-avg] hourly reduction in {len(slabs)} slab(s) of up to "
-        f"{_slab_days(ds)} day(s)"
-    )
-
-    parts = [_daily_features_for_slab(ds, slab) for slab in slabs]
-    if not parts:
-        return None
-    if len(parts) == 1:
-        return parts[0]
-    # join="exact": every slab comes off the same store, so lat/lon must match
-    # exactly. A silent outer join would NaN-fill a slab that somehow differed
-    # instead of surfacing it.
-    return xr.concat(parts, dim="time", join="exact")
 
 
 def _compile_atm_accum_avg(
@@ -298,6 +330,64 @@ def _compile_atm_accum_avg(
     # Coords ride along from the climatology alignment (.sel on dayofyear/month)
     # whether the features came off disk or were just computed.
     ds = ds.drop_vars(["dayofyear", "month", "quantile"], errors="ignore")
+    return ds.interp_like(compiler.base_grid, method="linear", assume_sorted=True)
+
+
+def _daily_atm_instante_for_slab(ds_hourly: xr.Dataset, slab: DateRange) -> xr.Dataset:
+    """
+    Reduce one slab of hourly source to its daily wind/cloud/pressure fields.
+
+    No warm-up: every one of these is a within-day aggregate, so a slab needs
+    nothing from the days before it. Computed eagerly for the same reason as
+    ``_daily_features_for_slab`` — the daily result is ~1/24 the size, so paying
+    it slab by slab is what bounds peak memory.
+    """
+    from h2mare.processing.core.cds import (
+        daily_cloud_cover,
+        daily_sea_level_pressure,
+        daily_wind,
+    )
+
+    sub = ds_hourly.sel(time=slice(slab.start, _end_of_day(slab.end)))
+    # The same functions the daily convert path calls, just later.
+    merged = xr.merge(
+        [daily_wind(sub), daily_cloud_cover(sub), daily_sea_level_pressure(sub)],
+        compat="override",
+        join="outer",
+    )
+    return merged.compute()
+
+
+def _compile_atm_instante(
+    compiler: Compiler,
+    catalog: ZarrCatalog | None,
+    date_range: DateRange,
+) -> xr.Dataset | None:
+    """
+    h2ds stays daily whatever cadence the atm-instante store is kept at.
+
+    A daily store already holds the aggregates, so this only regrids. An hourly
+    store holds raw wind, cloud and pressure, so the daily reductions run here
+    instead — yielding the same h2ds columns either way.
+    """
+    # .get, not [...]: step_freq already treats a missing entry as daily, which
+    # keeps stand-in configs on the path every existing store actually uses.
+    var_config = compiler.app_config.variables.get("atm-instante")
+    if step_freq(var_config) == "h":
+        ds = _reduce_hourly_in_slabs(
+            catalog,
+            "atm-instante",
+            compiler.var_config.bbox,
+            date_range,
+            # Indirect so monkeypatching the module attribute still takes effect.
+            lambda hourly, slab: _daily_atm_instante_for_slab(hourly, slab),
+        )
+    else:
+        ds = _open_or_warn(
+            catalog, "atm-instante", date_range, compiler.var_config.bbox
+        )
+    if ds is None:
+        return None
     return ds.interp_like(compiler.base_grid, method="linear", assume_sorted=True)
 
 
@@ -392,6 +482,7 @@ COMPILE_PROCESSORS: dict[str, CompileProcessor] = {
     "o2": _compile_depth_var,
     "thetao": _compile_depth_var,
     "atm-accum-avg": _compile_atm_accum_avg,
+    "atm-instante": _compile_atm_instante,
     "sst": _compile_sst,
     "waves": _compile_waves,
 }

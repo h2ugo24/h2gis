@@ -104,21 +104,50 @@ def merge_time_step(
     return ds
 
 
-def drop_dims(
-    ds: xr.Dataset,
-    dims_to_drop: list[str] = ["step", "number", "surface", "meanSea"],
-) -> xr.Dataset:
+#: Scalar coordinates cfgrib attaches to every ERA5 field, carrying no
+#: information once the variable is known.
+_GRIB_SCALAR_COORDS = ["step", "number", "surface", "meanSea"]
+
+
+def drop_scalar_dims(ds: xr.Dataset) -> xr.Dataset:
     """
-    Drop coordinates/dimensions from dataset"
+    Drop the scalar coordinates cfgrib attaches to every ERA5 field.
+
+    Safe to call anywhere, and the name is what carries that guarantee: every
+    entry is a scalar, so dropping one can never remove an axis. Coordinates
+    that vary along a dimension do not belong here — see :func:`drop_valid_time`
+    for what one of those costs.
 
     Args:
-        ds (xr.Dataset): dataset to drop variables
-        dims_to_drop (list[str]): List of vars to drop. Default to ['step', 'number', 'surface', 'number', 'meanSea']
+        ds (xr.Dataset): dataset to drop coordinates from
 
     Returns:
-        xr.Dataset: ds without dims_to_drop
+        xr.Dataset: ds without :data:`_GRIB_SCALAR_COORDS`
     """
-    return ds.drop_vars(dims_to_drop, errors="ignore")
+    return ds.drop_vars(_GRIB_SCALAR_COORDS, errors="ignore")
+
+
+def drop_valid_time(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Drop ``valid_time`` once ``time`` carries the axis, leaving it duplication.
+
+    ERA5 arrives in two layouts: ``valid_time`` *as* the time dimension, which
+    :func:`rename_dims` turns into ``time``, and ``valid_time`` as a coordinate
+    riding along an existing ``time``. Only the second is safe to drop, and the
+    difference does not announce itself — dropping a dimension coordinate leaves
+    the dimension in place with no labels at all, so every timestamp disappears
+    without raising. Hence a guard here rather than a place in
+    :data:`_GRIB_SCALAR_COORDS`, whose entries need no precondition.
+
+    Args:
+        ds (xr.Dataset): dataset to drop ``valid_time`` from
+
+    Returns:
+        xr.Dataset: ds without ``valid_time``, or unchanged if it carries the axis
+    """
+    if "time" in ds.dims and "valid_time" in ds.coords:
+        return ds.drop_vars("valid_time")
+    return ds
 
 
 def resample_daily_mean(ds, time_dim="time"):
@@ -177,7 +206,7 @@ def daily_wind(
         )
 
     # out = float64_to_float32(out)
-    return drop_dims(out)
+    return drop_scalar_dims(out)
 
 
 def daily_cloud_cover(
@@ -202,7 +231,7 @@ def daily_cloud_cover(
         }
     )
     # out = float64_to_float32(out)
-    return drop_dims(out)
+    return drop_scalar_dims(out)
 
 
 def daily_sea_level_pressure(
@@ -226,7 +255,7 @@ def daily_sea_level_pressure(
     out[var_name].attrs.update(
         {"long_name": "Daily mean sea level pressure", "units": "hPa"}
     )
-    return drop_dims(out)
+    return drop_scalar_dims(out)
 
 
 # -----------------------------
@@ -425,8 +454,11 @@ def get_previous_dates_da(da: xr.DataArray, var_key: str):
     )
     if ds_prev is not None:
         if isinstance(ds_prev, xr.Dataset):
-            ds_prev = drop_dims(
-                ds_prev, dims_to_drop=["quantile", "month", "dayofyear"]
+            # Not GRIB scalars but climatology leftovers, from .sel on the
+            # dayofyear/month means — dropped here rather than through
+            # drop_scalar_dims, whose list is exactly cfgrib's own.
+            ds_prev = ds_prev.drop_vars(
+                ["quantile", "month", "dayofyear"], errors="ignore"
             )
             da_prev = ds_prev["ekman_pumping"]
         else:
@@ -633,7 +665,7 @@ def daily_waves(
     out[swell_direction_name] = uv_to_direction(components["u_ts"], components["v_ts"])
     out[swell_direction_name].attrs.update(ds[swell_direction_name].attrs)
     out.attrs.update(ds.attrs)
-    return drop_dims(out)
+    return drop_scalar_dims(out)
 
 
 # -----------------------------------------
@@ -688,20 +720,53 @@ def process_atm_accum_avg(
     return merged.isel(lat=slice(None, None, -1))
 
 
+#: Raw ERA5 fields kept as-is by the hourly store. The daily reductions this
+#: variable publishes (wind_mean/std/max and the daily means) are derived at
+#: compile time instead — see ``compiler_registry._compile_atm_instante``.
+_ATM_INSTANTE_HOURLY_VARS = ("msl", "u10", "v10", "tcc")
+
+
+def hourly_atm_instante(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Keep ERA5's native hourly wind, cloud and pressure, deriving nothing.
+
+    Left in native units — ``daily_sea_level_pressure`` does the Pa→hPa
+    conversion, so it still sees exactly the input it saw at convert time. The
+    store therefore holds ``msl`` in Pa while h2ds holds it in hPa.
+
+    GRIB's own coordinates have to be dropped explicitly here. The daily path
+    sheds them twice over — every ``daily_*`` builder ends in
+    ``drop_scalar_dims``, and the resample discards ``valid_time`` on the way
+    through — while nothing at all sheds them on a cadence that does neither.
+    ``atm-accum-avg`` gets away without this only because ``merge_time_step``
+    already dropped them upstream, and atm-instante has no such step.
+    """
+    keep = [v for v in _ATM_INSTANTE_HOURLY_VARS if v in ds.data_vars]
+    return drop_valid_time(drop_scalar_dims(ds[keep]))
+
+
 def process_atm_instante(
     ds: xr.Dataset,
     var_config: Optional[KeyVarConfigEntry] = None,
     var_key: str | None = None,
 ) -> xr.Dataset:
-    datasets = []
+    """
+    Prepare the instantaneous atmospheric fields, aggregating to daily only for
+    a daily store.
+
+    With ``time_step: hourly`` the daily reductions are skipped here and happen
+    at compile instead (see ``compiler_registry._compile_atm_instante``), so the
+    store keeps ERA5's native hourly axis while h2ds stays daily.
+    """
     ds = rename_dims(ds)
     ds = ds.chunk(
         {"time": unified_time_chunk(ds), "lat": len(ds.lat), "lon": len(ds.lon)}
     )
-    datasets.append(daily_wind(ds))
-    datasets.append(daily_cloud_cover(ds))
-    datasets.append(daily_sea_level_pressure(ds))
-    merged = xr.merge(datasets, compat="override", join="outer")
+    if step_freq(var_config) == "h":
+        merged: xr.Dataset = hourly_atm_instante(ds)
+    else:
+        datasets = [daily_wind(ds), daily_cloud_cover(ds), daily_sea_level_pressure(ds)]
+        merged = xr.merge(datasets, compat="override", join="outer")
     assert isinstance(merged, xr.Dataset)
     return merged.isel(lat=slice(None, None, -1))
 
@@ -732,6 +797,11 @@ def hourly_waves(
 
     Deliberately a sibling rather than a flag on ``daily_waves``: the daily path
     feeds every existing store and h2ds column, so it is left byte-identical.
+
+    ``valid_time`` needs dropping here for the same reason it does on the hourly
+    atm-instante path: with no resample to shed it, it reaches the store. The
+    existing waves store carries it and is not worth reconverting over 70 kB a
+    year, so this only takes effect the next time waves is converted.
     """
     if time_dim not in ds.dims:
         raise ValueError(f"Dataset does not have dimension '{time_dim}'")
@@ -743,7 +813,7 @@ def hourly_waves(
         }
     )
     out.attrs.update(ds.attrs)
-    return drop_dims(out)
+    return drop_valid_time(drop_scalar_dims(out))
 
 
 def process_waves(

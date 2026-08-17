@@ -17,7 +17,8 @@ from h2mare.processing.core.cds import (
     daily_waves,
     daily_wind,
     direction_to_uv,
-    drop_dims,
+    drop_scalar_dims,
+    drop_valid_time,
     hourly_radiation,
     resample_daily_mean,
 )
@@ -70,21 +71,71 @@ class TestGetDsForMonth:
 
 
 # ---------------------------------------------------------------------------
-# drop_dims
+# drop_scalar_dims / drop_valid_time
 # ---------------------------------------------------------------------------
 
 
-class TestDropDims:
-    def test_removes_listed_variables(self):
-        ds = xr.Dataset({"a": 1.0, "b": 2.0, "c": 3.0})
-        result = drop_dims(ds, dims_to_drop=["a", "b"])
-        assert "a" not in result
-        assert "c" in result
+class TestDropScalarDims:
+    def test_removes_the_grib_scalar_coords(self):
+        ds = xr.Dataset({"swh": 1.0}).assign_coords(
+            step=pd.Timedelta(0), number=0, surface=0.0
+        )
+        result = drop_scalar_dims(ds)
+        assert set(result.coords) == set()
+        assert "swh" in result
 
     def test_ignores_absent_names_without_error(self):
-        ds = xr.Dataset({"x": 1.0})
-        result = drop_dims(ds, dims_to_drop=["x", "does_not_exist"])
-        assert "x" not in result
+        ds = xr.Dataset({"swh": 1.0}).assign_coords(number=0)
+        assert "number" not in drop_scalar_dims(ds).coords
+
+    def test_leaves_valid_time_alone(self):
+        """It varies along a dimension, so it is not this function's business."""
+        times = pd.date_range("2020-01-01", periods=3, freq="h")
+        ds = xr.Dataset(
+            {"swh": (["time"], np.ones(3))},
+            coords={"time": times, "valid_time": ("time", times.values)},
+        )
+        assert "valid_time" in drop_scalar_dims(ds).coords
+
+
+class TestDropValidTime:
+    """
+    Dropping valid_time is safe only once `time` carries the axis. The unsafe
+    case does not raise — it leaves the dimension in place with no labels — so
+    the guard is what stands between a redundant coord and lost timestamps.
+    """
+
+    @staticmethod
+    def _times():
+        return pd.date_range("2020-01-01", periods=3, freq="h")
+
+    def test_drops_it_when_time_carries_the_axis(self):
+        times = self._times()
+        ds = xr.Dataset(
+            {"swh": (["time"], np.ones(3))},
+            coords={"time": times, "valid_time": ("time", times.values)},
+        )
+        result = drop_valid_time(ds)
+
+        assert "valid_time" not in result.coords
+        assert list(result.time.values) == list(times.values)
+
+    def test_keeps_it_when_it_is_the_axis(self):
+        """Without the guard this silently strips every timestamp."""
+        times = self._times()
+        ds = xr.Dataset(
+            {"swh": (["valid_time"], np.ones(3))}, coords={"valid_time": times}
+        )
+        result = drop_valid_time(ds)
+
+        assert "valid_time" in result.coords, (
+            "dropping the dimension coordinate leaves the dimension unlabelled "
+            "rather than raising — the timestamps would just be gone"
+        )
+
+    def test_absent_valid_time_is_a_no_op(self):
+        ds = xr.Dataset({"swh": (["time"], np.ones(3))}, coords={"time": self._times()})
+        assert drop_valid_time(ds).equals(ds)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +355,145 @@ class TestProcessAtmInstante:
         result = process_atm_instante(ds)
         # isel(lat=slice(None, None, -1)) reverses the lat order
         assert list(result.lat.values) == list(reversed(ds.lat.values))
+
+
+# ---------------------------------------------------------------------------
+# process_atm_instante — cadence selected by config
+# ---------------------------------------------------------------------------
+
+
+class TestProcessAtmInstanteCadence:
+    """
+    time_step decides whether convert aggregates. An hourly store keeps ERA5's
+    raw fields; the daily reductions move to compile time.
+    """
+
+    @staticmethod
+    def _ds():
+        shape = (48, 2, 2)
+        return _hourly_ds(
+            2,
+            u10=np.full(shape, 3.0),
+            v10=np.full(shape, 4.0),
+            tcc=np.full(shape, 0.5),
+            msl=np.full(shape, 101325.0),
+        )
+
+    def test_daily_config_aggregates_as_before(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        cfg = SimpleNamespace(time_step=TimeStep.DAILY)
+        out = process_atm_instante(self._ds(), cfg, "atm-instante")
+
+        assert out.sizes["time"] == 2, "daily store must still be one step per day"
+        assert "wind_mean" in out.data_vars
+
+    def test_hourly_config_keeps_the_native_axis(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        cfg = SimpleNamespace(time_step=TimeStep.HOURLY)
+        out = process_atm_instante(self._ds(), cfg, "atm-instante")
+
+        assert out.sizes["time"] == 48, "hourly store must not be resampled"
+
+    def test_hourly_store_holds_only_the_raw_fields(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        cfg = SimpleNamespace(time_step=TimeStep.HOURLY)
+        out = process_atm_instante(self._ds(), cfg, "atm-instante")
+
+        assert set(out.data_vars) == {"msl", "u10", "v10", "tcc"}, (
+            "derived wind features belong to compile time, not the hourly store"
+        )
+
+    def test_hourly_msl_stays_in_native_pascals(self):
+        """daily_sea_level_pressure does the Pa→hPa conversion at compile time."""
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        cfg = SimpleNamespace(time_step=TimeStep.HOURLY)
+        out = process_atm_instante(self._ds(), cfg, "atm-instante")
+
+        np.testing.assert_allclose(out["msl"].values, 101325.0)
+
+    def test_hourly_lat_is_reversed_like_the_daily_path(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        cfg = SimpleNamespace(time_step=TimeStep.HOURLY)
+        ds = self._ds()
+        out = process_atm_instante(ds, cfg, "atm-instante")
+
+        assert list(out.lat.values) == list(reversed(ds.lat.values))
+
+    def test_missing_optional_field_is_tolerated(self):
+        """A store without tcc must not blow up on the selection."""
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        ds = self._ds().drop_vars("tcc")
+        out = process_atm_instante(ds, SimpleNamespace(time_step=TimeStep.HOURLY))
+
+        assert set(out.data_vars) == {"msl", "u10", "v10"}
+
+
+class TestAtmInstanteDropsGribCoords:
+    """
+    cfgrib attaches number/step/surface/valid_time to every ERA5 field. The
+    daily path sheds them twice over — drop_dims in each builder, and the
+    resample discarding valid_time — so a cadence that does neither has to drop
+    them itself or they reach the store. atm-accum-avg is clean without this
+    only because merge_time_step already dropped them; atm-instante has no such
+    step.
+    """
+
+    @staticmethod
+    def _grib_shaped_ds():
+        times = pd.date_range("2020-01-01", periods=48, freq="h")
+        shape = (48, 2, 2)
+        ds = xr.Dataset(
+            {
+                name: (["time", "lat", "lon"], np.full(shape, val, dtype="float32"))
+                for name, val in [
+                    ("u10", 3.0),
+                    ("v10", 4.0),
+                    ("tcc", 0.5),
+                    ("msl", 101325.0),
+                ]
+            },
+            coords={"time": times, "lat": [30.0, 30.25], "lon": [-10.0, -9.75]},
+        )
+        return ds.assign_coords(
+            number=0,
+            step=pd.Timedelta(0),
+            surface=0.0,
+            valid_time=("time", times.values),
+        )
+
+    def test_hourly_store_keeps_only_time_lat_lon(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        out = process_atm_instante(
+            self._grib_shaped_ds(), SimpleNamespace(time_step=TimeStep.HOURLY)
+        )
+
+        assert set(out.coords) == {"time", "lat", "lon"}, (
+            f"GRIB coords reached the hourly store: {sorted(out.coords)}"
+        )
+
+    def test_daily_path_is_unchanged(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        out = process_atm_instante(
+            self._grib_shaped_ds(), SimpleNamespace(time_step=TimeStep.DAILY)
+        )
+
+        assert set(out.coords) == {"time", "lat", "lon"}
 
 
 # ---------------------------------------------------------------------------
