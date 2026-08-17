@@ -22,6 +22,10 @@ from h2mare.storage.coverage import (
     resolve_date_range,
     split_time_range,
 )
+from h2mare.storage.provenance import (
+    collect_source_datasets,
+    write_compiled_provenance,
+)
 from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import chunk_dataset
@@ -209,6 +213,10 @@ class Compiler:
             )
 
             datasets = []
+            # var_key -> the source datasets that delivered this chunk's dates.
+            # Collected per chunk because a variable can switch from rep to nrt
+            # part-way through the archive, so it is not a property of the run.
+            provenance: dict[str, list[dict]] = {}
 
             for vkey in self.var_keys:
                 if vkey == self.var_key:
@@ -218,6 +226,11 @@ class Compiler:
                     ds = self._process_variable(vkey, chunk)
                 if ds is not None:
                     datasets.append(ds)
+                    # System variables (bathy, moon) have no store and no
+                    # catalog, so they contribute no provenance.
+                    if (catalog := self._catalog_cache.get(vkey)) is not None:
+                        if records := collect_source_datasets(catalog, chunk):
+                            provenance[vkey] = records
 
             if not datasets:
                 logger.warning(
@@ -236,6 +249,16 @@ class Compiler:
             )
             write_append_zarr(self.var_key, ds_final, path)
             written_paths.append(path)
+
+            if provenance:
+                try:
+                    write_compiled_provenance(path, provenance)
+                except Exception as e:
+                    # Bookkeeping about a compile must not fail the compile that
+                    # already succeeded — the data is on disk by this point.
+                    logger.warning(
+                        f"Could not write compiled provenance for {path.name}: {e}"
+                    )
 
             logger.success(
                 f"Finished period {chunk.start.date()} -> {chunk.end.date()}"

@@ -286,3 +286,83 @@ def backfill_provenance(catalog: "ZarrCatalog", rep_end_date: DateLike) -> int:
         catalog._log("info", "Backfill complete: no files needed provenance")
 
     return written
+
+
+# ---------------------------------------------------------------------------
+# Compiled (h2ds) provenance
+# ---------------------------------------------------------------------------
+
+#: Attribute h2ds carries its per-source provenance under.
+#:
+#: Deliberately not ``source_datasets``. That one is a flat list, which suits a
+#: store fed by a single product; h2ds merges a dozen sources, so its records
+#: have to say which variable each belongs to and the value is a mapping. Reusing
+#: the name would hand a reader a dict where it expected a list.
+COMPILED_PROVENANCE_ATTR = "source_datasets_by_variable"
+
+
+def read_source_datasets(zarr_path: Path) -> list[dict]:
+    """
+    Provenance records held by a store, or ``[]`` when it has none.
+
+    Absent, unreadable and malformed all return empty rather than raising:
+    provenance is metadata about a compile, and losing it must never be the
+    reason a compile fails.
+    """
+    import zarr
+
+    try:
+        root = zarr.open_group(str(zarr_path), mode="r")
+        raw = root.attrs.get("source_datasets")
+    except Exception:
+        return []
+    if not isinstance(raw, str) or not raw:
+        return []
+    try:
+        records = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return records if isinstance(records, list) else []
+
+
+def collect_source_datasets(catalog: "ZarrCatalog", window: DateRange) -> list[dict]:
+    """
+    Merge the provenance of every store file overlapping *window*.
+
+    A compile window routinely spans several per-period files, and a variable
+    can switch from rep to nrt part-way through, so the records are merged
+    rather than taken from the first file found.
+    """
+    records: list[dict] = []
+    for path in catalog.get_paths_in_range(window.start, window.end):
+        records = merge_records(records, read_source_datasets(Path(path)))
+    return records
+
+
+def write_compiled_provenance(
+    zarr_path: Path, by_variable: dict[str, list[dict]]
+) -> dict[str, list[dict]]:
+    """
+    Record on h2ds which dataset delivered which dates, for each source variable.
+
+    Merged into whatever the file already holds, never replacing it: ``run -v
+    sst`` recompiles one variable's columns into a file that already carries
+    every other variable's records, and replacing would silently drop them —
+    the same trap the per-variable path documents in ``write_provenance``.
+
+    Written after the Zarr exists rather than through ``ds.attrs``, so it does
+    not depend on how the write path combines attributes, and so a compile is
+    never failed by its own bookkeeping.
+    """
+    import zarr
+
+    root = zarr.open_group(str(zarr_path), mode="r+")
+    raw = root.attrs.get(COMPILED_PROVENANCE_ATTR)
+    existing = json.loads(raw) if isinstance(raw, str) and raw else {}
+
+    combined = dict(existing)
+    for var_key, records in by_variable.items():
+        combined[var_key] = merge_records(existing.get(var_key, []), records)
+
+    root.attrs[COMPILED_PROVENANCE_ATTR] = json.dumps(combined, sort_keys=True)
+    return combined
