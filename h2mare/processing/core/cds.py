@@ -266,6 +266,13 @@ def daily_sea_level_pressure(
 #: over essentially the whole ocean — and is left exactly as it is.
 _RATE_NOISE = 1e-6
 
+#: Watts per square metre, in udunits/CF form rather than with a superscript.
+#: This string is written into the store and travels on to Parquet and CSV,
+#: where a non-ASCII "²" is mangled by any reader that does not assume UTF-8 —
+#: Windows' default codepage among them. Every other unit the pipeline writes
+#: ("m/s", "hPa", "mm") is already plain ASCII; this was the one exception.
+_WATTS_PER_M2 = "W m-2"
+
 
 def accumulation_period_seconds(da: xr.DataArray, time_dim: str = "time") -> float:
     """
@@ -286,7 +293,7 @@ def accumulation_period_seconds(da: xr.DataArray, time_dim: str = "time") -> flo
 def hourly_radiation(
     da: xr.DataArray,
     time_dim: str = "time",
-    units_out: str = "W/m²",
+    units_out: str = _WATTS_PER_M2,
     clip_small_negatives: bool = True,
 ) -> xr.DataArray:
     """Convert ERA5's per-interval accumulation (J/m2) to a mean rate (W/m2).
@@ -306,7 +313,8 @@ def hourly_radiation(
     Args:
         da (xr.DataArray): data array with accumulated radiation data.
         time_dim (str, optional): time dimension name. Defaults to "time".
-        units_out (str, optional): Output units. Defaults to "W m^-2".
+        units_out (str, optional): Output units. Defaults to
+            :data:`_WATTS_PER_M2` ("W m-2").
         clip_small_negatives (bool, optional): Flatten rounding-noise negatives
             to zero. Genuinely negative fluxes are kept. Defaults to True.
 

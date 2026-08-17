@@ -316,11 +316,24 @@ class TestHourlyRadiation:
         )
         attrs = hourly_radiation(da).attrs
 
-        assert attrs["units"] == "W/m²"
-        assert attrs["GRIB_units"] == "W/m²"
+        assert attrs["units"] == "W m-2"
+        assert attrs["GRIB_units"] == "W m-2"
         assert attrs["GRIB_stepType"] == "avg", (
             "a rate must not still advertise itself as an accumulation"
         )
+
+    def test_units_are_plain_ascii(self):
+        """
+        The units string travels to Parquet and on to CSV, where a superscript
+        is mangled by any reader that does not assume UTF-8 — Windows' default
+        codepage among them.
+        """
+        attrs = hourly_radiation(_rad_da([3600.0, 3600.0])).attrs
+
+        for key in ("units", "GRIB_units"):
+            assert attrs[key].isascii(), (
+                f"{key}={attrs[key]!r} carries a non-ASCII character"
+            )
 
     def test_source_provenance_is_otherwise_preserved(self):
         da = _rad_da([3600.0, 3600.0])
