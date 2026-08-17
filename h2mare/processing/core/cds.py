@@ -261,36 +261,72 @@ def daily_sea_level_pressure(
 # -----------------------------
 # ---- Radiation features ----
 # ----------------------------
+#: Rates in [-_RATE_NOISE, 0) are rounding noise in ERA5's accumulation and are
+#: flattened to zero. Anything more negative is signal — ``slhf`` is negative
+#: over essentially the whole ocean — and is left exactly as it is.
+_RATE_NOISE = 1e-6
+
+
+def accumulation_period_seconds(da: xr.DataArray, time_dim: str = "time") -> float:
+    """
+    Seconds each accumulation covers, read off the time axis.
+
+    Taken from the axis rather than hardcoded so a 3-hourly product converts
+    correctly too, and as a median so one ragged step cannot skew it.
+    """
+    times = np.asarray(da[time_dim].values)
+    if times.size < 2:
+        raise ValueError(
+            f"Cannot infer the accumulation period from {times.size} timestep(s) — "
+            f"at least two are needed to measure the spacing."
+        )
+    return float(np.median(np.diff(times) / np.timedelta64(1, "s")))
+
+
 def hourly_radiation(
     da: xr.DataArray,
     time_dim: str = "time",
     units_out: str = "W/m²",
     clip_small_negatives: bool = True,
 ) -> xr.DataArray:
-    """Convert accumulated quantity (J/m2) to per-second rate over each interval.
+    """Convert ERA5's per-interval accumulation (J/m2) to a mean rate (W/m2).
+
+    Each value already covers only the interval ending at its own timestamp, so
+    the conversion is a division by that interval and nothing else. It used to
+    difference consecutive values first, which silently treated the field as a
+    running total. ERA5's own numbers say otherwise: a single forecast block of
+    ``tisr`` rises and falls with the sun ::
+
+        0, 0, 0, 149248, 905088, ..., 2423552, 2218112, 1781760, 1144320
+
+    and a running total cannot decrease. Dividing straight through reproduces
+    the astronomical top-of-atmosphere insolation to within 1.2% (174.3 vs
+    172.3 W/m² at 40°N on 1998-01-15); differencing first gave ~28.
 
     Args:
         da (xr.DataArray): data array with accumulated radiation data.
         time_dim (str, optional): time dimension name. Defaults to "time".
         units_out (str, optional): Output units. Defaults to "W m^-2".
-        clip_small_negatives (bool, optional): Clip extremely negative values. Defaults to True.
+        clip_small_negatives (bool, optional): Flatten rounding-noise negatives
+            to zero. Genuinely negative fluxes are kept. Defaults to True.
 
     Returns:
-        xr.DataArray: Hourly mean rates of the accumulated data.
+        xr.DataArray: Mean rate over each accumulation interval.
     """
-    dt = da[time_dim].diff(time_dim) / np.timedelta64(1, "s")
-    dacc = da.diff(time_dim)
-    rate = dacc / dt
+    rate = da / accumulation_period_seconds(da, time_dim)
 
     if clip_small_negatives:
-        rate = rate.where(rate >= -1e-6, 0.0)
+        # Bounded on both sides. The old form was `rate >= -1e-6, 0.0`, which
+        # zeroed everything *below* the threshold rather than the sliver just
+        # under zero — taking the whole of slhf with it.
+        rate = xr.where((rate < 0) & (rate >= -_RATE_NOISE), 0.0, rate)
 
     rate.attrs.update(da.attrs)
     rate.attrs.update(
         {
             "units": units_out,
             "GRIB_units": units_out,
-            "long_name": f"Hourly mean rate from accumulated {da.name or ''}".strip(),
+            "long_name": f"Mean rate from accumulated {da.name or ''}".strip(),
         }
     )
     rate.name = da.name
