@@ -391,6 +391,50 @@ def _compile_atm_instante(
     return ds.interp_like(compiler.base_grid, method="linear", assume_sorted=True)
 
 
+def _daily_radiation_for_slab(ds_hourly: xr.Dataset, slab: DateRange) -> xr.Dataset:
+    """
+    Reduce one slab of hourly radiation to daily means, materialised.
+
+    No warm-up and no unit conversion: the store already holds W/m², so the
+    daily value is a plain mean over the day's own hours.
+    """
+    from h2mare.processing.core.cds import resample_daily_mean
+
+    sub = ds_hourly.sel(time=slice(slab.start, _end_of_day(slab.end)))
+    return resample_daily_mean(sub).compute()
+
+
+def _compile_radiation(
+    compiler: Compiler,
+    catalog: ZarrCatalog | None,
+    date_range: DateRange,
+) -> xr.Dataset | None:
+    """
+    h2ds stays daily whatever cadence the radiation store is kept at.
+
+    Both cadences convert J/m²→W/m² at convert time, so an hourly store needs
+    only the daily mean here and a daily store needs nothing — the same h2ds
+    columns, in the same units, either way.
+    """
+    # .get, not [...]: step_freq already treats a missing entry as daily, which
+    # keeps stand-in configs on the path every existing store actually uses.
+    var_config = compiler.app_config.variables.get("radiation")
+    if step_freq(var_config) == "h":
+        ds = _reduce_hourly_in_slabs(
+            catalog,
+            "radiation",
+            compiler.var_config.bbox,
+            date_range,
+            # Indirect so monkeypatching the module attribute still takes effect.
+            lambda hourly, slab: _daily_radiation_for_slab(hourly, slab),
+        )
+    else:
+        ds = _open_or_warn(catalog, "radiation", date_range, compiler.var_config.bbox)
+    if ds is None:
+        return None
+    return ds.interp_like(compiler.base_grid, method="linear", assume_sorted=True)
+
+
 def _compile_waves(
     compiler: Compiler,
     catalog: ZarrCatalog | None,
@@ -483,6 +527,7 @@ COMPILE_PROCESSORS: dict[str, CompileProcessor] = {
     "thetao": _compile_depth_var,
     "atm-accum-avg": _compile_atm_accum_avg,
     "atm-instante": _compile_atm_instante,
+    "radiation": _compile_radiation,
     "sst": _compile_sst,
     "waves": _compile_waves,
 }

@@ -306,6 +306,80 @@ class TestHourlyRadiation:
 
 
 # ---------------------------------------------------------------------------
+# process_radiation — cadence selected by config
+# ---------------------------------------------------------------------------
+
+
+class TestProcessRadiationCadence:
+    """
+    time_step decides whether convert averages. Both cadences convert J/m²→W/m²
+    here, so the store and h2ds agree on units either way — unlike the other
+    hourly stores, which keep their source raw.
+    """
+
+    @staticmethod
+    def _ds():
+        times = pd.date_range("2020-01-01", periods=48, freq="h")
+        shape = (48, 2, 2)
+        return xr.Dataset(
+            {
+                "ssrd": (["time", "lat", "lon"], np.full(shape, 3600.0)),
+                "slhf": (["time", "lat", "lon"], np.full(shape, -360000.0)),
+            },
+            coords={"time": times, "lat": [30.0, 35.0], "lon": [-10.0, -5.0]},
+        )
+
+    def test_daily_config_averages_as_before(self):
+        cfg = SimpleNamespace(time_step=TimeStep.DAILY)
+        out = cds.process_radiation(self._ds(), cfg, "radiation")
+
+        assert out.sizes["time"] == 2, "daily store must still be one step per day"
+
+    def test_hourly_config_keeps_the_native_axis(self):
+        cfg = SimpleNamespace(time_step=TimeStep.HOURLY)
+        out = cds.process_radiation(self._ds(), cfg, "radiation")
+
+        assert out.sizes["time"] == 48, "hourly store must not be averaged"
+
+    def test_both_cadences_publish_the_same_units(self):
+        """3600 J/m² per hour is 1 W/m² whether or not a daily mean follows."""
+        daily = cds.process_radiation(
+            self._ds(), SimpleNamespace(time_step=TimeStep.DAILY), "radiation"
+        )
+        hourly = cds.process_radiation(
+            self._ds(), SimpleNamespace(time_step=TimeStep.HOURLY), "radiation"
+        )
+
+        np.testing.assert_allclose(daily["ssrd"].values, 1.0, rtol=1e-5)
+        np.testing.assert_allclose(hourly["ssrd"].values, 1.0, rtol=1e-5)
+
+    def test_hourly_store_keeps_negative_flux(self):
+        cfg = SimpleNamespace(time_step=TimeStep.HOURLY)
+        out = cds.process_radiation(self._ds(), cfg, "radiation")
+
+        np.testing.assert_allclose(out["slhf"].values, -100.0, rtol=1e-5)
+
+    def test_hourly_lat_is_reversed_like_the_daily_path(self):
+        ds = self._ds()
+        out = cds.process_radiation(
+            ds, SimpleNamespace(time_step=TimeStep.HOURLY), "radiation"
+        )
+        assert list(out.lat.values) == list(reversed(ds.lat.values))
+
+    def test_grib_coords_never_reach_the_store(self):
+        ds = self._ds().assign_coords(
+            number=0, step=pd.Timedelta(0), surface=0.0, meanSea=0.0
+        )
+        for step in (TimeStep.HOURLY, TimeStep.DAILY):
+            out = cds.process_radiation(
+                ds, SimpleNamespace(time_step=step), "radiation"
+            )
+            assert set(out.coords) == {"time", "lat", "lon"}, (
+                f"GRIB coords reached the {step} store: {sorted(out.coords)}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # daily_total_rain
 # ---------------------------------------------------------------------------
 

@@ -345,9 +345,23 @@ def daily_radiation(da: xr.DataArray, time_dim: str = "time") -> xr.Dataset:
     Returns:
         xr.DataArray: Daily mean array.
     """
-    da = hourly_radiation(da, time_dim=time_dim).astype("float32")
-    out = xr.Dataset({da.name: da})
+    out = store_hourly_radiation(da, time_dim=time_dim)
     return resample_daily_mean(out)
+
+
+def store_hourly_radiation(da: xr.DataArray, time_dim: str = "time") -> xr.Dataset:
+    """
+    Radiation at ERA5's own cadence — :func:`daily_radiation` without the mean.
+
+    Rates rather than the raw J/m² accumulations, unlike the other hourly
+    stores. Those keep their source untouched because the source is a physical
+    field; here it is a delivery artifact — a per-interval energy total whose
+    meaning depends on knowing the interval. W/m² is the quantity, and
+    converting once at write time is what lets the compile be a plain daily
+    mean and the extractor return something interpretable.
+    """
+    da = hourly_radiation(da, time_dim=time_dim).astype("float32")
+    return xr.Dataset({da.name: da})
 
 
 # ----------------------------------------------
@@ -812,12 +826,25 @@ def process_radiation(
     var_config: Optional[KeyVarConfigEntry] = None,
     var_key: str | None = None,
 ) -> xr.Dataset:
-    """A first preprocessing is done in processor.py because data overlap at adjacent days in monthly grib files"""
-    datasets = []
-    for var in ds.data_vars:
-        datasets.append(daily_radiation(ds[var]).sortby("time"))
+    """
+    Prepare the radiation fields, averaging to daily only for a daily store.
+
+    A first preprocessing is done in processor.py because data overlap at
+    adjacent days in monthly grib files.
+
+    With ``time_step: hourly`` the daily mean is skipped here and happens at
+    compile instead (see ``compiler_registry._compile_radiation``), so the store
+    keeps ERA5's native hourly axis while h2ds stays daily. Both cadences share
+    the J/m²→W/m² conversion, so they publish the same units.
+    """
+    build = store_hourly_radiation if step_freq(var_config) == "h" else daily_radiation
+    datasets = [build(ds[var]).sortby("time") for var in ds.data_vars]
     merged = xr.merge(datasets, compat="override", join="outer")
     assert isinstance(merged, xr.Dataset)
+    # No-ops today, since merge_time_step already sheds these upstream. Stated
+    # anyway so the store does not depend on that having run — which is the gap
+    # that let GRIB's coords reach the hourly atm-instante store.
+    merged = drop_valid_time(drop_scalar_dims(merged))
     return merged.isel(lat=slice(None, None, -1))
 
 

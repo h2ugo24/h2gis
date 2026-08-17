@@ -577,6 +577,101 @@ class TestAtmInstanteSlabbing:
 
 
 # ---------------------------------------------------------------------------
+# _compile_radiation
+# ---------------------------------------------------------------------------
+
+
+def _fake_hourly_radiation(start: str, end: str) -> xr.Dataset:
+    """Hourly W/m² dataset shaped like the radiation store, on the base grid."""
+    times = pd.date_range(start, pd.Timestamp(end) + pd.Timedelta(hours=23), freq="h")
+    lat, lon = [30.0, 30.25], [-10.0, -9.75]
+    shape = (len(times), len(lat), len(lon))
+    return xr.Dataset(
+        {
+            "ssrd": (["time", "lat", "lon"], np.full(shape, 200.0, dtype="float32")),
+            "tisr": (["time", "lat", "lon"], np.full(shape, 400.0, dtype="float32")),
+            "slhf": (["time", "lat", "lon"], np.full(shape, -100.0, dtype="float32")),
+        },
+        coords={"time": times, "lat": lat, "lon": lon},
+    )
+
+
+def _hourly_radiation_compiler(tmp_path) -> MagicMock:
+    compiler = _make_compiler(tmp_path)
+    compiler.app_config.variables = {
+        "radiation": SimpleNamespace(time_step=TimeStep.HOURLY)
+    }
+    return compiler
+
+
+class TestCompileRadiationHourly:
+    """An hourly store needs only the daily mean — the units were settled at convert."""
+
+    def test_hourly_config_dispatches_to_the_hourly_path(self, tmp_path, monkeypatch):
+        called = {}
+
+        def _spy(catalog, var_key, bbox, date_range, reduce_slab, warmup_days=0):
+            called["var_key"] = var_key
+            called["warmup"] = warmup_days
+            return None
+
+        monkeypatch.setattr(compiler_registry, "_reduce_hourly_in_slabs", _spy)
+
+        compiler_registry._compile_radiation(
+            _hourly_radiation_compiler(tmp_path), _make_catalog(None), _DR
+        )
+
+        assert called.get("var_key") == "radiation"
+        assert called.get("warmup") == 0, "a daily mean needs nothing from earlier days"
+
+    def test_daily_config_does_not_dispatch_to_the_hourly_path(
+        self, tmp_path, monkeypatch
+    ):
+        def _boom(*args, **kwargs):
+            raise AssertionError("daily store must not take the hourly path")
+
+        monkeypatch.setattr(compiler_registry, "_reduce_hourly_in_slabs", _boom)
+        compiler = _make_compiler(tmp_path)
+        compiler.app_config.variables = {
+            "radiation": SimpleNamespace(time_step=TimeStep.DAILY)
+        }
+
+        compiler_registry._compile_radiation(compiler, _make_catalog(None), _DR)
+
+    def test_hourly_store_yields_daily_columns_unchanged_in_units(self, tmp_path):
+        ds = _fake_hourly_radiation("2020-01-01", "2020-01-03")
+        out = compiler_registry._compile_radiation(
+            _hourly_radiation_compiler(tmp_path), _make_catalog(ds), _DR
+        )
+
+        assert out is not None
+        assert set(out.data_vars) == {"ssrd", "tisr", "slhf"}
+        assert out.sizes["time"] == 3, "h2ds stays daily whatever the store's cadence"
+        # A mean of constants is that constant — W/m² in, W/m² out, no rescaling.
+        np.testing.assert_allclose(out["ssrd"].values, 200.0, rtol=1e-5)
+        np.testing.assert_allclose(out["slhf"].values, -100.0, rtol=1e-5)
+
+    def test_returns_none_when_data_missing(self, tmp_path):
+        result = compiler_registry._compile_radiation(
+            _hourly_radiation_compiler(tmp_path), _make_catalog(None), _DR
+        )
+        assert result is None
+
+    def test_last_day_keeps_all_of_its_hours(self, tmp_path):
+        """A midnight-stamped slab end would average only 00:00 of the last day."""
+        ds = _fake_hourly_radiation("2020-01-01", "2020-01-03")
+        ds["ssrd"].loc[{"time": slice("2020-01-03 01:00", None)}] = 800.0
+
+        out = compiler_registry._compile_radiation(
+            _hourly_radiation_compiler(tmp_path), _make_catalog(ds), _DR
+        )
+
+        assert out is not None
+        last = float(out["ssrd"].isel(time=-1).mean())
+        assert last > 700.0, "reading only 00:00 of the last day would give 200"
+
+
+# ---------------------------------------------------------------------------
 # _compile_sst
 # ---------------------------------------------------------------------------
 
