@@ -104,21 +104,31 @@ def merge_time_step(
     return ds
 
 
+#: Scalar coordinates cfgrib attaches to every ERA5 field, carrying no
+#: information once the variable is known. Named so callers that need to drop
+#: more than the default can extend the list rather than restate it.
+_GRIB_SCALAR_COORDS = ["step", "number", "surface", "meanSea"]
+
+
 def drop_dims(
     ds: xr.Dataset,
-    dims_to_drop: list[str] = ["step", "number", "surface", "meanSea"],
+    dims_to_drop: list[str] | None = None,
 ) -> xr.Dataset:
     """
     Drop coordinates/dimensions from dataset"
 
     Args:
         ds (xr.Dataset): dataset to drop variables
-        dims_to_drop (list[str]): List of vars to drop. Default to ['step', 'number', 'surface', 'number', 'meanSea']
+        dims_to_drop (list[str]): List of vars to drop. Defaults to
+            :data:`_GRIB_SCALAR_COORDS`.
 
     Returns:
         xr.Dataset: ds without dims_to_drop
     """
-    return ds.drop_vars(dims_to_drop, errors="ignore")
+    return ds.drop_vars(
+        _GRIB_SCALAR_COORDS if dims_to_drop is None else dims_to_drop,
+        errors="ignore",
+    )
 
 
 def resample_daily_mean(ds, time_dim="time"):
@@ -701,9 +711,18 @@ def hourly_atm_instante(ds: xr.Dataset) -> xr.Dataset:
     Left in native units — ``daily_sea_level_pressure`` does the Pa→hPa
     conversion, so it still sees exactly the input it saw at convert time. The
     store therefore holds ``msl`` in Pa while h2ds holds it in hPa.
+
+    GRIB's own coordinates have to be dropped explicitly here. The daily path
+    sheds them twice over — every ``daily_*`` builder ends in ``drop_dims``, and
+    the resample discards ``valid_time`` on the way through — while nothing at
+    all sheds them on a cadence that does neither. ``atm-accum-avg`` gets away
+    without this only because ``merge_time_step`` already dropped them upstream,
+    and atm-instante has no such step.
     """
     keep = [v for v in _ATM_INSTANTE_HOURLY_VARS if v in ds.data_vars]
-    return ds[keep]
+    # valid_time duplicates time exactly for instantaneous fields (step is 0),
+    # so it is redundant rather than merely unused.
+    return drop_dims(ds[keep], [*_GRIB_SCALAR_COORDS, "valid_time"])
 
 
 def process_atm_instante(

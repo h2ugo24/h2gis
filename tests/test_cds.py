@@ -389,6 +389,62 @@ class TestProcessAtmInstanteCadence:
         assert set(out.data_vars) == {"msl", "u10", "v10"}
 
 
+class TestAtmInstanteDropsGribCoords:
+    """
+    cfgrib attaches number/step/surface/valid_time to every ERA5 field. The
+    daily path sheds them twice over — drop_dims in each builder, and the
+    resample discarding valid_time — so a cadence that does neither has to drop
+    them itself or they reach the store. atm-accum-avg is clean without this
+    only because merge_time_step already dropped them; atm-instante has no such
+    step.
+    """
+
+    @staticmethod
+    def _grib_shaped_ds():
+        times = pd.date_range("2020-01-01", periods=48, freq="h")
+        shape = (48, 2, 2)
+        ds = xr.Dataset(
+            {
+                name: (["time", "lat", "lon"], np.full(shape, val, dtype="float32"))
+                for name, val in [
+                    ("u10", 3.0),
+                    ("v10", 4.0),
+                    ("tcc", 0.5),
+                    ("msl", 101325.0),
+                ]
+            },
+            coords={"time": times, "lat": [30.0, 30.25], "lon": [-10.0, -9.75]},
+        )
+        return ds.assign_coords(
+            number=0,
+            step=pd.Timedelta(0),
+            surface=0.0,
+            valid_time=("time", times.values),
+        )
+
+    def test_hourly_store_keeps_only_time_lat_lon(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        out = process_atm_instante(
+            self._grib_shaped_ds(), SimpleNamespace(time_step=TimeStep.HOURLY)
+        )
+
+        assert set(out.coords) == {"time", "lat", "lon"}, (
+            f"GRIB coords reached the hourly store: {sorted(out.coords)}"
+        )
+
+    def test_daily_path_is_unchanged(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        out = process_atm_instante(
+            self._grib_shaped_ds(), SimpleNamespace(time_step=TimeStep.DAILY)
+        )
+
+        assert set(out.coords) == {"time", "lat", "lon"}
+
+
 # ---------------------------------------------------------------------------
 # Integration: process_waves
 # ---------------------------------------------------------------------------
