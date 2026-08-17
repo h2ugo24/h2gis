@@ -326,6 +326,10 @@ def hourly_radiation(
         {
             "units": units_out,
             "GRIB_units": units_out,
+            # The source says 'accum'; these values no longer are one. Left
+            # unchanged it invites exactly the reading that made this function
+            # difference an already-differenced field for years.
+            "GRIB_stepType": "avg",
             "long_name": f"Mean rate from accumulated {da.name or ''}".strip(),
         }
     )

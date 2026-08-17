@@ -304,6 +304,32 @@ class TestHourlyRadiation:
         with pytest.raises(ValueError, match="accumulation period"):
             hourly_radiation(da)
 
+    def test_attrs_describe_the_rate_not_the_source(self):
+        """
+        The output is a rate, so every attribute that says otherwise has to be
+        rewritten. GRIB_stepType matters most: left at 'accum' it invites the
+        same second de-accumulation this function used to perform.
+        """
+        da = _rad_da([3600.0, 3600.0])
+        da.attrs.update(
+            {"units": "J m**-2", "GRIB_units": "J m**-2", "GRIB_stepType": "accum"}
+        )
+        attrs = hourly_radiation(da).attrs
+
+        assert attrs["units"] == "W/m²"
+        assert attrs["GRIB_units"] == "W/m²"
+        assert attrs["GRIB_stepType"] == "avg", (
+            "a rate must not still advertise itself as an accumulation"
+        )
+
+    def test_source_provenance_is_otherwise_preserved(self):
+        da = _rad_da([3600.0, 3600.0])
+        da.attrs.update({"GRIB_paramId": 212, "GRIB_shortName": "tisr"})
+        attrs = hourly_radiation(da).attrs
+
+        assert attrs["GRIB_paramId"] == 212
+        assert attrs["GRIB_shortName"] == "tisr"
+
 
 # ---------------------------------------------------------------------------
 # process_radiation — cadence selected by config
