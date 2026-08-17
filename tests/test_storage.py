@@ -798,3 +798,77 @@ class TestInt16Encoding:
         ds = _make_ds("2020-01-01", 3)
         ds["sst"] = ds["sst"] * 0 + 7.0
         assert int16_encoding(ds) == {}
+
+
+class TestInt16EncodingReadsSourceOnce:
+    """
+    Finding the ranges must cost one pass over the source, not one per
+    reduction. A min and a max computed separately each re-decode the whole
+    input — on a year of hourly ERA5 that is tens of GB of GRIB read again,
+    and it happens before the write so nothing in the log explains the wait.
+    """
+
+    N_CHUNKS = 4
+
+    @classmethod
+    def _counting_ds(cls, n_vars: int) -> tuple[xr.Dataset, list[int]]:
+        """Dataset whose every chunk read bumps a counter, one array per var."""
+        import dask.array as darr
+
+        reads = [0]
+        chunk = 5
+
+        def _load(block_id=None):
+            reads[0] += 1
+            rng = np.random.default_rng(sum(block_id or (0,)))
+            return rng.random((chunk, 2, 2))
+
+        def _array():
+            return darr.map_blocks(
+                _load,
+                chunks=((chunk,) * cls.N_CHUNKS, (2,), (2,)),
+                dtype="float64",
+            )
+
+        times = pd.date_range("2020-01-01", periods=chunk * cls.N_CHUNKS, freq="D")
+        ds = xr.Dataset(
+            {f"v{i}": (["time", "lat", "lon"], _array()) for i in range(n_vars)},
+            coords={"time": times, "lat": [30.0, 30.25], "lon": [-10.0, -9.75]},
+        )
+        # dask calls the loader while building the graph to infer meta; only
+        # reads from here on are the pass this test is about.
+        reads[0] = 0
+        return ds, reads
+
+    def test_one_variable_is_read_once_not_twice(self):
+        from h2mare.storage.xarray_helpers import int16_encoding
+
+        ds, reads = self._counting_ds(n_vars=1)
+        int16_encoding(ds)
+
+        assert reads[0] == self.N_CHUNKS, (
+            f"expected one pass over {self.N_CHUNKS} chunks, got {reads[0]} reads "
+            f"— min and max are not sharing a graph"
+        )
+
+    def test_cost_stays_one_pass_with_several_variables(self):
+        from h2mare.storage.xarray_helpers import int16_encoding
+
+        n_vars = 3
+        ds, reads = self._counting_ds(n_vars=n_vars)
+        int16_encoding(ds)
+
+        assert reads[0] == n_vars * self.N_CHUNKS, (
+            f"expected one pass over {n_vars} variables, got {reads[0]} reads"
+        )
+
+    def test_bounds_are_still_the_real_min_and_max(self):
+        """Sharing the graph must not change the numbers it produces."""
+        from h2mare.storage.xarray_helpers import int16_encoding
+
+        ds = _make_ds("2020-01-01", 10)
+        enc = int16_encoding(ds)
+
+        lo, hi = float(ds.sst.min()), float(ds.sst.max())
+        assert enc["sst"]["scale_factor"] == pytest.approx((hi - lo) / 65000.0)
+        assert enc["sst"]["add_offset"] == pytest.approx((hi + lo) / 2.0)

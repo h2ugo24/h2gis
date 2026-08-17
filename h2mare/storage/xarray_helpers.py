@@ -26,13 +26,30 @@ def int16_encoding(ds: xr.Dataset, level: int = 9) -> dict:
 
     Computing the range forces one pass over the data. That is deliberate: a
     fixed guess would clip, and clipping is silent.
+
+    One pass, though, not one per reduction: every min and max goes into a
+    single graph so each source chunk is decoded once and fed to both. Computed
+    separately they cost a full re-read apiece — on a year of hourly ERA5 that
+    is tens of GB of GRIB decoded again for every extra call, all of it before
+    the write starts and so invisible in the log.
     """
+    import dask
     import zarr
 
-    encoding: dict = {}
+    logger.info(
+        f"int16_encoding: scanning {len(ds.data_vars)} variable(s) for their "
+        f"value range (one pass over the source, no output until it completes)"
+    )
+    bounds: dict[tuple[str, str], xr.DataArray] = {}
     for name, da in ds.data_vars.items():
-        lo = float(da.min().compute())
-        hi = float(da.max().compute())
+        bounds[(str(name), "lo")] = da.min()
+        bounds[(str(name), "hi")] = da.max()
+    (computed,) = dask.compute(bounds)
+
+    encoding: dict = {}
+    for name in ds.data_vars:
+        lo = float(computed[(str(name), "lo")])
+        hi = float(computed[(str(name), "hi")])
         span = hi - lo
         if not np.isfinite(span) or span == 0:
             # Degenerate or all-NaN: packing buys nothing and the scale would be
