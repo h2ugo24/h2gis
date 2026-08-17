@@ -233,23 +233,76 @@ class TestDailySeaLevelPressure:
 
 
 class TestHourlyRadiation:
+    """
+    ERA5's hourly accumulations already cover only their own interval, so the
+    conversion is a division and nothing else. The previous implementation
+    differenced first, treating the field as a running total; these tests are
+    written against ERA5's actual numbers rather than that assumption.
+    """
+
     def test_accumulated_to_watt_rate(self):
-        # 3600 J/m² per hour → 1 W/m²
-        da = _rad_da([0.0, 3600.0, 7200.0, 10800.0])
+        # 3600 J/m² accumulated over the hour → 1 W/m²
+        da = _rad_da([3600.0, 3600.0, 3600.0, 3600.0])
         result = hourly_radiation(da)
-        assert result.shape[0] == 3  # diff reduces by 1
         np.testing.assert_allclose(result.values, 1.0, rtol=1e-5)
 
-    def test_clips_large_negative_rates_to_zero(self):
-        # diff = −36000 J in one step → rate = −10 W/m² → clipped to 0
-        da = _rad_da([0.0, -36000.0, 0.0])
+    def test_every_timestep_survives(self):
+        """Differencing silently dropped the first hour of every period."""
+        da = _rad_da([3600.0, 7200.0, 10800.0, 14400.0])
+        assert hourly_radiation(da).shape[0] == 4
+
+    def test_a_falling_accumulation_is_not_a_reset(self):
+        """
+        A real tisr block rises and falls with the sun. Differencing read the
+        falling limb as negative rates and the clip then zeroed them, which is
+        what made stored tisr several times too small.
+        """
+        da = _rad_da([0.0, 905088.0, 2423552.0, 1144320.0, 0.0])
+        result = hourly_radiation(da)
+
+        np.testing.assert_allclose(
+            result.values[:, 0, 0],
+            np.array([0.0, 905088.0, 2423552.0, 1144320.0, 0.0]) / 3600.0,
+            rtol=1e-5,
+        )
+        assert float(result.values[:, 0, 0].max()) == pytest.approx(673.2, rel=1e-3)
+
+    def test_genuinely_negative_flux_is_preserved(self):
+        """slhf is negative over essentially the whole ocean."""
+        da = _rad_da([-360000.0, -360000.0, -360000.0])
         result = hourly_radiation(da, clip_small_negatives=True)
-        assert float(result.values[0, 0, 0]) == pytest.approx(0.0, abs=1e-9)
+
+        np.testing.assert_allclose(result.values, -100.0, rtol=1e-5)
+
+    def test_only_the_noise_sliver_is_clipped(self):
+        da = _rad_da([-1e-4, -3600.0, 3600.0])  # → -2.8e-8, -1.0, +1.0 W/m²
+        result = hourly_radiation(da, clip_small_negatives=True).values[:, 0, 0]
+
+        assert float(result[0]) == 0.0, "rounding noise should flatten to zero"
+        assert float(result[1]) == pytest.approx(-1.0, rel=1e-5), (
+            "a real negative flux must survive the clip"
+        )
 
     def test_preserves_negative_when_clip_disabled(self):
-        da = _rad_da([0.0, -36000.0, 0.0])
-        result = hourly_radiation(da, clip_small_negatives=False)
-        assert float(result.values[0, 0, 0]) == pytest.approx(-10.0, rel=1e-5)
+        da = _rad_da([-1e-4, -3600.0])
+        result = hourly_radiation(da, clip_small_negatives=False).values[:, 0, 0]
+        assert float(result[0]) < 0.0
+
+    def test_period_is_read_from_the_axis(self):
+        """A 3-hourly product divides by 10800, not 3600."""
+        times = pd.date_range("2020-01-01", periods=3, freq="3h")
+        da = xr.DataArray(
+            np.full((3, 2, 2), 10800.0),
+            dims=["time", "lat", "lon"],
+            coords={"time": times, "lat": [30.0, 35.0], "lon": [-10.0, -5.0]},
+            name="ssrd",
+        )
+        np.testing.assert_allclose(hourly_radiation(da).values, 1.0, rtol=1e-5)
+
+    def test_single_timestep_raises_rather_than_guessing(self):
+        da = _rad_da([3600.0])
+        with pytest.raises(ValueError, match="accumulation period"):
+            hourly_radiation(da)
 
 
 # ---------------------------------------------------------------------------
