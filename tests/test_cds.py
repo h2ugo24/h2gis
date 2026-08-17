@@ -17,7 +17,8 @@ from h2mare.processing.core.cds import (
     daily_waves,
     daily_wind,
     direction_to_uv,
-    drop_dims,
+    drop_scalar_dims,
+    drop_valid_time,
     hourly_radiation,
     resample_daily_mean,
 )
@@ -70,21 +71,71 @@ class TestGetDsForMonth:
 
 
 # ---------------------------------------------------------------------------
-# drop_dims
+# drop_scalar_dims / drop_valid_time
 # ---------------------------------------------------------------------------
 
 
-class TestDropDims:
-    def test_removes_listed_variables(self):
-        ds = xr.Dataset({"a": 1.0, "b": 2.0, "c": 3.0})
-        result = drop_dims(ds, dims_to_drop=["a", "b"])
-        assert "a" not in result
-        assert "c" in result
+class TestDropScalarDims:
+    def test_removes_the_grib_scalar_coords(self):
+        ds = xr.Dataset({"swh": 1.0}).assign_coords(
+            step=pd.Timedelta(0), number=0, surface=0.0
+        )
+        result = drop_scalar_dims(ds)
+        assert set(result.coords) == set()
+        assert "swh" in result
 
     def test_ignores_absent_names_without_error(self):
-        ds = xr.Dataset({"x": 1.0})
-        result = drop_dims(ds, dims_to_drop=["x", "does_not_exist"])
-        assert "x" not in result
+        ds = xr.Dataset({"swh": 1.0}).assign_coords(number=0)
+        assert "number" not in drop_scalar_dims(ds).coords
+
+    def test_leaves_valid_time_alone(self):
+        """It varies along a dimension, so it is not this function's business."""
+        times = pd.date_range("2020-01-01", periods=3, freq="h")
+        ds = xr.Dataset(
+            {"swh": (["time"], np.ones(3))},
+            coords={"time": times, "valid_time": ("time", times.values)},
+        )
+        assert "valid_time" in drop_scalar_dims(ds).coords
+
+
+class TestDropValidTime:
+    """
+    Dropping valid_time is safe only once `time` carries the axis. The unsafe
+    case does not raise — it leaves the dimension in place with no labels — so
+    the guard is what stands between a redundant coord and lost timestamps.
+    """
+
+    @staticmethod
+    def _times():
+        return pd.date_range("2020-01-01", periods=3, freq="h")
+
+    def test_drops_it_when_time_carries_the_axis(self):
+        times = self._times()
+        ds = xr.Dataset(
+            {"swh": (["time"], np.ones(3))},
+            coords={"time": times, "valid_time": ("time", times.values)},
+        )
+        result = drop_valid_time(ds)
+
+        assert "valid_time" not in result.coords
+        assert list(result.time.values) == list(times.values)
+
+    def test_keeps_it_when_it_is_the_axis(self):
+        """Without the guard this silently strips every timestamp."""
+        times = self._times()
+        ds = xr.Dataset(
+            {"swh": (["valid_time"], np.ones(3))}, coords={"valid_time": times}
+        )
+        result = drop_valid_time(ds)
+
+        assert "valid_time" in result.coords, (
+            "dropping the dimension coordinate leaves the dimension unlabelled "
+            "rather than raising — the timestamps would just be gone"
+        )
+
+    def test_absent_valid_time_is_a_no_op(self):
+        ds = xr.Dataset({"swh": (["time"], np.ones(3))}, coords={"time": self._times()})
+        assert drop_valid_time(ds).equals(ds)
 
 
 # ---------------------------------------------------------------------------
