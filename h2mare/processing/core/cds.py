@@ -688,20 +688,46 @@ def process_atm_accum_avg(
     return merged.isel(lat=slice(None, None, -1))
 
 
+#: Raw ERA5 fields kept as-is by the hourly store. The daily reductions this
+#: variable publishes (wind_mean/std/max and the daily means) are derived at
+#: compile time instead — see ``compiler_registry._compile_atm_instante``.
+_ATM_INSTANTE_HOURLY_VARS = ("msl", "u10", "v10", "tcc")
+
+
+def hourly_atm_instante(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Keep ERA5's native hourly wind, cloud and pressure, deriving nothing.
+
+    Left in native units — ``daily_sea_level_pressure`` does the Pa→hPa
+    conversion, so it still sees exactly the input it saw at convert time. The
+    store therefore holds ``msl`` in Pa while h2ds holds it in hPa.
+    """
+    keep = [v for v in _ATM_INSTANTE_HOURLY_VARS if v in ds.data_vars]
+    return ds[keep]
+
+
 def process_atm_instante(
     ds: xr.Dataset,
     var_config: Optional[KeyVarConfigEntry] = None,
     var_key: str | None = None,
 ) -> xr.Dataset:
-    datasets = []
+    """
+    Prepare the instantaneous atmospheric fields, aggregating to daily only for
+    a daily store.
+
+    With ``time_step: hourly`` the daily reductions are skipped here and happen
+    at compile instead (see ``compiler_registry._compile_atm_instante``), so the
+    store keeps ERA5's native hourly axis while h2ds stays daily.
+    """
     ds = rename_dims(ds)
     ds = ds.chunk(
         {"time": unified_time_chunk(ds), "lat": len(ds.lat), "lon": len(ds.lon)}
     )
-    datasets.append(daily_wind(ds))
-    datasets.append(daily_cloud_cover(ds))
-    datasets.append(daily_sea_level_pressure(ds))
-    merged = xr.merge(datasets, compat="override", join="outer")
+    if step_freq(var_config) == "h":
+        merged: xr.Dataset = hourly_atm_instante(ds)
+    else:
+        datasets = [daily_wind(ds), daily_cloud_cover(ds), daily_sea_level_pressure(ds)]
+        merged = xr.merge(datasets, compat="override", join="outer")
     assert isinstance(merged, xr.Dataset)
     return merged.isel(lat=slice(None, None, -1))
 

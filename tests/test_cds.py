@@ -307,6 +307,89 @@ class TestProcessAtmInstante:
 
 
 # ---------------------------------------------------------------------------
+# process_atm_instante — cadence selected by config
+# ---------------------------------------------------------------------------
+
+
+class TestProcessAtmInstanteCadence:
+    """
+    time_step decides whether convert aggregates. An hourly store keeps ERA5's
+    raw fields; the daily reductions move to compile time.
+    """
+
+    @staticmethod
+    def _ds():
+        shape = (48, 2, 2)
+        return _hourly_ds(
+            2,
+            u10=np.full(shape, 3.0),
+            v10=np.full(shape, 4.0),
+            tcc=np.full(shape, 0.5),
+            msl=np.full(shape, 101325.0),
+        )
+
+    def test_daily_config_aggregates_as_before(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        cfg = SimpleNamespace(time_step=TimeStep.DAILY)
+        out = process_atm_instante(self._ds(), cfg, "atm-instante")
+
+        assert out.sizes["time"] == 2, "daily store must still be one step per day"
+        assert "wind_mean" in out.data_vars
+
+    def test_hourly_config_keeps_the_native_axis(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        cfg = SimpleNamespace(time_step=TimeStep.HOURLY)
+        out = process_atm_instante(self._ds(), cfg, "atm-instante")
+
+        assert out.sizes["time"] == 48, "hourly store must not be resampled"
+
+    def test_hourly_store_holds_only_the_raw_fields(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        cfg = SimpleNamespace(time_step=TimeStep.HOURLY)
+        out = process_atm_instante(self._ds(), cfg, "atm-instante")
+
+        assert set(out.data_vars) == {"msl", "u10", "v10", "tcc"}, (
+            "derived wind features belong to compile time, not the hourly store"
+        )
+
+    def test_hourly_msl_stays_in_native_pascals(self):
+        """daily_sea_level_pressure does the Pa→hPa conversion at compile time."""
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        cfg = SimpleNamespace(time_step=TimeStep.HOURLY)
+        out = process_atm_instante(self._ds(), cfg, "atm-instante")
+
+        np.testing.assert_allclose(out["msl"].values, 101325.0)
+
+    def test_hourly_lat_is_reversed_like_the_daily_path(self):
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        cfg = SimpleNamespace(time_step=TimeStep.HOURLY)
+        ds = self._ds()
+        out = process_atm_instante(ds, cfg, "atm-instante")
+
+        assert list(out.lat.values) == list(reversed(ds.lat.values))
+
+    def test_missing_optional_field_is_tolerated(self):
+        """A store without tcc must not blow up on the selection."""
+        from h2mare.models import TimeStep
+        from h2mare.processing.core.cds import process_atm_instante
+
+        ds = self._ds().drop_vars("tcc")
+        out = process_atm_instante(ds, SimpleNamespace(time_step=TimeStep.HOURLY))
+
+        assert set(out.data_vars) == {"msl", "u10", "v10"}
+
+
+# ---------------------------------------------------------------------------
 # Integration: process_waves
 # ---------------------------------------------------------------------------
 
