@@ -1,5 +1,5 @@
 """
-Download climate data from Copernicus ECMWF CLimate Data Store (CLS)
+Download climate data from the Copernicus Climate Data Store (CDS), operated by ECMWF.
 Go to https://cds.climate.copernicus.eu/datasets to check API request code
 
 """
