@@ -25,6 +25,11 @@ warnings.filterwarnings("ignore")
 _EKMAN_P90_FILE = "cds_ekman-monthly-90thquantile_80W-10E-0N-70N_1998-2017.nc"
 _EKMAN_DOY_FILE = "cds_ekman-doy-mean_80W-10E-0N-70N_1998-2017.nc"
 
+#: Buckets in the day-of-year climatology: one per calendar day of a common
+#: year. A file with 366 was built on raw ``dayofyear`` and is misaligned (see
+#: :func:`calendar_doy`), so the count doubles as a format check.
+_EKMAN_DOY_BUCKETS = 365
+
 #: Time chunk used while the curl stencil runs. Matches the GRIB read the
 #: convert path has always used (`chunks={"time": 168, ...}`), which keeps each
 #: chunk ~68 MB with lat/lon whole and lets time chunks stream independently.
@@ -532,6 +537,28 @@ def get_previous_dates_da(da: xr.DataArray, var_key: str):
         return da
 
 
+def calendar_doy(time: xr.DataArray) -> xr.DataArray:
+    """
+    Day index on a fixed 365-day calendar, so one index is one calendar date.
+
+    ``time.dt.dayofyear`` is not that. It slips by one after February in a leap
+    year: 1 March is 60 in three years out of four and 61 in the fourth. A
+    climatology grouped on it therefore averages two different calendar dates
+    into every post-February bucket, and an anomaly taken against it subtracts
+    the wrong day for ten months of every leap year — a quarter of the archive,
+    silently, since nothing about the result looks wrong.
+
+    29 February gets 28 February's index rather than one of its own: a twenty
+    year baseline holds five of them against twenty samples for every other day,
+    and a bucket estimated from a quarter of the data does not belong beside the
+    rest. Both the climatology and the anomaly that reads it go through here, so
+    the two cannot drift apart.
+    """
+    month, day = time.dt.month, time.dt.day
+    adjusted = time.dt.dayofyear - xr.where(time.dt.is_leap_year & (month > 2), 1, 0)
+    return xr.where((month == 2) & (day == 29), 59, adjusted)
+
+
 def add_engineered_ekman(
     da: xr.DataArray, var_key: str, *, seed_from_store: bool = True
 ):
@@ -555,6 +582,18 @@ def add_engineered_ekman(
     p90 = p90.chunk({"month": -1, "lat": 200, "lon": 200})
 
     clim_doy = xr.open_dataset(clim_dir / _EKMAN_DOY_FILE)
+    # A 366-bucket file was grouped on raw dayofyear, which pairs each March
+    # onward day with the wrong calendar date in leap years. Selecting from it
+    # with calendar_doy would still succeed — every index it asks for exists —
+    # and quietly return a climatology one day out, so refuse it here instead.
+    n_doy = clim_doy.sizes.get("dayofyear")
+    if n_doy != _EKMAN_DOY_BUCKETS:
+        raise ValueError(
+            f"{_EKMAN_DOY_FILE} has {n_doy} dayofyear buckets, expected "
+            f"{_EKMAN_DOY_BUCKETS}. A 366-bucket file predates the leap-year "
+            f"alignment fix and is offset by a day from March onward in leap "
+            f"years. Rebuild it with scripts/ekman_climatology.py."
+        )
     clim_doy = clim_doy.chunk({"dayofyear": -1, "lat": 200, "lon": 200})
 
     # Get previous days for rowling mean
@@ -569,7 +608,7 @@ def add_engineered_ekman(
 
     # Get 7-day rolling mean of Ekman pumping (Since files are yearly, the first 6days of the year are not complete)
     ekman_7d = da.rolling(time=_EKMAN_ROLL_DAYS, min_periods=1).mean()
-    clim_align = clim_doy.sel(dayofyear=ekman_7d["time"].dt.dayofyear)
+    clim_align = clim_doy.sel(dayofyear=calendar_doy(ekman_7d["time"]))
     anom = ekman_7d - clim_align
 
     ds_ekman = xr.Dataset({"ekman_7d": ekman_7d, "ekman_anom": anom["ekman_pumping"]})
