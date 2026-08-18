@@ -341,3 +341,44 @@ def snap_grid_coords(ds: xr.Dataset, decimals: int = GRID_COORD_DECIMALS) -> xr.
             continue
         new_coords[name] = rounded
     return ds.assign_coords(new_coords) if new_coords else ds
+
+
+#: Attribute name prefixes carrying the source file's own encoding.
+_SOURCE_ENCODING_PREFIXES = ("GRIB_",)
+
+#: Attribute names carrying the source file's packing bounds. These read as
+#: physical limits and are not: CMEMS ships int16-packed data, so thetao_100
+#: arrives declaring [-32766, 21306] "degrees_C" against real values of
+#: [-2.3, 28.2]. Some variables' bounds happen to be plausible (mld's [1, 4525]
+#: metres), which is what makes keeping them worse than dropping them — a
+#: consumer cannot tell the nonsense from the sensible.
+_SOURCE_ENCODING_ATTRS = ("valid_min", "valid_max")
+
+
+def drop_source_encoding_attrs(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Strip attributes that describe the source file rather than this dataset.
+
+    They were true of the file the data came from and stopped being true the
+    moment it was regridded and re-encoded, but nothing removes them, so they
+    travel into the compiled product asserting the wrong thing. On h2ds — 280 x
+    360 at 0.25 deg — the wave variables still claimed ``GRIB_Nx=181,
+    GRIB_Ny=141, iDirectionIncrement=0.5``, ERA5's coarser wave grid; the upwell
+    counts claimed ``GRIB_units='N m**-2'`` inherited from the stress field they
+    are derived from; and ``GRIB_missingValue`` named a sentinel h2ds does not
+    use, having NaN.
+
+    Only data variables are touched, and only these families: ``standard_name``,
+    ``cell_methods``, ``unit_long`` and the rest still describe the quantity
+    itself and survive. Provenance is not lost with ``GRIB_paramId`` — the
+    variable's ``product_id``/``dataset_id`` carry it.
+    """
+    for var in ds.data_vars:
+        attrs = ds[var].attrs
+        for name in list(attrs):
+            if (
+                name.startswith(_SOURCE_ENCODING_PREFIXES)
+                or name in _SOURCE_ENCODING_ATTRS
+            ):
+                del attrs[name]
+    return ds
