@@ -330,6 +330,51 @@ class TestExecuteTask:
 
 
 # ---------------------------------------------------------------------------
+# Dataset availability — the trailing day
+# ---------------------------------------------------------------------------
+
+
+class TestAvailabilityTrailingDay:
+    """
+    Store coverage is day-granular, so a day ingested while the provider is
+    still publishing it counts as covered and its remaining hours are never
+    fetched again. The trailing day is held back until it is whole.
+    """
+
+    @staticmethod
+    def _availability(dl, first: str, last: str) -> pd.Timestamp:
+        with patch(
+            "h2mare.downloader.cmems_downloader.get_dataset_time_range",
+            return_value=(pd.Timestamp(first), pd.Timestamp(last)),
+        ):
+            return pd.Timestamp(dl.get_rep_availability().end)
+
+    def test_hourly_partial_last_day_is_held_back(self, dl_hourly):
+        end = self._availability(dl_hourly, "2020-01-01", "2020-06-30 05:00")
+
+        assert end == pd.Timestamp("2020-06-29")
+
+    def test_hourly_complete_last_day_is_kept(self, dl_hourly):
+        end = self._availability(dl_hourly, "2020-01-01", "2020-06-30 23:00")
+
+        assert end == pd.Timestamp("2020-06-30")
+
+    def test_daily_keeps_the_day_its_last_stamp_falls_in(self, dl):
+        # One step per day, so the day holding the last stamp is complete by
+        # definition — noon stamps must not be mistaken for a partial day.
+        end = self._availability(dl, "2020-01-01", "2020-06-30 12:00")
+
+        assert end == pd.Timestamp("2020-06-30")
+
+    def test_a_history_of_one_partial_day_does_not_go_empty(self, dl_hourly):
+        """Holding the day back would put end before start, which DateRange
+        rejects outright — a brand-new product must not raise."""
+        end = self._availability(dl_hourly, "2020-06-30 00:00", "2020-06-30 05:00")
+
+        assert end == pd.Timestamp("2020-06-30")
+
+
+# ---------------------------------------------------------------------------
 # download_subset — the end bound handed to the toolbox
 # ---------------------------------------------------------------------------
 
