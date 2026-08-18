@@ -23,7 +23,20 @@ variables:
     subset: true                      # CMEMS only: subset() vs get() download API
     bbox: [-80, 0, 10, 70]           # [xmin, ymin, xmax, ymax]
     depth_range: [0.0, 500.0]        # [min_depth, max_depth]
+
+  radiation:
+    local_folder: CDS_Radiation
+    source: cds
+    archive_raw: false
+    time_step: hourly                 # keep the source cadence; h2ds stays daily
+    store_dtype: int16                # scale/offset packed, ~2/3 the size
+    merge_time_step: true             # GRIB time x step grid
+    dataset_id_rep: reanalysis-era5-single-levels
 ```
+
+Both `time_step` and `store_dtype` are properties of the **store**, not of a run:
+each takes effect when a Zarr is created and an append inherits it, so changing
+either on an existing variable means re-converting it.
 
 | Field | Required | Description |
 |---|---|---|
@@ -38,6 +51,9 @@ variables:
 | `merge_time_step` | no | Set to `true` for CDS/ERA5 accumulated or averaged variables whose GRIB files have a 2-D `time × step` coordinate grid instead of a flat `time` axis (e.g. `atm-accum-avg`, `radiation`). Triggers a preprocess step that merges the two dimensions and trims overlapping timestamps at month edges. Default `false`. |
 | `filename_date_range` | no | Set to `true` when the `pattern` captures a `(start, end)` date range (e.g. CMEMS/CDS files named `2021-01-01-2021-01-31.nc`). A **one-day** request is named with a single date instead (`2026-07-31.nc`), so make the second group optional and it will be read as that one day — without this a single-day repair download matches nothing and is discarded. Leave `false` (default) when the pattern yields a single date (e.g. AVISO FSLE: `_20210115_`). Controls how `Netcdf2Zarr` expands filenames into daily time steps. |
 | `known_gaps` | no | Days the provider never published, so they can never be downloaded, converted or backfilled. Each entry is a date (`2025-06-02`) or a closed interval (`2025-06-02/2025-06-05`). Excluded from the gap checks and from `h2mare audit`, which reports how many were suppressed. Needed because a source shipping one file per day leaves an *axis* hole when it skips one — AVISO has no `fsle` file for 2025-06-02 and its remote listing jumps `20250601` → `20250603` — which is otherwise indistinguishable from data the pipeline lost. Only for gaps confirmed absent at the source; anything else is a defect and belongs fixed, not listed. |
+| `time_step` | no | Cadence of this variable's own Zarr: `daily` (default) or `hourly`. An hourly store keeps the source's native axis and moves the daily reduction to compile time, so h2ds stays daily either way. Distinct from `time_resolution`, which chooses the *file* period (one Zarr per year or per month) — a store can be hourly and still written one file per year. The gap checks read this so they compare a store against a calendar at its own resolution; a daily grid cannot see a missing hour, and an hourly grid over a daily store would report 23 phantom gaps a day. Flipping it on an existing store requires re-converting: the store is written at one cadence and the check expects the other, which fails the write verification rather than corrupting anything. |
+| `store_dtype` | no | On-disk encoding: `float32` (default, byte-identical to what the pipeline has always written) or `int16`, which stores scale/offset-packed integers at roughly two thirds the size. Safe for ERA5, whose GRIB is already ~16-bit packed, so the packing discards quantisation noise rather than signal. The scale spans each variable's own measured range, so the encoding step makes one pass over the data before the first byte is written — expect a silent minutes-long pause on a large store. Applied only when a store is **created**; appends inherit whatever encoding the store already has, so changing this on an existing store does nothing until it is re-converted. |
+| `expect_contiguous_time` | no | Whether this product publishes an unbroken time axis at its own cadence (see `time_step`). `true` (default) lets the convert step reject a Zarr whose axis skips a step inside the range it just wrote. Set `false` only for a source that legitimately publishes an irregular axis. Distinct from `known_gaps`, which suppresses named days on an otherwise contiguous axis, and from `time_step`, which asks how finely the axis is sampled rather than whether it may skip. |
 | `raw_include` | no | Regex matched (via `re.search`) against each raw filename; only matching files are converted. Use when a download directory holds files the pipeline must not read — AVISO ships META3.2 eddy trajectories as `long`/`short`/`untracked` variants side by side, and only the long ones belong in the store (the `untracked` files carry no `track` variable at all). Omit (default) to convert every file the date `pattern` matches. |
 | `bbox` | no | Bounding box for subset. If omitted, the full available extent is downloaded |
 | `depth_range` | no | Depth range for 3D variables (e.g. `o2`) |
