@@ -108,7 +108,15 @@ def _parse_time_values(
         dataset_id: Dataset ID for error messages
 
     Returns:
-        Tuple of normalized Timestamps
+        The dataset's first and last stamps, exactly as the catalogue reports
+        them — time of day included.
+
+        Deliberately not floored to midnight. Every consumer builds a
+        ``DateRange``, which floors both ends itself, so flooring here changed
+        nothing except to destroy the one thing a caller cannot recover: whether
+        the last day is a full day of data or a few hours of one still being
+        published. :meth:`CMEMSDownloader._get_dataset_availability` needs that
+        to decide whether the trailing day is safe to ingest.
 
     Raises:
         CMEMSAPIError: If values are invalid
@@ -135,8 +143,8 @@ def _parse_time_values(
 
     # Convert milliseconds to datetime
     try:
-        tmin = pd.Timestamp(tmin_ms, unit="ms").normalize()
-        tmax = pd.Timestamp(tmax_ms, unit="ms").normalize()
+        tmin = pd.Timestamp(tmin_ms, unit="ms")
+        tmax = pd.Timestamp(tmax_ms, unit="ms")
     except (ValueError, pd.errors.OutOfBoundsDatetime) as e:
         raise CMEMSAPIError(
             f"Failed to parse timestamps for dataset '{dataset_id}': "

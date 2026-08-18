@@ -272,11 +272,47 @@ class CMEMSDownloader(BaseDownloader):
 
     # ==================== Dates and data coverage Resolution ====================
 
+    def _last_complete_day(
+        self, start: pd.Timestamp, end: pd.Timestamp
+    ) -> pd.Timestamp:
+        """
+        Day-level availability end: the last day the provider has published whole.
+
+        A trailing *partial* day is the one case where taking the day the last
+        stamp falls in loses data for good. Store coverage is day-granular, so a
+        day ingested six hours old counts as covered and its remaining eighteen
+        hours are never requested again. Held back, it is fetched whole once the
+        provider finishes publishing it.
+
+        Only the tail behaves this way. A partial *first* day is partial at the
+        source forever, so it is taken as it is rather than skipped — hence the
+        clamp to *start*, which also keeps a product whose entire history is one
+        partial day from resolving to an empty range.
+
+        Daily variables are unaffected: one step per day means the day holding
+        the last stamp is complete by definition.
+        """
+        day = end.normalize()
+        if step_freq(self.var_config) != "h":
+            return day
+
+        # Complete when the day's final step is present. Written against the
+        # cadence rather than as a bare `hour == 23` so that adding a TimeStep
+        # member — a 3-hourly product, say — has to come back through here.
+        last_step_of_day = day + pd.Timedelta(hours=23)
+        if end >= last_step_of_day:
+            return day
+        logger.info(
+            f"[{self.var_key}] {day.date()} is still being published "
+            f"(last stamp {end}); holding it back until it is complete."
+        )
+        return max(day - pd.Timedelta(days=1), start.normalize())
+
     def _get_dataset_availability(self, dataset_id: str) -> DateRange:
         """Query CMEMS API for dataset time range."""
         try:
             start, end = get_dataset_time_range(dataset_id)
-            return DateRange(start=start, end=end)
+            return DateRange(start=start, end=self._last_complete_day(start, end))
         except CMEMSAPIError as e:
             logger.error(f"Failed to get dataset availability: {e}")
             raise

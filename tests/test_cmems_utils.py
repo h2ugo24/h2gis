@@ -88,15 +88,21 @@ class TestParseTimeValues:
         assert tmin == pd.Timestamp("2020-01-01")
         assert tmax == pd.Timestamp("2021-01-01")
 
-    def test_returns_normalized_dates(self):
+    def test_preserves_the_time_of_day(self):
+        """
+        Flooring here bought nothing — every consumer builds a DateRange, which
+        floors both ends itself — and cost the one fact a caller cannot rebuild:
+        whether the last day is whole or still being published.
+        """
         tmin, tmax = _parse_time_values(
             {
-                "minimum_value": self._ms("2020-06-15"),
-                "maximum_value": self._ms("2021-06-15"),
+                "minimum_value": self._ms("2020-06-15 12:00"),
+                "maximum_value": self._ms("2021-06-15 05:00"),
             },
             "test-ds",
         )
-        assert tmin.hour == 0 and tmin.minute == 0
+        assert tmin == pd.Timestamp("2020-06-15 12:00")
+        assert tmax == pd.Timestamp("2021-06-15 05:00")
 
     def test_raises_when_minimum_value_is_none(self):
         with pytest.raises(CMEMSAPIError, match="Missing time bounds"):
