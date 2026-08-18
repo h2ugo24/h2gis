@@ -21,11 +21,11 @@ from h2mare.config import AppConfig, get_settings
 from h2mare.models import TimeStep
 from h2mare.storage.zarr_index import ZarrIndex, _variables_list
 from h2mare.storage.zarr_reader import ZarrReader
-from h2mare.types import BBox, DateLike, DateRange, TimeResolution
+from h2mare.types import BBox, DateLike, DateRange, FilePeriod
 from h2mare.utils.datetime_utils import end_of_day
 from h2mare.utils.labels import create_label_from_dataset
 from h2mare.utils.paths import resolve_store_path
-from h2mare.validators import validate_time_resolution, validate_var_key
+from h2mare.validators import validate_file_period, validate_var_key
 
 
 # ================ Convenience functions for quick access ==========================
@@ -39,7 +39,7 @@ class ZarrCatalog:
         self,
         var_key: str,
         *,
-        time_resolution: TimeResolution = TimeResolution.YEAR,
+        file_period: FilePeriod = FilePeriod.YEAR,
         app_config: Optional[AppConfig] = None,
         store_root: Optional[Path] = None,
         metadata_root: Optional[Path] = None,
@@ -54,7 +54,7 @@ class ZarrCatalog:
 
         Args:
             var_key (str): Variable key that must exist in app_config.variables
-            time_resolution: Temporal granularity for file storage ('year' or 'month'). Defaults to 'year'.
+            file_period: Temporal granularity for file storage ('year' or 'month'). Defaults to 'year'.
             app_config (Optional[AppConfig], optional): Application configuration. If None, loads from get_settings().
             store_root (Optional[Path]): Root directory for zarr files. If None, uses get_settings().STORE_ROOT or get_settings().ZARR_DIR.
             metadata_root (Optional[Path]): Root directory for catalog parquet files. If None, uses get_settings().METADATA_DIR.
@@ -72,7 +72,7 @@ class ZarrCatalog:
         self.var_key = validate_var_key(var_key, self.app_config)
         self.var_config = self.app_config.variables[var_key]
 
-        self.time_resolution = validate_time_resolution(time_resolution)
+        self.file_period = validate_file_period(file_period)
 
         # Setup directories
         self.store_root = resolve_store_path(
@@ -90,7 +90,7 @@ class ZarrCatalog:
             self.var_config,
             store_root=self.store_root,
             metadata_root=self.metadata_root,
-            time_resolution=self.time_resolution,
+            file_period=self.file_period,
             auto_refresh=auto_refresh,
             verbose=verbose,
         )
@@ -112,16 +112,14 @@ class ZarrCatalog:
         # Two different facts, and either one alone gets read as the other:
         # how far apart the data's steps are, versus how the store is cut into
         # files. An hourly store written one file per year is legitimately
-        # "hourly" and "year" at once. `file_period` names the second for what
-        # it is — the attribute behind it is `time_resolution`, whose name has
-        # always oversold what it controls.
+        # "hourly" and "year" at once, so both are shown.
         step = getattr(self.var_config, "time_step", TimeStep.DAILY)
 
         return (
             f"ZarrCatalog(\n"
             f"  var_key={self.var_key},\n"
             f"  time_step={step.value},\n"
-            f"  file_period={self.time_resolution.value},\n"
+            f"  file_period={self.file_period.value},\n"
             f"  files={df['path'].nunique() if not df.empty else 0},\n"
             f"  coverage={time_str},\n"
             f"  bbox={bbox.to_label() if bbox is not None else None},\n"
@@ -455,7 +453,7 @@ class ZarrCatalog:
                 "time_coverage": None,
                 "bbox": "No data",
                 "store_bbox": None,
-                "period": self.time_resolution,
+                "period": self.file_period,
                 "variables": set(),
                 "total_timesteps": 0,
                 "store_root": str(self.store_root),
@@ -471,7 +469,7 @@ class ZarrCatalog:
             "time_coverage": time_cov if time_cov is not None else "No data",
             "bbox": bbox if bbox is not None else "No data",
             "store_bbox": self.get_store_bbox(),
-            "period": self.time_resolution,
+            "period": self.file_period,
             "variables": self.get_variables(),
             "total_timesteps": (
                 df["num_timesteps"].sum().item()

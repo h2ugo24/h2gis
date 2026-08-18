@@ -22,7 +22,7 @@ from h2mare.downloader.cmems_utils import CMEMSAPIError, get_dataset_time_range
 from h2mare.models import step_freq
 from h2mare.storage import split_time_range
 from h2mare.storage.coverage import resolve_date_range
-from h2mare.types import DateLike, DateRange, DownloadTask, TimeResolution
+from h2mare.types import DateLike, DateRange, DownloadTask, FilePeriod
 from h2mare.utils.datetime_utils import end_of_day
 
 warnings.filterwarnings("ignore")
@@ -405,7 +405,7 @@ class CMEMSDownloader(BaseDownloader):
         end_date: Optional[DateLike] = None,
         output_dir: Optional[Path] = None,
         dry_run: bool = False,
-        time_split: TimeResolution = TimeResolution.MONTH,
+        time_split: FilePeriod = FilePeriod.MONTH,
     ) -> bool:
         """
         Run download for specified date range.
@@ -496,7 +496,7 @@ class CMEMSDownloader(BaseDownloader):
     def _execute_task(
         self,
         task: DownloadTask,
-        time_split: TimeResolution,
+        time_split: FilePeriod,
         output_dir: Optional[Path] = None,
     ) -> None:
         """

@@ -35,11 +35,11 @@ from h2mare.storage.xarray_helpers import (
     snap_grid_coords,
 )
 from h2mare.storage.zarr_catalog import ZarrCatalog
-from h2mare.types import DateLike, DateRange, TimeResolution
+from h2mare.types import DateLike, DateRange, FilePeriod
 from h2mare.utils.datetime_utils import normalize_date
 from h2mare.utils.files_io import filter_raw_files, safe_move_files, safe_rmtree
 from h2mare.utils.paths import resolve_download_path
-from h2mare.validators import validate_time_resolution, validate_var_key
+from h2mare.validators import validate_file_period, validate_var_key
 
 warnings.filterwarnings("ignore")
 
@@ -173,7 +173,7 @@ class Netcdf2Zarr(BaseConverter):
         app_config: Optional[AppConfig] = None,
         store_root: Optional[Path] = None,
         download_root: Optional[Path] = None,
-        time_resolution: TimeResolution = TimeResolution.YEAR,
+        file_period: FilePeriod = FilePeriod.YEAR,
         date_format: Literal["year", "date", "yearmonth"] = "year",
     ) -> None:
         """
@@ -184,7 +184,7 @@ class Netcdf2Zarr(BaseConverter):
             app_config: The application's configuration object.
             store_root: The root directory where the processed Zarr files will be stored.
             download_root: The root directory containing the downloaded raw data files to be processed.
-            time_resolution: Temporal granularity ('year' or 'month') for file storage. Defaults to 'year'.
+            file_period: Temporal granularity ('year' or 'month') for file storage. Defaults to 'year'.
             date_format: string date format for output file name.
         """
 
@@ -198,7 +198,7 @@ class Netcdf2Zarr(BaseConverter):
 
         self.download_root = resolve_download_path(self.var_config, download_root)
 
-        self.time_resolution = validate_time_resolution(time_resolution)
+        self.file_period = validate_file_period(file_period)
         self.date_format: Literal["year", "date", "yearmonth"] = date_format
 
         self.catalog = ZarrCatalog(self.var_key, store_root=store_root)
@@ -265,7 +265,7 @@ class Netcdf2Zarr(BaseConverter):
             )
             return True
 
-        file_groups = self._group_map(groupby=self.time_resolution, window=window)
+        file_groups = self._group_map(groupby=self.file_period, window=window)
 
         if not file_groups:
             # Distinguish two ways of getting nothing. A window that matches no
@@ -303,7 +303,7 @@ class Netcdf2Zarr(BaseConverter):
     # ========= DATA PREPARATION FUNCTIONS =========
 
     def _group_map(
-        self, groupby: TimeResolution, window: Optional[DateRange] = None
+        self, groupby: FilePeriod, window: Optional[DateRange] = None
     ) -> dict[int | tuple[int, int], list[Path]]:
         """
         Group paths of nc files by period i.e groupby str.
@@ -337,9 +337,9 @@ class Netcdf2Zarr(BaseConverter):
                 )
                 return {}
 
-        if groupby == TimeResolution.YEAR:
+        if groupby == FilePeriod.YEAR:
             groups = file_map.groupby(file_map.index.year)  # type: ignore
-        elif groupby == TimeResolution.MONTH:
+        elif groupby == FilePeriod.MONTH:
             groups = file_map.groupby([file_map.index.year, file_map.index.month])  # type: ignore
         else:
             raise ValueError("groupby must be 'year' or 'month'")
@@ -553,7 +553,7 @@ class Netcdf2Zarr(BaseConverter):
             ed_processor = aviso.EDDIESProcessor(
                 store_root=self.store_root,
                 download_root=self.download_root,
-                time_resolution=self.time_resolution,
+                file_period=self.file_period,
                 date_format=self.date_format,
             )
             ed_processor.run(start_date, end_date)

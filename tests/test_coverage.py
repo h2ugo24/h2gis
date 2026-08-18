@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from h2mare.storage.coverage import get_store_coverage, split_time_range
-from h2mare.types import DateRange, TimeResolution
+from h2mare.types import DateRange, FilePeriod
 
 # ---------------------------------------------------------------------------
 # split_time_range
@@ -16,28 +16,28 @@ from h2mare.types import DateRange, TimeResolution
 class TestSplitTimeRange:
     def test_single_month_stays_as_one_chunk(self):
         dr = DateRange("2021-03-01", "2021-03-31")
-        chunks = split_time_range(dr, TimeResolution.MONTH)
+        chunks = split_time_range(dr, FilePeriod.MONTH)
         assert len(chunks) == 1
         assert chunks[0].start == pd.Timestamp("2021-03-01")
         assert chunks[0].end == pd.Timestamp("2021-03-31")
 
     def test_cross_month_boundary_splits_in_two(self):
         dr = DateRange("2021-01-15", "2021-02-28")
-        chunks = split_time_range(dr, TimeResolution.MONTH)
+        chunks = split_time_range(dr, FilePeriod.MONTH)
         assert len(chunks) == 2
         assert chunks[0].end == pd.Timestamp("2021-01-31")
         assert chunks[1].start == pd.Timestamp("2021-02-01")
 
     def test_year_split_within_single_year(self):
         dr = DateRange("2021-03-01", "2021-09-30")
-        chunks = split_time_range(dr, TimeResolution.YEAR)
+        chunks = split_time_range(dr, FilePeriod.YEAR)
         assert len(chunks) == 1
         assert chunks[0].start == pd.Timestamp("2021-03-01")
         assert chunks[0].end == pd.Timestamp("2021-09-30")
 
     def test_year_split_across_two_years(self):
         dr = DateRange("2020-06-01", "2021-03-31")
-        chunks = split_time_range(dr, TimeResolution.YEAR)
+        chunks = split_time_range(dr, FilePeriod.YEAR)
         assert len(chunks) == 2
         assert chunks[0].end == pd.Timestamp("2020-12-31")
         assert chunks[1].start == pd.Timestamp("2021-01-01")
@@ -45,7 +45,7 @@ class TestSplitTimeRange:
 
     def test_chunk_end_does_not_exceed_range_end(self):
         dr = DateRange("2021-01-01", "2021-06-15")
-        chunks = split_time_range(dr, TimeResolution.YEAR)
+        chunks = split_time_range(dr, FilePeriod.YEAR)
         assert len(chunks) == 1
         assert chunks[0].end == pd.Timestamp("2021-06-15")
 

@@ -32,11 +32,28 @@ def to_datetime(value) -> datetime:
     raise TypeError(f"Cannot convert {type(value)} to datetime")
 
 
-class TimeResolution(str, Enum):
-    """Supported period granularity for data storage."""
+class FilePeriod(str, Enum):
+    """
+    How much time one Zarr file on disk covers — one per year, or one per month.
+
+    A property of the *storage layout*, not of the data: it says nothing about
+    how far apart the steps inside a file are. That is
+    :class:`h2mare.models.TimeStep`, and the two are independent — an hourly
+    store written one file per year is ``TimeStep.HOURLY`` and
+    ``FilePeriod.YEAR`` at the same time.
+
+    Named ``TimeResolution`` until it acquired an hourly sibling to be confused
+    with; "resolution" reads as the cadence of the data, which this is not.
+    """
 
     YEAR = "year"
     MONTH = "month"
+
+
+#: Deprecated alias for :class:`FilePeriod`. Nothing in h2mare uses it — it is
+#: here so an import in a downstream repo does not break on the rename. Safe to
+#: delete once those have caught up.
+TimeResolution = FilePeriod
 
 
 @dataclass

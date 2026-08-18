@@ -10,11 +10,11 @@ import pandas as pd
 from loguru import logger
 
 from h2mare.storage.zarr_catalog import get_zarr_time_coverage
-from h2mare.types import DateLike, DateRange, TimeResolution, to_datetime
+from h2mare.types import DateLike, DateRange, FilePeriod, to_datetime
 from h2mare.utils.datetime_utils import normalize_date
 
 
-def split_time_range(date_range: DateRange, split: TimeResolution) -> list[DateRange]:
+def split_time_range(date_range: DateRange, split: FilePeriod) -> list[DateRange]:
     """
     Split date range into chunks.
 
@@ -29,10 +29,10 @@ def split_time_range(date_range: DateRange, split: TimeResolution) -> list[DateR
     current = date_range.start
 
     while current <= date_range.end:
-        if split == TimeResolution.MONTH:
+        if split == FilePeriod.MONTH:
             # End of current month
             chunk_end = current + pd.offsets.MonthEnd(0)
-        elif split == TimeResolution.YEAR:
+        elif split == FilePeriod.YEAR:
             # End of current year
             chunk_end = pd.Timestamp(year=current.year, month=12, day=31)
         else:

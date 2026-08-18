@@ -31,12 +31,12 @@ from h2mare.storage.xarray_helpers import (
     ds_float64_to_float32,
 )
 from h2mare.storage.zarr_catalog import ZarrCatalog
-from h2mare.types import BBox, DateLike, DateRange, TimeResolution
+from h2mare.types import BBox, DateLike, DateRange, FilePeriod
 from h2mare.utils.datetime_utils import normalize_date
 from h2mare.utils.files_io import filter_raw_files
 from h2mare.utils.paths import resolve_download_path, resolve_store_path
 from h2mare.utils.spatial import GridBuilder, haversine_min_distance_kdtree
-from h2mare.validators import validate_time_resolution, validate_var_key
+from h2mare.validators import validate_file_period, validate_var_key
 
 # ====================================================
 # ================= EDDIES PROCESSOR =================
@@ -118,7 +118,7 @@ def find_nearest_vectorized(
 
 def _group_dates(
     dates: pd.DatetimeIndex,
-    groupby: TimeResolution,
+    groupby: FilePeriod,
 ) -> Iterator[tuple[int | tuple[int, int], pd.DatetimeIndex]]:
     """
     Yield (period_key, dates_in_period) pairs from a DatetimeIndex.
@@ -126,10 +126,10 @@ def _group_dates(
     For 'year':  period_key is the year (e.g. 2020)
     For 'month': period_key is a (year, month) tuple (e.g. (2020, 1))
     """
-    if groupby == TimeResolution.YEAR:
+    if groupby == FilePeriod.YEAR:
         for year in dates.year.unique():
             yield int(year), dates[dates.year == year]
-    elif groupby == TimeResolution.MONTH:
+    elif groupby == FilePeriod.MONTH:
         for year in dates.year.unique():
             for month in dates[dates.year == year].month.unique():
                 mask = (dates.year == year) & (dates.month == month)
@@ -179,7 +179,7 @@ class EDDIESProcessor:
         app_config: Optional[AppConfig] = None,
         store_root: Optional[Path] = None,
         download_root: Optional[Path] = None,
-        time_resolution: TimeResolution = TimeResolution.YEAR,
+        file_period: FilePeriod = FilePeriod.YEAR,
         date_format: Literal["year", "date", "yearmonth"] = "year",
     ) -> None:
         """
@@ -212,7 +212,7 @@ class EDDIESProcessor:
         if self.var_config.bbox is not None:
             self.bbox = BBox.from_tuple(self.var_config.bbox)
 
-        self.time_resolution = validate_time_resolution(time_resolution)
+        self.file_period = validate_file_period(file_period)
         self.date_format: Literal["year", "date", "yearmonth"] = date_format
 
         # Initialise parent class with the Repository index class
@@ -256,7 +256,7 @@ class EDDIESProcessor:
             freq="D",
         )
 
-        for _, period_dates in _group_dates(all_dates, self.time_resolution):
+        for _, period_dates in _group_dates(all_dates, self.file_period):
             ds_list = []
 
             for record in records:

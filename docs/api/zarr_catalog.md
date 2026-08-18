@@ -20,7 +20,7 @@ ds = catalog.open_dataset(
 ```python
 ZarrCatalog(
     var_key,
-    time_resolution=TimeResolution.YEAR,
+    file_period=FilePeriod.YEAR,
     app_config=None,
     store_root=None,
     metadata_root=None,
@@ -31,7 +31,7 @@ ZarrCatalog(
 | Parameter | Default | Description |
 |---|---|---|
 | `var_key` | — | Variable key; must exist in `config.yaml` |
-| `time_resolution` | `YEAR` | Granularity used for the `period` column in the index |
+| `file_period` | `YEAR` | Granularity used for the `period` column in the index |
 | `store_root` | `STORE_ROOT/<local_folder>` | Directory scanned for `.zarr` files |
 | `metadata_root` | `data/processed/metadata/` | Directory for the Parquet catalog file |
 | `auto_refresh` | `True` | Check for new/modified files on each `.df` access |

@@ -12,9 +12,9 @@ class TimeStep(str, Enum):
     """
     Native cadence of a variable's stored Zarr — how far apart its time steps are.
 
-    Distinct from :class:`h2mare.types.TimeResolution`, which selects the *file*
-    period a store is split into (one Zarr per year or per month). A store can be
-    hourly and still be written one file per year.
+    Distinct from :class:`h2mare.types.FilePeriod`, which is about the storage
+    layout rather than the data: a store can be hourly and still be written one
+    file per year.
     """
 
     DAILY = "daily"
