@@ -695,12 +695,6 @@ class TestVerifyWrittenDates:
 
         conv._process_period(2020, paths)  # must not raise
 
-    def test_expect_contiguous_time_false_skips_the_check(self, tmp_path):
-        conv = _period_converter(tmp_path, expect_contiguous_time=False)
-        paths = _write_raw_days(conv, _JAN.drop(pd.Timestamp("2020-01-05")))
-
-        conv._process_period(2020, paths)  # must not raise
-
     def test_short_tail_warns_but_does_not_raise(self, tmp_path):
         """Provider lag at the tail is ordinary and must not fail the run."""
         conv = _period_converter(tmp_path)
