@@ -20,7 +20,7 @@ import zarr
 
 from h2mare.storage.provenance import (
     COMPILED_PROVENANCE_ATTR,
-    annotate_delivered,
+    annotate_covered,
     collect_source_datasets,
     merge_records,
     read_source_datasets,
@@ -75,14 +75,19 @@ class TestRecordsForWindow:
     def test_window_clipped_to_the_written_span(self):
         """A whole-year manifest entry must not claim more than was written."""
         got = records_for_window(_MANIFEST, _window("2020-02-01", "2020-03-01"))
-        assert got[0]["start_date"] == "2020-02-01"
-        assert got[0]["end_date"] == "2020-03-01"
+        assert got[0]["requested_start"] == "2020-02-01"
+        assert got[0]["requested_end"] == "2020-03-01"
+
+    def test_only_the_requested_window_is_emitted(self):
+        """The covered pair is read off the store, so it cannot be set here."""
+        [got] = records_for_window(_MANIFEST, _window("2020-02-01", "2020-03-01"))
+        assert "start_date" not in got and "end_date" not in got
 
     def test_window_spanning_the_boundary_splits(self):
         got = records_for_window(_MANIFEST, _window("2020-06-01", "2020-08-31"))
         assert [r["dataset_type"] for r in got] == ["rep", "nrt"]
-        assert got[0]["end_date"] == "2020-06-30"
-        assert got[1]["start_date"] == "2020-07-01"
+        assert got[0]["requested_end"] == "2020-06-30"
+        assert got[1]["requested_start"] == "2020-07-01"
 
     def test_non_overlapping_entries_are_dropped(self):
         got = records_for_window(_MANIFEST, _window("2020-08-01", "2020-09-01"))
@@ -93,7 +98,8 @@ class TestRecordsForWindow:
 
     def test_records_are_sorted_by_start(self):
         got = records_for_window(_MANIFEST, _window("2020-01-01", "2020-12-31"))
-        assert [r["start_date"] for r in got] == sorted(r["start_date"] for r in got)
+        starts = [r["requested_start"] for r in got]
+        assert starts == sorted(starts)
 
 
 class TestMergeRecords:
@@ -146,11 +152,27 @@ class TestMergeRecords:
             {
                 "dataset_id": "a",
                 "dataset_type": "nrt",
+                "requested_start": "2020-01-01",
+                "requested_end": "2020-02-01",
+            }
+        ]
+        assert merge_records([], new) == new
+
+    def test_a_legacy_record_gains_its_requested_pair(self):
+        """The old layout meant requested by start_date/end_date, so that is
+        how a file written under it is read forward."""
+        legacy = [
+            {
+                "dataset_id": "a",
+                "dataset_type": "nrt",
                 "start_date": "2020-01-01",
                 "end_date": "2020-02-01",
             }
         ]
-        assert merge_records([], new) == new
+        [got] = merge_records([], legacy)
+
+        assert got["requested_start"] == "2020-01-01"
+        assert got["requested_end"] == "2020-02-01"
 
 
 class TestWriteProvenanceForWindow:
@@ -177,8 +199,37 @@ class TestWriteProvenanceForWindow:
         got = _read_records(path)
 
         assert len(got) == 1
-        assert got[0]["start_date"] == "2020-07-01"
-        assert got[0]["end_date"] == "2020-10-31"
+        assert got[0]["requested_start"] == "2020-07-01"
+        assert got[0]["requested_end"] == "2020-10-31"
+
+    def test_covered_reflects_the_store_not_the_request(self, tmp_path):
+        """
+        The fixture holds 2020-01-01..2020-01-05 and the request asks for July,
+        so nothing was covered — which the record has to say rather than
+        repeating the window back.
+        """
+        path = _write_zarr(tmp_path)
+        write_provenance_for_window(
+            path, _MANIFEST, _window("2020-07-01", "2020-08-31")
+        )
+
+        [got] = _read_records(path)
+
+        assert got["days"] == 0
+        assert "start_date" not in got
+
+    def test_covered_is_the_overlap_with_the_store(self, tmp_path):
+        path = _write_zarr(tmp_path)
+        write_provenance_for_window(
+            path, _MANIFEST, _window("2020-01-01", "2020-06-30")
+        )
+
+        [got] = _read_records(path)
+
+        assert got["start_date"] == "2020-01-01"
+        assert got["end_date"] == "2020-01-05"
+        assert got["days"] == 5
+        assert got["requested_end"] == "2020-06-30"
 
     def test_window_outside_manifest_writes_nothing(self, tmp_path):
         path = _write_zarr(tmp_path)
@@ -193,65 +244,89 @@ class TestWriteProvenanceForWindow:
 
 
 # ---------------------------------------------------------------------------
-# annotate_delivered
+# annotate_covered
 #
-# start_date/end_date say what was *asked* for. chl's 1999 record reads
-# 1999-01-01 → 1999-12-31 because that is what the request was, and nothing in
-# the file states what actually arrived — so every later integrity question had
-# to reopen the data. Recording the delivered count alongside makes it a
-# metadata comparison, and conversion time is the only moment the truth is
-# available for archive_raw: false variables.
+# start_date/end_date are what the store actually holds, so a reader can answer
+# "which product covers which part of the archive, and where does rep hand over
+# to nrt" from metadata alone. The requested window stays alongside, because
+# comparing the two is what turns "did this product deliver what it was asked
+# for" into a metadata comparison rather than a re-read of the data.
 # ---------------------------------------------------------------------------
 
 
-class TestAnnotateDelivered:
+class TestAnnotateCovered:
     _RECORD = {
         "dataset_id": "ds-rep",
         "dataset_type": "rep",
-        "start_date": "2020-01-01",
-        "end_date": "2020-01-10",
+        "requested_start": "2020-01-01",
+        "requested_end": "2020-01-10",
     }
 
     def test_counts_the_days_inside_the_span(self):
         stored = pd.date_range("2020-01-01", "2020-01-10", freq="D")
-        [out] = annotate_delivered([self._RECORD], stored)
-        assert out["delivered_days"] == 10
+        [out] = annotate_covered([self._RECORD], stored)
+        assert out["days"] == 10
 
     def test_a_missing_day_shows_up_as_a_shortfall(self):
         stored = pd.date_range("2020-01-01", "2020-01-10", freq="D").drop(
             pd.Timestamp("2020-01-05")
         )
-        [out] = annotate_delivered([self._RECORD], stored)
-        assert out["delivered_days"] == 9
+        [out] = annotate_covered([self._RECORD], stored)
+        assert out["days"] == 9
 
-    def test_records_delivered_bounds(self):
+    def test_covered_dates_are_what_the_store_holds(self):
+        """Not the request: the store starts on the 3rd and stops on the 8th."""
         stored = pd.date_range("2020-01-03", "2020-01-08", freq="D")
-        [out] = annotate_delivered([self._RECORD], stored)
-        assert out["delivered_start"] == "2020-01-03"
-        assert out["delivered_end"] == "2020-01-08"
+        [out] = annotate_covered([self._RECORD], stored)
+        assert out["start_date"] == "2020-01-03"
+        assert out["end_date"] == "2020-01-08"
 
     def test_days_outside_the_span_are_not_counted(self):
         stored = pd.date_range("2019-01-01", "2021-12-31", freq="D")
-        [out] = annotate_delivered([self._RECORD], stored)
-        assert out["delivered_days"] == 10
-
-    def test_empty_span_gets_zero_and_no_bounds(self):
-        [out] = annotate_delivered([self._RECORD], pd.DatetimeIndex([]))
-        assert out["delivered_days"] == 0
-        assert "delivered_start" not in out
-
-    def test_requested_span_is_preserved(self):
-        [out] = annotate_delivered(
-            [self._RECORD], pd.date_range("2020-01-01", periods=3)
-        )
+        [out] = annotate_covered([self._RECORD], stored)
+        assert out["days"] == 10
         assert out["start_date"] == "2020-01-01"
         assert out["end_date"] == "2020-01-10"
+
+    def test_empty_span_gets_zero_and_no_covered_dates(self):
+        """Asked and received nothing, rather than a span that does not exist."""
+        [out] = annotate_covered([self._RECORD], pd.DatetimeIndex([]))
+        assert out["days"] == 0
+        assert "start_date" not in out and "end_date" not in out
+
+    def test_requested_span_is_preserved(self):
+        [out] = annotate_covered([self._RECORD], pd.date_range("2020-01-01", periods=3))
+        assert out["requested_start"] == "2020-01-01"
+        assert out["requested_end"] == "2020-01-10"
+
+    def test_a_legacy_record_upgrades_in_place(self):
+        """
+        Records written before the switch carry the requested window under
+        start_date/end_date. Reading them as such is what lets a file correct
+        itself on the next write instead of needing a migration.
+        """
+        legacy = {
+            "dataset_id": "ds-rep",
+            "dataset_type": "rep",
+            "start_date": "2020-01-01",
+            "end_date": "2020-01-10",
+            "delivered_days": 4,
+            "delivered_start": "2020-01-01",
+            "delivered_end": "2020-01-04",
+        }
+        [out] = annotate_covered([legacy], pd.date_range("2020-01-03", "2020-01-08"))
+
+        assert out["requested_start"] == "2020-01-01"
+        assert out["requested_end"] == "2020-01-10"
+        assert out["start_date"] == "2020-01-03"
+        assert out["end_date"] == "2020-01-08"
+        assert not [k for k in out if k.startswith("delivered_")]
 
     def test_is_idempotent(self):
         """Recomputed from the store, so re-running must not accumulate."""
         stored = pd.date_range("2020-01-01", "2020-01-10", freq="D")
-        once = annotate_delivered([self._RECORD], stored)
-        twice = annotate_delivered(once, stored)
+        once = annotate_covered([self._RECORD], stored)
+        twice = annotate_covered(once, stored)
         assert twice == once
 
 

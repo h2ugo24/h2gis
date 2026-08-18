@@ -802,7 +802,7 @@ class TestPeriodBounds:
 # ---------------------------------------------------------------------------
 
 
-class TestProvenanceDeliveredDates:
+class TestProvenanceCoveredDates:
     def _manifest(self, conv, start="2020-01-01", end="2020-01-10"):
         (conv.download_root / "h2mare_manifest.json").write_text(
             json.dumps(
@@ -823,26 +823,16 @@ class TestProvenanceDeliveredDates:
         root = zarr.open_group(str(conv.catalog.build_file_path.return_value), mode="r")
         return json.loads(root.attrs["source_datasets"])
 
-    def test_delivered_days_are_recorded(self, tmp_path):
+    def test_covered_days_are_recorded(self, tmp_path):
         conv = _period_converter(tmp_path)
         self._manifest(conv)
         conv._process_period(2020, _write_raw_days(conv, _JAN))
 
         [record] = self._read_provenance(conv)
 
-        assert record["delivered_days"] == 10
+        assert record["days"] == 10
 
-    def test_delivered_bounds_are_recorded(self, tmp_path):
-        conv = _period_converter(tmp_path)
-        self._manifest(conv)
-        conv._process_period(2020, _write_raw_days(conv, _JAN))
-
-        [record] = self._read_provenance(conv)
-
-        assert record["delivered_start"] == "2020-01-01"
-        assert record["delivered_end"] == "2020-01-10"
-
-    def test_requested_span_is_still_recorded(self, tmp_path):
+    def test_covered_bounds_are_recorded(self, tmp_path):
         conv = _period_converter(tmp_path)
         self._manifest(conv)
         conv._process_period(2020, _write_raw_days(conv, _JAN))
@@ -851,6 +841,16 @@ class TestProvenanceDeliveredDates:
 
         assert record["start_date"] == "2020-01-01"
         assert record["end_date"] == "2020-01-10"
+
+    def test_requested_span_is_still_recorded(self, tmp_path):
+        conv = _period_converter(tmp_path)
+        self._manifest(conv)
+        conv._process_period(2020, _write_raw_days(conv, _JAN))
+
+        [record] = self._read_provenance(conv)
+
+        assert record["requested_start"] == "2020-01-01"
+        assert record["requested_end"] == "2020-01-10"
 
     def test_append_widens_rather_than_overwrites(self, tmp_path):
         """The old path replaced the attribute, dropping the earlier run."""
@@ -866,7 +866,7 @@ class TestProvenanceDeliveredDates:
         assert record["start_date"] == "2020-01-01"
         assert record["end_date"] == "2020-01-10"
 
-    def test_delivered_count_reflects_the_whole_file_after_an_append(self, tmp_path):
+    def test_covered_count_reflects_the_whole_file_after_an_append(self, tmp_path):
         """Recomputed from the store, so appends do not double-count."""
         conv = _period_converter(tmp_path)
         self._manifest(conv, "2020-01-01", "2020-01-05")
@@ -877,7 +877,7 @@ class TestProvenanceDeliveredDates:
 
         [record] = self._read_provenance(conv)
 
-        assert record["delivered_days"] == 10
+        assert record["days"] == 10
 
 
 # ---------------------------------------------------------------------------
