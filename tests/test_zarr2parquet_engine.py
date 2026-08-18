@@ -39,6 +39,27 @@ def _write_zarr(ds: xr.Dataset, path):
     return path
 
 
+def test_period_boundary_keeps_a_noon_stamped_last_day(tmp_path):
+    """
+    Periods tile the window at date granularity. Sliced to a midnight end, the
+    last day of each period belongs to no period at all: its steps are written
+    nowhere, and the gap sits mid-store where nothing downstream looks for it.
+    """
+    ds = _make_ds(n_days=40)  # 2020-01-01 → 2020-02-09, so Jan is a full period
+    ds = ds.assign_coords(time=ds.time.to_index() + pd.Timedelta(hours=12))
+    src = tmp_path / "store.zarr"
+    _write_zarr(ds, src)
+    out = tmp_path / "parquet"
+
+    convert_zarr_to_parquet(src, out, time_resolution=TimeResolution.MONTH)
+
+    got = ParquetIndexer(out).load()
+    days = set(pd.DatetimeIndex(got["time"].to_numpy()).normalize())
+    assert pd.Timestamp("2020-01-31") in days, "period boundary dropped the last day"
+    assert len(days) == 40
+    assert got.height == 40 * 2 * 2
+
+
 # ---------------------------------------------------------------------------
 # Core conversion — no config / no var_key
 # ---------------------------------------------------------------------------

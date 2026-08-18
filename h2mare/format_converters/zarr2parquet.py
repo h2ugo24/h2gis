@@ -24,6 +24,7 @@ from h2mare.storage import ZarrCatalog
 from h2mare.storage.coverage import get_store_coverage, split_time_range
 from h2mare.storage.parquet_indexer import ParquetIndexer
 from h2mare.types import DateLike, DateRange, TimeResolution
+from h2mare.utils.datetime_utils import end_of_day
 from h2mare.validators import validate_time_resolution
 
 # How far behind the parquet end the incremental backfill looks for "holes"
@@ -121,7 +122,11 @@ def convert_zarr_to_parquet(
         for period in periods:
             df: pl.DataFrame | None = None
             try:
-                sub = ds.sel(time=slice(period.start, period.end))
+                # end_of_day, not period.end: periods tile the window at
+                # date granularity, so a midnight bound leaves every step
+                # after 00:00 on the period's last day in no period at all —
+                # 23 hours per period silently absent from the Parquet store.
+                sub = ds.sel(time=slice(period.start, end_of_day(period.end)))
                 if depth is not None and "depth" in sub.dims:
                     sub = sub.sel(depth=depth, method="nearest")
                 df = pl.from_pandas(sub.to_dataframe().reset_index())

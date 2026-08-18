@@ -48,6 +48,7 @@ from loguru import logger
 from h2mare.config import AppConfig, get_settings
 from h2mare.models import step_freq
 from h2mare.types import DateRange
+from h2mare.utils.datetime_utils import end_of_day
 from h2mare.utils.paths import resolve_store_path
 from h2mare.validators import validate_var_key
 
@@ -262,7 +263,12 @@ def check_slice_health(
         ``(variable, date, kind, detail)`` tuples. Empty when everything is fine.
     """
     if window is not None:
-        ds = ds.sel(time=slice(window.start, window.end))
+        # end_of_day, not window.end: the bound is a date, so a store whose
+        # stamps are not at midnight would have its last day judged on one step
+        # (an hourly store) or dropped from the scan entirely (a noon-stamped
+        # daily one) — a value check that silently skips a day is worse than
+        # none, since it reports the day clean.
+        ds = ds.sel(time=slice(window.start, end_of_day(window.end)))
         # A file wholly outside the window keeps its variables but loses every
         # timestep, and min/max over a zero-length axis raises rather than
         # returning empty. Nothing to check here.
