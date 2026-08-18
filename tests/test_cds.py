@@ -1002,11 +1002,11 @@ class TestUpwellEventPartialWindow:
             {
                 "ekman_pumping": (
                     ["dayofyear", "lat", "lon"],
-                    np.zeros((366, *shape2d)),
+                    np.zeros((cds._EKMAN_DOY_BUCKETS, *shape2d)),
                 )
             },
             coords={
-                "dayofyear": np.arange(1, 367),
+                "dayofyear": np.arange(1, cds._EKMAN_DOY_BUCKETS + 1),
                 "lat": self._LATS,
                 "lon": self._LONS,
             },
@@ -1063,3 +1063,126 @@ class TestUpwellEventPartialWindow:
         for lag in cds._EKMAN_LAGS:
             series = out[f"ekman_anom_lag{lag}"].isel(lat=0, lon=0).values
             assert np.isnan(series[:lag]).all()
+
+
+# ---------------------------------------------------------------------------
+# calendar_doy — the leap-year alignment of the climatology
+# ---------------------------------------------------------------------------
+
+
+def _doy(dates) -> list[int]:
+    time = xr.DataArray(pd.to_datetime(dates), dims="time", name="time")
+    return [int(v) for v in cds.calendar_doy(time).values]
+
+
+class TestCalendarDoy:
+    def test_a_calendar_date_keeps_its_index_across_leap_years(self):
+        """
+        The whole point: 1 March must be the same bucket every year. Raw
+        dayofyear gives 60 in a common year and 61 in a leap year, so the
+        climatology averaged 1 March with 2 March and the anomaly subtracted
+        the wrong day for ten months of every fourth year.
+        """
+        assert _doy(["2019-03-01", "2020-03-01", "2021-03-01"]) == [60, 60, 60]
+        assert _doy(["2019-12-31", "2020-12-31"]) == [365, 365]
+
+    def test_before_march_is_untouched(self):
+        assert _doy(["2019-01-01", "2020-01-01", "2020-02-28"]) == [1, 1, 59]
+
+    def test_leap_day_borrows_the_28th(self):
+        """Five samples in a twenty-year baseline does not make a bucket."""
+        assert _doy(["2020-02-29"]) == [59]
+
+    def test_never_leaves_the_365_day_calendar(self):
+        every_day = pd.date_range("2020-01-01", "2021-12-31", freq="D")
+        values = cds.calendar_doy(
+            xr.DataArray(every_day, dims="time", name="time")
+        ).values
+        assert values.min() == 1
+        assert values.max() == cds._EKMAN_DOY_BUCKETS
+
+
+class TestClimatologyAlignment:
+    """The consumer must read the climatology on the same calendar it was built on."""
+
+    _LATS = [30.0, 30.25]
+    _LONS = [-40.0, -39.75]
+
+    def _write_climatology(self, tmp_path, n_buckets: int):
+        shape2d = (len(self._LATS), len(self._LONS))
+        coords = {"lat": self._LATS, "lon": self._LONS}
+        xr.Dataset(
+            {"ekman_pumping_anom": (["month", "lat", "lon"], np.zeros((12, *shape2d)))},
+            coords={"month": np.arange(1, 13), **coords},
+        ).to_netcdf(tmp_path / cds._EKMAN_P90_FILE)
+
+        # Each bucket holds its own index, so an anomaly reveals which bucket
+        # was selected: anomaly = value - bucket_index.
+        buckets = np.arange(1, n_buckets + 1, dtype="float64")
+        xr.Dataset(
+            {
+                "ekman_pumping": (
+                    ["dayofyear", "lat", "lon"],
+                    np.broadcast_to(buckets[:, None, None], (n_buckets, *shape2d)),
+                )
+            },
+            coords={"dayofyear": np.arange(1, n_buckets + 1), **coords},
+        ).to_netcdf(tmp_path / cds._EKMAN_DOY_FILE)
+
+    def _run(self, tmp_path, monkeypatch, start: str, n_buckets: int = 365):
+        self._write_climatology(tmp_path, n_buckets)
+        monkeypatch.setattr(
+            cds, "get_settings", lambda: SimpleNamespace(CLIMATOLOGY_DIR=tmp_path)
+        )
+        # Long enough to outrun the deepest lag; shift() past the end of a
+        # shorter axis leaves dask with a zero-length chunk.
+        times = pd.date_range(start, periods=40, freq="D")
+        da = xr.DataArray(
+            np.zeros((len(times), len(self._LATS), len(self._LONS))),
+            dims=["time", "lat", "lon"],
+            coords={"time": times, "lat": self._LATS, "lon": self._LONS},
+            name="ekman_pumping",
+        )
+        return cds.add_engineered_ekman(da, "atm-accum-avg", seed_from_store=False)
+
+    @staticmethod
+    def _bucket_on(out, date: str) -> float:
+        """Which climatology bucket was subtracted on *date*.
+
+        The input is zero and each bucket holds its own index, so the anomaly
+        is the negated index of whichever bucket the selection landed on.
+        """
+        return float(-out["ekman_anom"].sel(time=date).isel(lat=0, lon=0))
+
+    def test_leap_year_march_reads_the_calendar_aligned_bucket(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        1 March must subtract the same bucket whatever the year. On raw
+        dayofyear a leap year takes 61 — the day after — for every day from
+        March to December.
+        """
+        leap = self._run(tmp_path, monkeypatch, "2020-02-20")
+
+        assert self._bucket_on(leap, "2020-03-01") == 60.0
+        assert self._bucket_on(leap, "2020-03-15") == 74.0
+
+    def test_common_year_agrees_with_the_leap_year(self, tmp_path, monkeypatch):
+        common = self._run(tmp_path, monkeypatch, "2019-02-20")
+
+        assert self._bucket_on(common, "2019-03-01") == 60.0
+        assert self._bucket_on(common, "2019-03-15") == 74.0
+
+    def test_leap_day_takes_the_28th_bucket(self, tmp_path, monkeypatch):
+        out = self._run(tmp_path, monkeypatch, "2020-02-20")
+
+        assert self._bucket_on(out, "2020-02-29") == 59.0
+        assert self._bucket_on(out, "2020-02-28") == 59.0
+
+    def test_a_366_bucket_file_is_refused(self, tmp_path, monkeypatch):
+        """
+        It would select happily — every index asked for exists — and return a
+        climatology a day out. Nothing downstream could tell.
+        """
+        with pytest.raises(ValueError, match="366 dayofyear buckets"):
+            self._run(tmp_path, monkeypatch, "2020-02-20", n_buckets=366)
