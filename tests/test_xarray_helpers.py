@@ -8,6 +8,7 @@ import xarray as xr
 from h2mare.storage.xarray_helpers import (
     chunk_dataset,
     convert360_180,
+    drop_source_encoding_attrs,
     get_dataset_encoding,
     rename_dims,
     snap_grid_coords,
@@ -338,3 +339,73 @@ class TestRenameDims:
         assert "time" in result.dims
         assert "lat" in result.dims
         assert "lon" in result.dims
+
+
+class TestDropSourceEncodingAttrs:
+    """
+    These attributes were true of the source file and stopped being true when
+    the data was regridded and re-encoded, but nothing removed them — so they
+    reached h2ds asserting the wrong grid, the wrong units and packing bounds
+    read as physical limits.
+    """
+
+    @staticmethod
+    def _ds() -> xr.Dataset:
+        da = xr.DataArray(
+            np.ones((2, 2)),
+            dims=["lat", "lon"],
+            coords={"lat": [0.0, 0.25], "lon": [0.0, 0.25]},
+            attrs={
+                # source grid, wrong once regridded
+                "GRIB_Nx": 181,
+                "GRIB_Ny": 141,
+                "GRIB_iDirectionIncrementInDegrees": 0.5,
+                "GRIB_missingValue": 3.4028234663852886e38,
+                "GRIB_units": "N m**-2",
+                # source packing, reads as a physical range and is not
+                "valid_min": -32766,
+                "valid_max": 21306,
+                # genuinely about the quantity
+                "standard_name": "sea_water_potential_temperature",
+                "long_name": "Potential temperature",
+                "units": "degrees_C",
+                "cell_methods": "area: mean",
+                "unit_long": "Degrees Celsius",
+            },
+        )
+        return xr.Dataset({"thetao_100": da})
+
+    def test_grib_attrs_are_gone(self):
+        out = drop_source_encoding_attrs(self._ds())
+        assert not [k for k in out["thetao_100"].attrs if k.startswith("GRIB_")]
+
+    def test_packing_bounds_are_gone(self):
+        """[-32766, 21306] 'degrees_C' against real values of [-2.3, 28.2]."""
+        attrs = drop_source_encoding_attrs(self._ds())["thetao_100"].attrs
+        assert "valid_min" not in attrs
+        assert "valid_max" not in attrs
+
+    def test_attributes_describing_the_quantity_survive(self):
+        attrs = drop_source_encoding_attrs(self._ds())["thetao_100"].attrs
+        assert set(attrs) == {
+            "standard_name",
+            "long_name",
+            "units",
+            "cell_methods",
+            "unit_long",
+        }
+
+    def test_a_contradicting_grib_units_cannot_outlive_units(self):
+        """n_upwell_events_7d carried GRIB_units='N m**-2' beside units='count'."""
+        attrs = drop_source_encoding_attrs(self._ds())["thetao_100"].attrs
+        assert "GRIB_units" not in attrs
+        assert attrs["units"] == "degrees_C"
+
+    def test_coordinates_are_left_alone(self):
+        ds = self._ds()
+        ds["lat"].attrs["valid_min"] = -90
+        assert drop_source_encoding_attrs(ds)["lat"].attrs["valid_min"] == -90
+
+    def test_a_dataset_with_nothing_to_drop_is_unchanged(self):
+        ds = xr.Dataset({"sst": xr.DataArray([1.0], dims="x", attrs={"units": "degC"})})
+        assert drop_source_encoding_attrs(ds)["sst"].attrs == {"units": "degC"}

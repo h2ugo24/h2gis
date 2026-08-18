@@ -29,7 +29,7 @@ from h2mare.storage.provenance import (
 )
 from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
-from h2mare.storage.xarray_helpers import chunk_dataset
+from h2mare.storage.xarray_helpers import chunk_dataset, drop_source_encoding_attrs
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import BBox, DateLike, DateRange, TimeResolution
 from h2mare.utils.datetime_utils import normalize_date
@@ -502,6 +502,7 @@ class Compiler:
             ds: Dataset for atts assignment
         """
         ds.attrs = get_settings().global_attrs
+        ds = drop_source_encoding_attrs(ds)
         for var in ds.data_vars:
             var_info = get_settings().get_var_info(str(var))
             ds[var].attrs.update({key: val for key, val in var_info.items()})
