@@ -19,23 +19,12 @@ from loguru import logger
 from h2mare.models import StoreDtype, TimeStep
 from h2mare.storage.zarr_index import ZarrIndex
 from h2mare.types import BBox, DateLike, DateRange
-from h2mare.utils.datetime_utils import normalize_date, normalize_dates
+from h2mare.utils.datetime_utils import end_of_day, normalize_dates
 from h2mare.utils.spatial import sel_padded_bbox
 
-# One nanosecond short of the next midnight — pandas' datetime64[ns] resolution,
-# so nothing can fall between this and the following day.
-_LAST_INSTANT_OF_DAY = pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
-
-
-def _end_of_day(ts: pd.Timestamp) -> pd.Timestamp:
-    """
-    Last representable instant of *ts*'s calendar day.
-
-    Turns a date-level upper bound into one that covers the whole day, so an
-    inclusive ``slice`` keeps every sub-daily step of the final day instead of
-    stopping at its midnight stamp.
-    """
-    return normalize_date(ts) + _LAST_INSTANT_OF_DAY
+# Aliased rather than re-implemented: an inclusive `slice` here needs the same
+# whole-day upper bound the compile and download paths do.
+_end_of_day = end_of_day
 
 
 class ZarrReader:

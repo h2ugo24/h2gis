@@ -19,9 +19,11 @@ from loguru import logger
 from h2mare import AppConfig
 from h2mare.downloader.base import BaseDownloader
 from h2mare.downloader.cmems_utils import CMEMSAPIError, get_dataset_time_range
+from h2mare.models import step_freq
 from h2mare.storage import split_time_range
 from h2mare.storage.coverage import resolve_date_range
 from h2mare.types import DateLike, DateRange, DownloadTask, TimeResolution
+from h2mare.utils.datetime_utils import end_of_day
 
 warnings.filterwarnings("ignore")
 
@@ -43,8 +45,11 @@ def download_subset(
 
     Args:
         dataset_id:  CMEMS dataset ID (e.g. 'METOFFICE-GLO-SST-L4-REP-OBS-SST').
-        start:       Start date.
-        end:         End date.
+        start:       Start datetime, sent to the API as given.
+        end:         End datetime, sent to the API as given — it is *not*
+                     widened to cover the day. On a sub-daily dataset a
+                     midnight-stamped end therefore delivers only that day's
+                     00:00 step; pass ``end_of_day(end)`` to get all 24.
         output_dir:  Directory to write the downloaded file.
         variables:   Variable name(s) to download. None downloads all.
         bbox:        (xmin, ymin, xmax, ymax). None = full geographic extent.
@@ -497,7 +502,24 @@ class CMEMSDownloader(BaseDownloader):
         end: pd.Timestamp,
         output_dir: Optional[Path] = None,
     ) -> None:
-        """Download using copernicusmarine.subset, deriving spatial/variable config from var_config."""
+        """
+        Download using copernicusmarine.subset, deriving spatial/variable config
+        from var_config.
+
+        *end* is a date, and the toolbox reads it as an instant. On an hourly
+        variable that means the last day of every chunk arrives as its 00:00
+        step alone and the other 23 hours are simply never requested — a whole-
+        month split loses 23 hours per month, quietly: the loss sits at the tail
+        of the converted span, where ``_verify_written_dates`` only warns.
+        Widening the bound to the end of the day is what makes a chunk boundary
+        land between two days instead of inside one.
+
+        Left untouched on a daily variable, whose stores were all written under
+        the midnight bound and whose one step per day it already covers.
+        """
+        if step_freq(self.var_config) == "h":
+            end = end_of_day(end)
+
         download_subset(
             dataset_id=dataset_id,
             start=start,

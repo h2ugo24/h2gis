@@ -17,6 +17,7 @@ import xarray as xr
 from h2mare.models import step_freq
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import DateRange
+from h2mare.utils.datetime_utils import end_of_day
 from h2mare.utils.spatial import clip_land_data
 
 if TYPE_CHECKING:
@@ -153,14 +154,10 @@ def _compile_depth_var(
 _SLAB_SOURCE_BUDGET_BYTES = 1024**3
 
 
-def _end_of_day(ts) -> pd.Timestamp:
-    """Last instant of ``ts``'s calendar day.
-
-    Slicing an hourly axis with a midnight-stamped end would drop that day's
-    other 23 steps. ``ZarrCatalog`` resolves whole days on the way in, but a
-    ``.sel`` against an already-open hourly dataset has to do it itself.
-    """
-    return pd.Timestamp(ts) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+# Slicing an hourly axis with a midnight-stamped end would drop that day's other
+# 23 steps. ``ZarrCatalog`` resolves whole days on the way in, but a ``.sel``
+# against an already-open hourly dataset has to do it itself.
+_end_of_day = end_of_day
 
 
 def _slab_days(ds: xr.Dataset) -> int:

@@ -13,10 +13,28 @@ from h2mare.types import to_datetime as to_datetime
 if TYPE_CHECKING:
     from h2mare.types import DateLike
 
+_LAST_INSTANT_OF_DAY = pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+
 
 def normalize_date(date: DateLike) -> pd.Timestamp:
     """Normalize a single date to a Timestamp at midnight."""
     return pd.Timestamp(date).normalize()
+
+
+def end_of_day(date: DateLike) -> pd.Timestamp:
+    """
+    Last representable instant of *date*'s calendar day.
+
+    One nanosecond short of the next midnight — pandas' datetime64[ns]
+    resolution, so nothing can fall between this and the following day.
+
+    Turns a date-level upper bound into one that covers the whole day. Every
+    date the pipeline passes around is a midnight-stamped ``Timestamp``, which
+    on a sub-daily axis names that day's *first* step: used verbatim as an
+    inclusive end bound it keeps one step of the final day and drops the other
+    23, whether the bound is slicing a store or being sent to a provider.
+    """
+    return normalize_date(date) + _LAST_INSTANT_OF_DAY
 
 
 def normalize_dates(dates: DateLike | Sequence[DateLike]) -> list[pd.Timestamp]:

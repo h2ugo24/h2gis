@@ -7,6 +7,7 @@ import pytest
 
 from h2mare.utils.datetime_utils import (
     date_to_standard_string,
+    end_of_day,
     more_than_one_year,
     normalize_date,
     normalize_dates,
@@ -47,6 +48,19 @@ class TestNormalizeDate:
     def test_scalar_timestamp(self):
         result = normalize_date(pd.Timestamp("2020-03-15 12:30"))
         assert result.hour == 0
+
+
+class TestEndOfDay:
+    def test_covers_the_last_sub_daily_step(self):
+        got = end_of_day("2020-03-15")
+
+        assert got > pd.Timestamp("2020-03-15 23:00")
+        assert got < pd.Timestamp("2020-03-16")
+
+    def test_stays_within_the_day_of_a_stamped_input(self):
+        # Normalizes first, so a noon-stamped bound does not spill into the
+        # following day.
+        assert end_of_day(pd.Timestamp("2020-03-15 12:00")) < pd.Timestamp("2020-03-16")
 
 
 class TestNormalizeDates:
