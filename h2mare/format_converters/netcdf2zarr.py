@@ -511,19 +511,19 @@ class Netcdf2Zarr(BaseConverter):
         if not dataset_info:
             return
 
-        # The raw files say which window each dataset was asked for; what the
-        # store ended up covering is read back off its axis by annotate_covered.
+        # The raw files say where each dataset's contribution begins; what the
+        # file holds from it is read back off the axis by annotate_covered.
         records = sorted(
             [
                 {
                     "dataset_id": did,
                     "dataset_type": info["dataset_type"],
-                    "requested_start": info["start_date"].strftime("%Y-%m-%d"),
-                    "requested_end": info["end_date"].strftime("%Y-%m-%d"),
+                    "start_date": info["start_date"].strftime("%Y-%m-%d"),
+                    "end_date": info["end_date"].strftime("%Y-%m-%d"),
                 }
                 for did, info in dataset_info.items()
             ],
-            key=lambda r: r["requested_start"],
+            key=lambda r: r["start_date"],
         )
 
         import zarr

@@ -75,19 +75,14 @@ class TestRecordsForWindow:
     def test_window_clipped_to_the_written_span(self):
         """A whole-year manifest entry must not claim more than was written."""
         got = records_for_window(_MANIFEST, _window("2020-02-01", "2020-03-01"))
-        assert got[0]["requested_start"] == "2020-02-01"
-        assert got[0]["requested_end"] == "2020-03-01"
-
-    def test_only_the_requested_window_is_emitted(self):
-        """The covered pair is read off the store, so it cannot be set here."""
-        [got] = records_for_window(_MANIFEST, _window("2020-02-01", "2020-03-01"))
-        assert "start_date" not in got and "end_date" not in got
+        assert got[0]["start_date"] == "2020-02-01"
+        assert got[0]["end_date"] == "2020-03-01"
 
     def test_window_spanning_the_boundary_splits(self):
         got = records_for_window(_MANIFEST, _window("2020-06-01", "2020-08-31"))
         assert [r["dataset_type"] for r in got] == ["rep", "nrt"]
-        assert got[0]["requested_end"] == "2020-06-30"
-        assert got[1]["requested_start"] == "2020-07-01"
+        assert got[0]["end_date"] == "2020-06-30"
+        assert got[1]["start_date"] == "2020-07-01"
 
     def test_non_overlapping_entries_are_dropped(self):
         got = records_for_window(_MANIFEST, _window("2020-08-01", "2020-09-01"))
@@ -98,7 +93,7 @@ class TestRecordsForWindow:
 
     def test_records_are_sorted_by_start(self):
         got = records_for_window(_MANIFEST, _window("2020-01-01", "2020-12-31"))
-        starts = [r["requested_start"] for r in got]
+        starts = [r["start_date"] for r in got]
         assert starts == sorted(starts)
 
 
@@ -152,27 +147,28 @@ class TestMergeRecords:
             {
                 "dataset_id": "a",
                 "dataset_type": "nrt",
-                "requested_start": "2020-01-01",
-                "requested_end": "2020-02-01",
-            }
-        ]
-        assert merge_records([], new) == new
-
-    def test_a_legacy_record_gains_its_requested_pair(self):
-        """The old layout meant requested by start_date/end_date, so that is
-        how a file written under it is read forward."""
-        legacy = [
-            {
-                "dataset_id": "a",
-                "dataset_type": "nrt",
                 "start_date": "2020-01-01",
                 "end_date": "2020-02-01",
             }
         ]
-        [got] = merge_records([], legacy)
+        assert merge_records([], new) == new
 
-        assert got["requested_start"] == "2020-01-01"
-        assert got["requested_end"] == "2020-02-01"
+    def test_per_write_fields_are_not_carried_through(self):
+        """days and updated describe a write, not a span, so a merge drops
+        them for annotate_covered to set again."""
+        existing = [
+            {
+                "dataset_id": "a",
+                "dataset_type": "nrt",
+                "start_date": "2020-01-01",
+                "end_date": "2020-04-20",
+                "days": 111,
+                "updated": "2020-04-20",
+            }
+        ]
+        [got] = merge_records(existing, [])
+
+        assert "days" not in got and "updated" not in got
 
 
 class TestWriteProvenanceForWindow:
@@ -186,8 +182,12 @@ class TestWriteProvenanceForWindow:
         got = _read_records(path)
         assert [r["dataset_type"] for r in got] == ["rep"]
 
-    def test_second_append_widens_coverage(self, tmp_path):
-        """Two runs over the same period must not lose the first one's span."""
+    def test_two_runs_still_describe_one_file(self, tmp_path):
+        """
+        Two runs over the same period must not leave the file claiming only the
+        second one. The fixture holds 2020-01-01..2020-01-05 throughout, and
+        both runs name the same dataset, so the file says so once.
+        """
         path = _write_zarr(tmp_path)
         write_provenance_for_window(
             path, _MANIFEST, _window("2020-07-01", "2020-08-31")
@@ -199,15 +199,12 @@ class TestWriteProvenanceForWindow:
         got = _read_records(path)
 
         assert len(got) == 1
-        assert got[0]["requested_start"] == "2020-07-01"
-        assert got[0]["requested_end"] == "2020-10-31"
+        assert got[0]["start_date"] == "2020-01-01"
+        assert got[0]["end_date"] == "2020-01-05"
 
-    def test_covered_reflects_the_store_not_the_request(self, tmp_path):
-        """
-        The fixture holds 2020-01-01..2020-01-05 and the request asks for July,
-        so nothing was covered — which the record has to say rather than
-        repeating the window back.
-        """
+    def test_dates_come_from_the_file_not_the_window(self, tmp_path):
+        """The window asked for July; the file holds the first five days of
+        January, and that is what it has to report."""
         path = _write_zarr(tmp_path)
         write_provenance_for_window(
             path, _MANIFEST, _window("2020-07-01", "2020-08-31")
@@ -215,10 +212,11 @@ class TestWriteProvenanceForWindow:
 
         [got] = _read_records(path)
 
-        assert got["days"] == 0
-        assert "start_date" not in got
+        assert got["start_date"] == "2020-01-01"
+        assert got["end_date"] == "2020-01-05"
+        assert got["days"] == 5
 
-    def test_covered_is_the_overlap_with_the_store(self, tmp_path):
+    def test_the_write_is_stamped(self, tmp_path):
         path = _write_zarr(tmp_path)
         write_provenance_for_window(
             path, _MANIFEST, _window("2020-01-01", "2020-06-30")
@@ -226,10 +224,7 @@ class TestWriteProvenanceForWindow:
 
         [got] = _read_records(path)
 
-        assert got["start_date"] == "2020-01-01"
-        assert got["end_date"] == "2020-01-05"
-        assert got["days"] == 5
-        assert got["requested_end"] == "2020-06-30"
+        assert got["updated"] == pd.Timestamp.today().strftime("%Y-%m-%d")
 
     def test_window_outside_manifest_writes_nothing(self, tmp_path):
         path = _write_zarr(tmp_path)
@@ -254,72 +249,76 @@ class TestWriteProvenanceForWindow:
 # ---------------------------------------------------------------------------
 
 
-class TestAnnotateCovered:
-    _RECORD = {
-        "dataset_id": "ds-rep",
-        "dataset_type": "rep",
-        "requested_start": "2020-01-01",
-        "requested_end": "2020-01-10",
+def _rec(dataset_id, kind, start, end) -> dict:
+    return {
+        "dataset_id": dataset_id,
+        "dataset_type": kind,
+        "start_date": start,
+        "end_date": end,
     }
 
-    def test_counts_the_days_inside_the_span(self):
-        stored = pd.date_range("2020-01-01", "2020-01-10", freq="D")
-        [out] = annotate_covered([self._RECORD], stored)
-        assert out["days"] == 10
 
-    def test_a_missing_day_shows_up_as_a_shortfall(self):
-        stored = pd.date_range("2020-01-01", "2020-01-10", freq="D").drop(
-            pd.Timestamp("2020-01-05")
-        )
-        [out] = annotate_covered([self._RECORD], stored)
-        assert out["days"] == 9
+class TestAnnotateCovered:
+    _RECORD = _rec("ds-rep", "rep", "2020-01-01", "2020-01-10")
+    _YEAR = pd.date_range("2020-01-01", "2020-12-31", freq="D")
 
-    def test_covered_dates_are_what_the_store_holds(self):
-        """Not the request: the store starts on the 3rd and stops on the 8th."""
-        stored = pd.date_range("2020-01-03", "2020-01-08", freq="D")
-        [out] = annotate_covered([self._RECORD], stored)
-        assert out["start_date"] == "2020-01-03"
-        assert out["end_date"] == "2020-01-08"
+    def test_the_file_is_accounted_for_end_to_end(self):
+        [out] = annotate_covered([self._RECORD], self._YEAR)
 
-    def test_days_outside_the_span_are_not_counted(self):
-        stored = pd.date_range("2019-01-01", "2021-12-31", freq="D")
-        [out] = annotate_covered([self._RECORD], stored)
-        assert out["days"] == 10
         assert out["start_date"] == "2020-01-01"
-        assert out["end_date"] == "2020-01-10"
+        assert out["end_date"] == "2020-12-31"
+        assert out["days"] == 366
 
-    def test_empty_span_gets_zero_and_no_covered_dates(self):
-        """Asked and received nothing, rather than a span that does not exist."""
-        [out] = annotate_covered([self._RECORD], pd.DatetimeIndex([]))
-        assert out["days"] == 0
-        assert "start_date" not in out and "end_date" not in out
-
-    def test_requested_span_is_preserved(self):
-        [out] = annotate_covered([self._RECORD], pd.date_range("2020-01-01", periods=3))
-        assert out["requested_start"] == "2020-01-01"
-        assert out["requested_end"] == "2020-01-10"
-
-    def test_a_legacy_record_upgrades_in_place(self):
+    def test_a_record_naming_one_week_still_claims_the_whole_file(self):
         """
-        Records written before the switch carry the requested window under
-        start_date/end_date. Reading them as such is what lets a file correct
-        itself on the next write instead of needing a migration.
+        The shape that made 2026 unreadable: a store filled week by week kept a
+        record naming the most recent week, so the year appeared to hold seven
+        days. One dataset means the file is made of that dataset.
         """
+        last_week = _rec("ds-nrt", "nrt", "2020-12-25", "2020-12-31")
+
+        [out] = annotate_covered([last_week], self._YEAR)
+
+        assert out["start_date"] == "2020-01-01"
+        assert out["end_date"] == "2020-12-31"
+
+    def test_a_handover_splits_at_the_second_dataset(self):
+        records = [
+            _rec("REP", "rep", "2020-01-01", "2020-06-30"),
+            _rec("NRT", "nrt", "2020-07-01", "2020-12-31"),
+        ]
+
+        rep, nrt = annotate_covered(records, self._YEAR)
+
+        assert (rep["start_date"], rep["end_date"]) == ("2020-01-01", "2020-06-30")
+        assert (nrt["start_date"], nrt["end_date"]) == ("2020-07-01", "2020-12-31")
+        assert rep["days"] + nrt["days"] == len(self._YEAR)
+
+    def test_days_counts_what_is_present_not_the_span(self):
+        gappy = self._YEAR.drop(pd.date_range("2020-03-01", "2020-03-10"))
+
+        [out] = annotate_covered([self._RECORD], gappy)
+
+        assert out["start_date"] == "2020-01-01"
+        assert out["end_date"] == "2020-12-31"
+        assert out["days"] == 356
+
+    def test_the_write_is_stamped(self):
+        [out] = annotate_covered([self._RECORD], self._YEAR)
+        assert out["updated"] == pd.Timestamp.today().strftime("%Y-%m-%d")
+
+    def test_a_file_with_no_axis_yields_nothing(self):
+        assert annotate_covered([self._RECORD], pd.DatetimeIndex([])) == []
+
+    def test_legacy_delivered_fields_do_not_survive(self):
         legacy = {
-            "dataset_id": "ds-rep",
-            "dataset_type": "rep",
-            "start_date": "2020-01-01",
-            "end_date": "2020-01-10",
+            **self._RECORD,
             "delivered_days": 4,
             "delivered_start": "2020-01-01",
             "delivered_end": "2020-01-04",
         }
-        [out] = annotate_covered([legacy], pd.date_range("2020-01-03", "2020-01-08"))
+        [out] = annotate_covered([legacy], self._YEAR)
 
-        assert out["requested_start"] == "2020-01-01"
-        assert out["requested_end"] == "2020-01-10"
-        assert out["start_date"] == "2020-01-03"
-        assert out["end_date"] == "2020-01-08"
         assert not [k for k in out if k.startswith("delivered_")]
 
     def test_is_idempotent(self):
@@ -395,15 +394,6 @@ def _seed_source_datasets(path, records: list[dict]) -> None:
     """Put a per-variable store's provenance in place, as the converter would."""
     root = zarr.open_group(str(path), mode="r+")
     root.attrs["source_datasets"] = json.dumps(records)
-
-
-def _rec(dataset_id, kind, start, end) -> dict:
-    return {
-        "dataset_id": dataset_id,
-        "dataset_type": kind,
-        "start_date": start,
-        "end_date": end,
-    }
 
 
 def _read_compiled(path) -> dict:

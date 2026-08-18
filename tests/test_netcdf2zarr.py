@@ -842,15 +842,14 @@ class TestProvenanceCoveredDates:
         assert record["start_date"] == "2020-01-01"
         assert record["end_date"] == "2020-01-10"
 
-    def test_requested_span_is_still_recorded(self, tmp_path):
+    def test_the_write_is_stamped(self, tmp_path):
         conv = _period_converter(tmp_path)
         self._manifest(conv)
         conv._process_period(2020, _write_raw_days(conv, _JAN))
 
         [record] = self._read_provenance(conv)
 
-        assert record["requested_start"] == "2020-01-01"
-        assert record["requested_end"] == "2020-01-10"
+        assert record["updated"] == pd.Timestamp.today().strftime("%Y-%m-%d")
 
     def test_append_widens_rather_than_overwrites(self, tmp_path):
         """The old path replaced the attribute, dropping the earlier run."""

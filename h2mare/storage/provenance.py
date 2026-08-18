@@ -15,35 +15,36 @@ if TYPE_CHECKING:
     from h2mare.storage.zarr_catalog import ZarrCatalog
 
 
-#: What a record's dates mean.
+#: What a record says.
 #:
-#: ``start_date``/``end_date`` are **covered**: the first and last day the store
-#: actually holds from that dataset. That is the question provenance is asked —
-#: which product covers which part of the archive, and where rep hands over to
-#: nrt — and it is answerable from the store itself, so it is recomputed on
-#: every write rather than accumulated. A record that has never been recomputed
-#: cannot drift from the data, because it is never the source of truth.
+#: ``start_date``/``end_date`` are what the file holds from that dataset, and
+#: together the records account for every day on its time axis. One dataset for
+#: a year means that year's first and last day; a year where rep hands over to
+#: nrt splits at the handover. So a file states its coverage the same way
+#: whatever sequence of runs built it.
 #:
-#: ``requested_start``/``requested_end`` are the download windows that produced
-#: it. They are bookkeeping: they say which days belong to which dataset, which
-#: is the one thing the time axis cannot reveal on its own. Comparing the two
-#: pairs is what answers "did this product deliver everything it was asked for".
-_COVERED = ("start_date", "end_date")
-_UNMERGEABLE = ("days",)
+#: They are read off the axis on every write rather than accumulated, which is
+#: what keeps them from drifting: a download window is what was *asked* for, and
+#: recording that instead is how a store appended to over a hundred runs ended
+#: up claiming only the last week of them.
+#:
+#: ``days`` counts the days actually present in the span — equal to its length
+#: unless the source skipped some. ``updated`` is when the record was last
+#: rewritten, which is the one fact the axis cannot supply.
+_DERIVED = ("start_date", "end_date", "days", "updated")
 
 
-def _requested_span(record: dict) -> tuple[str, str]:
+def _anchor(record: dict) -> str:
     """
-    The download window a record describes, tolerating the pre-covered layout.
+    First day attributed to a record's dataset, used to order the handovers.
 
-    Records written before the switch carry the requested window in
-    ``start_date``/``end_date``, since that is what those fields meant. Reading
-    them as such is what lets a legacy file upgrade in place the next time
-    anything writes to it, rather than needing a migration pass.
+    ``start_date`` under either layout: the covered one it now means, and the
+    requested one it used to. A narrower value than the truth is harmless
+    because :func:`annotate_covered` only uses it for ordering — the first
+    dataset on the axis is extended back to the file's own start regardless,
+    which is what repairs a file whose history was never fully recorded.
     """
-    if "requested_start" in record:
-        return record["requested_start"], record["requested_end"]
-    return record["start_date"], record["end_date"]
+    return record["start_date"]
 
 
 def records_for_window(manifest: list[dict], window: DateRange) -> list[dict]:
@@ -56,8 +57,9 @@ def records_for_window(manifest: list[dict], window: DateRange) -> list[dict]:
     period is written to its own Zarr. Intersecting the written window with the
     manifest attributes each period correctly.
 
-    Emits the requested window only. The covered dates come from
-    :func:`annotate_covered`, which reads them off the store.
+    The dates here are provisional: they say where each dataset's contribution
+    begins, which is what :func:`annotate_covered` needs to place the handovers
+    before replacing them with what the axis actually holds.
 
     Entries that do not overlap *window* are dropped.
     """
@@ -71,11 +73,11 @@ def records_for_window(manifest: list[dict], window: DateRange) -> list[dict]:
             {
                 "dataset_id": entry["dataset_id"],
                 "dataset_type": entry["dataset_type"],
-                "requested_start": start.strftime("%Y-%m-%d"),
-                "requested_end": end.strftime("%Y-%m-%d"),
+                "start_date": start.strftime("%Y-%m-%d"),
+                "end_date": end.strftime("%Y-%m-%d"),
             }
         )
-    return sorted(records, key=lambda r: r["requested_start"])
+    return sorted(records, key=_anchor)
 
 
 def merge_records(existing: list[dict], new: list[dict]) -> list[dict]:
@@ -87,16 +89,16 @@ def merge_records(existing: list[dict], new: list[dict]) -> list[dict]:
     records — as the generic converter path used to — would drop the earlier
     part of the same file.
 
-    Both spans widen. The requested one because that is how a period file
-    accumulates the windows that fed it; the covered one because h2ds merges the
-    spans its sources already computed and has no time axis of its own to
-    recompute them from. Where there *is* an axis — every per-variable store —
-    :func:`annotate_covered` runs afterwards and overwrites the covered pair, so
-    widening it here costs nothing and is never the final word.
+    A dataset seen twice keeps the earliest start and the latest end, which is
+    all h2ds needs: it merges the spans its sources already worked out and has
+    no time axis of its own to recompute them from. Every per-variable store
+    does have one, and :func:`annotate_covered` runs afterwards and replaces
+    these dates with what it holds — so merging here settles *which* datasets a
+    file involves and roughly where each begins, not what it finally says.
 
     ``days`` is dropped rather than combined: summing double-counts a re-convert
     of a period already present, and taking a maximum understates a genuine
-    append. It is recomputed alongside the covered dates.
+    append. Same for ``updated``, which belongs to a write, not to a span.
     """
     merged: dict[str, dict] = {}
     for record in [*existing, *new]:
@@ -104,66 +106,72 @@ def merge_records(existing: list[dict], new: list[dict]) -> list[dict]:
         span = {
             k: v
             for k, v in record.items()
-            if not k.startswith("delivered_") and k not in _UNMERGEABLE
+            if not k.startswith("delivered_") and k not in ("days", "updated")
         }
-        span["requested_start"], span["requested_end"] = _requested_span(record)
         if key not in merged:
             merged[key] = span
             continue
 
         held = merged[key]
-        held["requested_start"] = min(held["requested_start"], span["requested_start"])
-        held["requested_end"] = max(held["requested_end"], span["requested_end"])
-        for field, pick in zip(_COVERED, (min, max)):
-            if field in span:
-                held[field] = (
-                    pick(held[field], span[field]) if field in held else span[field]
-                )
-    return sorted(merged.values(), key=lambda r: r["requested_start"])
+        held["start_date"] = min(held["start_date"], span["start_date"])
+        held["end_date"] = max(held["end_date"], span["end_date"])
+    return sorted(merged.values(), key=_anchor)
 
 
 def annotate_covered(records: list[dict], stored: pd.DatetimeIndex) -> list[dict]:
     """
-    Set each record's covered dates from what the store actually holds.
+    Share the store's time axis out between the datasets that supplied it.
 
-    ``start_date``/``end_date`` become the first and last day present inside the
-    record's requested window, and ``days`` the count between them. Read off the
-    time axis rather than carried forward, which makes it idempotent: the record
-    describes the file as it now stands, however many conversions contributed to
-    it, and a file written by an older version corrects itself the next time
-    anything writes to it.
+    Every day on the axis is attributed, so the records account for the whole
+    file: one dataset for a year gets that year's first and last day, and a year
+    where rep hands over to nrt splits at the handover. The records say the same
+    thing whether the file was written in one run or a hundred.
 
-    It is also the only moment the truth is available for ``archive_raw: false``
-    variables, whose raw files are gone by the next run.
+    Each dataset holds from where it starts until the next one begins, and the
+    earliest is extended back to the first day on the axis. That last part is
+    what repairs a file whose history was only partly recorded: a store filled
+    week by week ends up with a record naming the most recent week, and reading
+    it literally would claim the year holds seven days. Extending it back says
+    what is true — that dataset is what the file is made of.
 
-    A window holding nothing gets ``days: 0`` and no covered dates at all —
-    saying "asked, received nothing" rather than implying a span that does not
-    exist. ``delivered_*`` from the previous layout is dropped; the covered
-    fields say the same thing under the names that now mean it.
+    ``days`` counts what is actually present in the span, so a source that
+    skipped days shows fewer than the span is long. ``updated`` stamps the
+    write, being the one fact no amount of reading the axis can recover.
 
-    Each record is measured against its own requested window, so two datasets
-    whose windows overlap both claim the days in the overlap. The download
-    planners do not produce that — ``_create_download_tasks`` ends the rep task
-    where the nrt one begins — but a hand-written manifest could, and the count
-    would then attribute the same day twice rather than pick a winner.
+    A file with no time axis, or records for datasets it holds nothing from,
+    yields nothing rather than dates that describe no data.
     """
-    stored = pd.DatetimeIndex(stored).normalize().unique()
+    stored = pd.DatetimeIndex(stored).normalize().unique().sort_values()
+    if len(stored) == 0 or not records:
+        return []
+
+    ordered = sorted(records, key=_anchor)
+    today = pd.Timestamp.today().strftime("%Y-%m-%d")
     out = []
-    for record in records:
-        r_start, r_end = _requested_span(record)
-        inside = stored[
-            (stored >= pd.to_datetime(r_start)) & (stored <= pd.to_datetime(r_end))
-        ]
-        covered = {k: v for k, v in record.items() if not k.startswith("delivered_")}
-        covered["requested_start"], covered["requested_end"] = r_start, r_end
-        covered["days"] = int(len(inside))
-        if len(inside):
-            covered["start_date"] = inside.min().strftime("%Y-%m-%d")
-            covered["end_date"] = inside.max().strftime("%Y-%m-%d")
+
+    for i, record in enumerate(ordered):
+        # The first dataset owns everything up to the second one, however late
+        # its own record happens to start.
+        start = stored[0] if i == 0 else max(pd.to_datetime(_anchor(record)), stored[0])
+        if i + 1 < len(ordered):
+            end = pd.to_datetime(_anchor(ordered[i + 1])) - pd.Timedelta(days=1)
         else:
-            covered.pop("start_date", None)
-            covered.pop("end_date", None)
-        out.append(covered)
+            end = stored[-1]
+
+        inside = stored[(stored >= start) & (stored <= end)]
+        if len(inside) == 0:
+            continue
+
+        out.append(
+            {
+                "dataset_id": record["dataset_id"],
+                "dataset_type": record["dataset_type"],
+                "start_date": inside.min().strftime("%Y-%m-%d"),
+                "end_date": inside.max().strftime("%Y-%m-%d"),
+                "days": int(len(inside)),
+                "updated": today,
+            }
+        )
     return out
 
 
@@ -295,8 +303,8 @@ def backfill_provenance(catalog: "ZarrCatalog", rep_end_date: DateLike) -> int:
                 {
                     "dataset_id": catalog.var_config.dataset_id_rep,
                     "dataset_type": "rep",
-                    "requested_start": z_start.strftime("%Y-%m-%d"),
-                    "requested_end": z_end.strftime("%Y-%m-%d"),
+                    "start_date": z_start.strftime("%Y-%m-%d"),
+                    "end_date": z_end.strftime("%Y-%m-%d"),
                 }
             )
         elif z_start > rep_end:
@@ -304,8 +312,8 @@ def backfill_provenance(catalog: "ZarrCatalog", rep_end_date: DateLike) -> int:
                 {
                     "dataset_id": catalog.var_config.dataset_id_nrt,
                     "dataset_type": "nrt",
-                    "requested_start": z_start.strftime("%Y-%m-%d"),
-                    "requested_end": z_end.strftime("%Y-%m-%d"),
+                    "start_date": z_start.strftime("%Y-%m-%d"),
+                    "end_date": z_end.strftime("%Y-%m-%d"),
                 }
             )
         else:
@@ -313,16 +321,16 @@ def backfill_provenance(catalog: "ZarrCatalog", rep_end_date: DateLike) -> int:
                 {
                     "dataset_id": catalog.var_config.dataset_id_rep,
                     "dataset_type": "rep",
-                    "requested_start": z_start.strftime("%Y-%m-%d"),
-                    "requested_end": rep_end.strftime("%Y-%m-%d"),
+                    "start_date": z_start.strftime("%Y-%m-%d"),
+                    "end_date": rep_end.strftime("%Y-%m-%d"),
                 }
             )
             records.append(
                 {
                     "dataset_id": catalog.var_config.dataset_id_nrt,
                     "dataset_type": "nrt",
-                    "requested_start": nrt_start.strftime("%Y-%m-%d"),
-                    "requested_end": z_end.strftime("%Y-%m-%d"),
+                    "start_date": nrt_start.strftime("%Y-%m-%d"),
+                    "end_date": z_end.strftime("%Y-%m-%d"),
                 }
             )
 
