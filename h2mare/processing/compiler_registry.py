@@ -258,14 +258,21 @@ def _reduce_hourly_in_slabs(
             "next compile."
         )
         return None
-    if covered != date_range:
-        logger.info(f"[{var_key}] reducing {covered}, the part the store covers")
-
     days = _slab_days(ds)
     slabs = _slabs(covered, days)
-    logger.debug(
-        f"[{var_key}] hourly reduction in {len(slabs)} slab(s) of up to {days} day(s)"
+
+    # One line per variable, and it only reaches INFO when there is something to
+    # notice: a store falling short of the window means that variable lags and
+    # its tail lands in h2ds as NaN. A reduction that covers what was asked for
+    # is routine, and at 29 chunks a run says so 29 times per variable.
+    summary = (
+        f"[{var_key}] hourly → daily over {covered} in "
+        f"{len(slabs)} slab(s) of up to {days} day(s)"
     )
+    if covered != date_range:
+        logger.info(f"{summary} — short of the requested {date_range}")
+    else:
+        logger.debug(summary)
 
     # An interior hole can still leave a slab with nothing in it, which clipping
     # the ends cannot see. Skipping costs a coordinate read and keeps the same
@@ -542,7 +549,10 @@ def compile_default(
     if step_freq(compiler.app_config.variables.get(var_key)) == "h":
         from loguru import logger
 
-        logger.info(f"[{var_key}] hourly store — reducing to daily mean for h2ds")
+        # Debug, not info: the line below already reports the reduction, and
+        # which one it was matters when reading back a surprising number, not
+        # once per chunk during a run.
+        logger.debug(f"[{var_key}] unregistered hourly store — plain daily mean")
         ds = _reduce_hourly_in_slabs(
             catalog,
             var_key,
