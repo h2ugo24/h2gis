@@ -17,10 +17,10 @@ from .types import (
     DateLike,
     DateRange,
     DownloadTask,
+    FilePeriod,
     FTPDownloadTask,
-    TimeResolution,
 )
-from .validators import validate_time_resolution, validate_var_key, validate_var_keys
+from .validators import validate_file_period, validate_var_key, validate_var_keys
 
 __all__ = [
     "get_settings",
@@ -31,10 +31,10 @@ __all__ = [
     "DateLike",
     "DateRange",
     "BBox",
-    "TimeResolution",
+    "FilePeriod",
     "DownloadTask",
     "FTPDownloadTask",
     "validate_var_key",
     "validate_var_keys",
-    "validate_time_resolution",
+    "validate_file_period",
 ]

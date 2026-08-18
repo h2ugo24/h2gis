@@ -31,10 +31,10 @@ from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import chunk_dataset, drop_source_encoding_attrs
 from h2mare.storage.zarr_catalog import ZarrCatalog
-from h2mare.types import BBox, DateLike, DateRange, TimeResolution
+from h2mare.types import BBox, DateLike, DateRange, FilePeriod
 from h2mare.utils.datetime_utils import normalize_date
 from h2mare.utils.spatial import GridBuilder
-from h2mare.validators import validate_time_resolution, validate_var_key
+from h2mare.validators import validate_file_period, validate_var_key
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -95,7 +95,7 @@ class Compiler:
         app_config: Optional[AppConfig] = None,
         remote_store_root: Optional[Path] = None,
         local_store_root: Optional[Path] = None,
-        time_resolution: TimeResolution = TimeResolution.YEAR,
+        file_period: FilePeriod = FilePeriod.YEAR,
         date_format: Literal["year", "date", "yearmonth"] = "year",
     ):
         """
@@ -106,7 +106,7 @@ class Compiler:
             app_config (AppConfig, optional): Configuration data for var keys. Defaults to AppConfig.
             remote_store_root (Path, optional): Store directory where all environmental data lives (currently D:).
             local_store_root (Path], optional): Local data directory where compiled data lives (currently C:)
-            time_resolution: Temporal granularity ('year' or 'month') for file storage. Defaults to 'year'.
+            file_period: Temporal granularity ('year' or 'month') for file storage. Defaults to 'year'.
             date_format: string date format for output file name.
         """
         self.app_config = app_config or get_settings().app_config
@@ -129,7 +129,7 @@ class Compiler:
             )
         self.bbox = BBox.from_tuple(self.var_config.bbox)
 
-        self.time_resolution = validate_time_resolution(time_resolution)
+        self.file_period = validate_file_period(file_period)
         self.date_format: Literal["year", "date", "yearmonth"] = date_format
 
         self.catalog = ZarrCatalog(self.var_key)
@@ -204,7 +204,7 @@ class Compiler:
         self.base_grid = GridBuilder(self.bbox, dx, dy).generate_grid()
 
         # time chunks
-        chunks = split_time_range(requested_range, self.time_resolution)
+        chunks = split_time_range(requested_range, self.file_period)
 
         written_paths: list[Path] = []
 

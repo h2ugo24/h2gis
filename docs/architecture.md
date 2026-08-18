@@ -162,4 +162,4 @@ Aggregation results are cached internally and cleared when new data is written.
 | `DateRange` | Dataclass with `start` / `end` datetime fields and overlap helpers |
 | `BBox` | Dataclass with `xmin, ymin, xmax, ymax`; spatial overlap and label helpers |
 | `DownloadTask` | Single download unit: `dataset_id`, `date_range`, `dataset_type` |
-| `TimeResolution` | `YEAR` or `MONTH` enum controlling Zarr file granularity |
+| `FilePeriod` | `YEAR` or `MONTH` enum controlling Zarr file granularity |

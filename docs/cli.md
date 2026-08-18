@@ -199,7 +199,7 @@ uv run h2mare parquet2zarr PARQUET_ROOT OUT_DIR [OPTIONS]
 | `--start-date` | YYYY-MM-DD | store start | Start of date range (must be paired with `--end-date`) |
 | `--end-date` | YYYY-MM-DD | store end | End of date range (must be paired with `--start-date`) |
 | `-v, --vars` | text (repeatable) | all | Variable column(s) to read |
-| `--time-resolution` | `month` \| `year` | `month` | Read/append chunk granularity (memory control) |
+| `--file-period` | `month` \| `year` | `month` | Read/append chunk granularity (memory control). `--time-resolution` is accepted as the former name |
 | `--date-format` | `year` \| `yearmonth` \| `date` | `year` | Output file granularity |
 | `--layout` | `timeseries` \| `map` | `timeseries` | Zarr chunk layout — extraction vs interactive display |
 

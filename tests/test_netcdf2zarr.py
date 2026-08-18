@@ -12,7 +12,7 @@ import xarray as xr
 
 from h2mare.format_converters.netcdf2zarr import Netcdf2Zarr
 from h2mare.models import AppConfig
-from h2mare.types import DateRange, TimeResolution
+from h2mare.types import DateRange, FilePeriod
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -204,7 +204,7 @@ class TestGroupMap:
         n2z = _make_converter(tmp_path)
         (n2z.download_root / "sst_20210101_20210131.nc").touch()
         (n2z.download_root / "sst_20210201_20210228.nc").touch()
-        result = n2z._group_map(TimeResolution.YEAR)
+        result = n2z._group_map(FilePeriod.YEAR)
         assert 2021 in result
         assert len(result[2021]) == 2
 
@@ -212,7 +212,7 @@ class TestGroupMap:
         n2z = _make_converter(tmp_path)
         (n2z.download_root / "sst_20210101_20210131.nc").touch()
         (n2z.download_root / "sst_20210201_20210228.nc").touch()
-        result = n2z._group_map(TimeResolution.MONTH)
+        result = n2z._group_map(FilePeriod.MONTH)
         assert (2021, 1) in result
         assert (2021, 2) in result
         # Each month key has only its own file
@@ -225,7 +225,7 @@ class TestGroupMap:
         with patch.object(
             n2z, "_get_file_date_series", return_value=pd.Series(dtype="object")
         ):
-            assert n2z._group_map(TimeResolution.YEAR) == {}
+            assert n2z._group_map(FilePeriod.YEAR) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +394,7 @@ class TestRunWindow:
 
         with patch.object(converter, "_get_file_date_series", return_value=series):
             groups = converter._group_map(
-                TimeResolution.YEAR,
+                FilePeriod.YEAR,
                 window=DateRange(
                     pd.Timestamp("2021-01-01"), pd.Timestamp("2021-12-31")
                 ),
@@ -410,7 +410,7 @@ class TestRunWindow:
         )
 
         with patch.object(converter, "_get_file_date_series", return_value=series):
-            groups = converter._group_map(TimeResolution.YEAR)
+            groups = converter._group_map(FilePeriod.YEAR)
 
         assert sorted(groups) == [2020, 2021]
 
@@ -420,7 +420,7 @@ class TestRunWindow:
 
         with patch.object(converter, "_get_file_date_series", return_value=series):
             groups = converter._group_map(
-                TimeResolution.YEAR,
+                FilePeriod.YEAR,
                 window=DateRange(
                     pd.Timestamp("2030-01-01"), pd.Timestamp("2030-12-31")
                 ),
@@ -949,7 +949,7 @@ class TestSingleDayFilename:
         conv = self._conv(tmp_path)
         (conv.download_root / "METOFFICE_2026-07-31.nc").write_bytes(b"")
 
-        assert list(conv._group_map(groupby=TimeResolution.YEAR)) == [2026]
+        assert list(conv._group_map(groupby=FilePeriod.YEAR)) == [2026]
 
 
 class TestUnparseableFilenamesAreNotSilent:

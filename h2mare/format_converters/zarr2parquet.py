@@ -23,9 +23,9 @@ from h2mare.models import SYSTEM_VAR_KEYS
 from h2mare.storage import ZarrCatalog
 from h2mare.storage.coverage import get_store_coverage, split_time_range
 from h2mare.storage.parquet_indexer import ParquetIndexer
-from h2mare.types import DateLike, DateRange, TimeResolution
+from h2mare.types import DateLike, DateRange, FilePeriod
 from h2mare.utils.datetime_utils import end_of_day
-from h2mare.validators import validate_time_resolution
+from h2mare.validators import validate_file_period
 
 # How far behind the parquet end the incremental backfill looks for "holes"
 # (days whose rows were appended while a variable's compile lagged, leaving the
@@ -40,7 +40,7 @@ def convert_zarr_to_parquet(
     *,
     start_date: DateLike | None = None,
     end_date: DateLike | None = None,
-    time_resolution: TimeResolution | str = TimeResolution.MONTH,
+    file_period: FilePeriod | str = FilePeriod.MONTH,
     depth: float | None = None,
     variables: list[str] | None = None,
     indexer_kwargs: Optional[dict] = None,
@@ -68,8 +68,8 @@ def convert_zarr_to_parquet(
             first time step.
         end_date: End of the conversion window. Defaults to the store's last
             time step.
-        time_resolution: Granularity of each write batch. Defaults to
-            ``TimeResolution.MONTH`` so each chunk fits comfortably in memory.
+        file_period: Granularity of each write batch. Defaults to
+            ``FilePeriod.MONTH`` so each chunk fits comfortably in memory.
         depth: Depth level (in metres) to select for stores with a ``depth``
             dimension; the nearest level is chosen. Required when the store has
             a ``depth`` dim (otherwise the time/lon/lat Parquet schema would get
@@ -87,7 +87,7 @@ def convert_zarr_to_parquet(
         ValueError: If the store has a ``depth`` dim but ``depth`` is not given,
             or if ``start_date`` is after ``end_date``.
     """
-    time_resolution = validate_time_resolution(time_resolution)
+    file_period = validate_file_period(file_period)
 
     if isinstance(zarr_path, (str, Path)):
         ds = xr.open_zarr(zarr_path, **(open_kwargs or {}))
@@ -113,7 +113,7 @@ def convert_zarr_to_parquet(
             end=pd.Timestamp(end_date) if end_date is not None else times.max(),
         )
 
-        periods = split_time_range(window, time_resolution)
+        periods = split_time_range(window, file_period)
         logger.info(
             f"Zarr → Parquet conversion: {window.start.date()} → {window.end.date()} "
             f"({len(periods)} chunk(s)) → {Path(parquet_root)}"
@@ -203,14 +203,14 @@ class Zarr2Parquet(BaseConverter):
         self,
         start_date: str | pd.Timestamp | None = None,
         end_date: str | pd.Timestamp | None = None,
-        time_resolution: TimeResolution = TimeResolution.MONTH,
+        file_period: FilePeriod = FilePeriod.MONTH,
         depth: float | None = None,
         variables: list[str] | None = None,
     ) -> bool:
         """
         Convert Zarr data to Parquet, mirroring the compiler's incremental mode.
 
-        Every conversion window is split by *time_resolution* (default: monthly)
+        Every conversion window is split by *file_period* (default: monthly)
         so each chunk fits comfortably in memory.
 
         Three modes, in priority order:
@@ -233,8 +233,8 @@ class Zarr2Parquet(BaseConverter):
         Args:
             start_date: Start of the conversion window. Inferred when omitted.
             end_date: End of the conversion window. Inferred when omitted.
-            time_resolution: Granularity of each write batch. Defaults to
-                ``TimeResolution.MONTH``.
+            file_period: Granularity of each write batch. Defaults to
+                ``FilePeriod.MONTH``.
             depth: Depth level to select (in metres) for variables that have a
                 depth dimension. The nearest available level is chosen. Required
                 for depth-aware variables (e.g. thetao, o2); ignored otherwise.
@@ -250,7 +250,7 @@ class Zarr2Parquet(BaseConverter):
         if variables is not None and start_date is None and end_date is None:
             ok = self._convert_window(
                 DateRange(self.repo_start, self.repo_end),
-                time_resolution,
+                file_period,
                 depth,
                 variables,
                 label=f"Merging {variables} into all existing partitions",
@@ -266,7 +266,7 @@ class Zarr2Parquet(BaseConverter):
                 if window is None
                 else self._convert_window(
                     window,
-                    time_resolution,
+                    file_period,
                     depth,
                     variables,
                     label="Converting requested range",
@@ -303,7 +303,7 @@ class Zarr2Parquet(BaseConverter):
             if window is not None:
                 ok &= self._convert_window(
                     window,
-                    time_resolution,
+                    file_period,
                     depth,
                     None,
                     label="Appending new dates",
@@ -312,7 +312,7 @@ class Zarr2Parquet(BaseConverter):
             for window, cols in backfill_groups:
                 ok &= self._convert_window(
                     window,
-                    time_resolution,
+                    file_period,
                     depth,
                     sorted(cols),
                     label=f"Backfilling {sorted(cols)} into existing partitions",
@@ -332,7 +332,7 @@ class Zarr2Parquet(BaseConverter):
     def _convert_window(
         self,
         window: DateRange,
-        time_resolution: TimeResolution,
+        file_period: FilePeriod,
         depth: float | None,
         variables: list[str] | None,
         *,
@@ -354,7 +354,7 @@ class Zarr2Parquet(BaseConverter):
 
         Returns ``True`` when every chunk converted without error.
         """
-        periods = split_time_range(window, time_resolution)
+        periods = split_time_range(window, file_period)
         # The chunk count is only informative when the window actually splits;
         # the per-chunk DEBUG lines below cover that case in full.
         chunks = f" ({len(periods)} chunks)" if len(periods) > 1 else ""

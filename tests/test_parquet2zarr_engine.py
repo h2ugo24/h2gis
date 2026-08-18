@@ -273,21 +273,21 @@ def test_second_call_extends_year_file(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# time_resolution accepts a plain string / validation
+# file_period accepts a plain string / validation
 # ---------------------------------------------------------------------------
 
 
-def test_time_resolution_accepts_plain_string(tmp_path):
+def test_file_period_accepts_plain_string(tmp_path):
     parquet = _make_parquet(tmp_path, _make_ds(n_days=40))
     written = convert_parquet_to_zarr(
-        parquet, tmp_path / "out", name="adhoc", time_resolution="year"
+        parquet, tmp_path / "out", name="adhoc", file_period="year"
     )
     assert xr.open_zarr(written[0]).sizes["time"] == 40
 
 
-def test_invalid_time_resolution_raises(tmp_path):
+def test_invalid_file_period_raises(tmp_path):
     parquet = _make_parquet(tmp_path, _make_ds(n_days=5))
     with pytest.raises(ValueError, match="(?i)period|month|year"):
         convert_parquet_to_zarr(
-            parquet, tmp_path / "out", name="adhoc", time_resolution="monthly"
+            parquet, tmp_path / "out", name="adhoc", file_period="monthly"
         )

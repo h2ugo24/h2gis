@@ -18,7 +18,7 @@ import pandas as pd
 from loguru import logger
 
 from h2mare.storage.zarr_scanner import ZarrDirectoryScanner
-from h2mare.types import BBox, DateLike, DateRange, TimeResolution
+from h2mare.types import BBox, DateLike, DateRange, FilePeriod
 from h2mare.utils.datetime_utils import normalize_dates
 
 
@@ -58,7 +58,7 @@ class ZarrIndex:
         *,
         store_root: Path,
         metadata_root: Path,
-        time_resolution: TimeResolution,
+        file_period: FilePeriod,
         auto_refresh: bool = True,
         verbose: bool = False,
     ) -> None:
@@ -66,12 +66,12 @@ class ZarrIndex:
         self.var_config = var_config
         self.store_root = store_root
         self.metadata_root = metadata_root
-        self.time_resolution = time_resolution
+        self.file_period = file_period
         self.auto_refresh = auto_refresh
         self.verbose = verbose
 
         self._scanner = ZarrDirectoryScanner(
-            self.store_root, self.time_resolution, self.var_config, verbose=verbose
+            self.store_root, self.file_period, self.var_config, verbose=verbose
         )
         self._df_cache: Optional[pd.DataFrame] = None
 

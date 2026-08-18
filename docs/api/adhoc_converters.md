@@ -105,7 +105,7 @@ convert_zarr_to_parquet(
     *,
     start_date=None,            # defaults to the store's first time step
     end_date=None,              # defaults to the store's last time step
-    time_resolution="month",    # "month" | "year" (or TimeResolution); chunk size
+    file_period="month",    # "month" | "year" (or FilePeriod); chunk size
     depth=None,                 # required if the store has a depth dim
     variables=None,             # subset of data variables; None = all
     indexer_kwargs=None,        # forwarded to ParquetIndexer (e.g. column names)
@@ -119,7 +119,7 @@ convert_zarr_to_parquet(
 | `parquet_root` | — | Destination directory. Unlike the class, no dataset sub-folder is derived — data is written here directly. Existing partitions are appended or JOINed via the indexer's overlap semantics |
 | `start_date` | store start | Start of the conversion window (`str` or `pd.Timestamp`) |
 | `end_date` | store end | End of the conversion window (`str` or `pd.Timestamp`) |
-| `time_resolution` | `"month"` | Granularity of each write batch. Accepts a plain string (`"month"`/`"year"`) or `TimeResolution` |
+| `file_period` | `"month"` | Granularity of each write batch. Accepts a plain string (`"month"`/`"year"`) or `FilePeriod` |
 | `depth` | `None` | Depth level (metres) to select for stores with a `depth` dim; nearest level is chosen. **Required** when the store has a `depth` dim |
 | `variables` | `None` | Subset of data variables to read. `None` reads all |
 | `indexer_kwargs` | `None` | Extra kwargs for `ParquetIndexer` (e.g. `time_col`/`lon_col`/`lat_col`, `partition_by`) |
@@ -155,7 +155,7 @@ generic prep the pipeline uses — `snap_grid_coords` → `chunk_dataset` →
 
 Output is split into per-period Zarr files matching the pipeline store layout.
 `date_format` controls the *file* granularity (one `.zarr` per year by default);
-`time_resolution` controls how much is read and pivoted *at once* (monthly by
+`file_period` controls how much is read and pivoted *at once* (monthly by
 default, to bound memory). With the defaults each month is read, pivoted, and
 appended into its year's `.zarr` file.
 
@@ -169,7 +169,7 @@ convert_parquet_to_zarr(
     name="data",                # identity label for the filename / overlap / logs
     start_date=None,            # defaults to the store's first time step
     end_date=None,              # defaults to the store's last time step
-    time_resolution="month",    # "month" | "year" (or TimeResolution); read/pivot batch
+    file_period="month",    # "month" | "year" (or FilePeriod); read/pivot batch
     date_format="year",         # "year" | "yearmonth" | "date"; output file granularity
     variables=None,             # subset of data columns; None = all
     bbox=None,                  # (min_lon, min_lat, max_lon, max_lat) spatial filter
@@ -185,7 +185,7 @@ convert_parquet_to_zarr(
 | `name` | `"data"` | Identity label used in the output filename (`{name}_{label}.zarr`) and in write/append logs and overlap resolution. Need not exist in config |
 | `start_date` | store start | Start of the window (`str` or `pd.Timestamp`) |
 | `end_date` | store end | End of the window (`str` or `pd.Timestamp`) |
-| `time_resolution` | `"month"` | Granularity of each read/pivot batch. Accepts a plain string (`"month"`/`"year"`) or `TimeResolution` |
+| `file_period` | `"month"` | Granularity of each read/pivot batch. Accepts a plain string (`"month"`/`"year"`) or `FilePeriod` |
 | `date_format` | `"year"` | Output file granularity / filename date label — `"year"` (one file per year), `"yearmonth"` (per month), or `"date"` (explicit start–end range) |
 | `variables` | `None` | Subset of data columns to read. `None` reads all. The time/lat/lon coordinate columns are always included |
 | `bbox` | `None` | Optional `(min_lon, min_lat, max_lon, max_lat)` spatial filter forwarded to the indexer scan |

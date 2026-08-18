@@ -12,7 +12,7 @@ import xarray as xr
 
 from h2mare.format_converters.zarr2parquet import convert_zarr_to_parquet
 from h2mare.storage.parquet_indexer import ParquetIndexer
-from h2mare.types import TimeResolution
+from h2mare.types import FilePeriod
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -51,7 +51,7 @@ def test_period_boundary_keeps_a_noon_stamped_last_day(tmp_path):
     _write_zarr(ds, src)
     out = tmp_path / "parquet"
 
-    convert_zarr_to_parquet(src, out, time_resolution=TimeResolution.MONTH)
+    convert_zarr_to_parquet(src, out, file_period=FilePeriod.MONTH)
 
     got = ParquetIndexer(out).load()
     days = set(pd.DatetimeIndex(got["time"].to_numpy()).normalize())
@@ -216,7 +216,7 @@ def test_list_of_stores(tmp_path):
     _write_zarr(_make_ds("2020-01-06", 5, seed=2), b)
     out = tmp_path / "parquet"
 
-    convert_zarr_to_parquet([a, b], out, time_resolution=TimeResolution.MONTH)
+    convert_zarr_to_parquet([a, b], out, file_period=FilePeriod.MONTH)
 
     cov = ParquetIndexer(out).get_time_coverage()
     assert pd.Timestamp(cov.start) == pd.Timestamp("2020-01-01")
@@ -224,24 +224,24 @@ def test_list_of_stores(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# time_resolution accepts a plain string
+# file_period accepts a plain string
 # ---------------------------------------------------------------------------
 
 
-def test_time_resolution_accepts_plain_string(tmp_path):
+def test_file_period_accepts_plain_string(tmp_path):
     src = tmp_path / "store.zarr"
     _write_zarr(_make_ds(n_days=40), src)
     out = tmp_path / "parquet"
 
-    # "year" instead of TimeResolution.YEAR — no enum import needed by the caller.
-    convert_zarr_to_parquet(src, out, time_resolution="year")
+    # "year" instead of FilePeriod.YEAR — no enum import needed by the caller.
+    convert_zarr_to_parquet(src, out, file_period="year")
 
     assert ParquetIndexer(out).load().height == 40 * 2 * 2
 
 
-def test_invalid_time_resolution_raises(tmp_path):
+def test_invalid_file_period_raises(tmp_path):
     src = tmp_path / "store.zarr"
     _write_zarr(_make_ds(n_days=5), src)
 
     with pytest.raises(ValueError, match="(?i)period|month|year"):
-        convert_zarr_to_parquet(src, tmp_path / "parquet", time_resolution="monthly")
+        convert_zarr_to_parquet(src, tmp_path / "parquet", file_period="monthly")

@@ -13,7 +13,7 @@ from h2mare.downloader.cmems_downloader import (
     generate_copernicus_patterns,
 )
 from h2mare.models import AppConfig
-from h2mare.types import DateRange, DownloadTask, TimeResolution
+from h2mare.types import DateRange, DownloadTask, FilePeriod
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -277,7 +277,7 @@ class TestExecuteTask:
             patch.object(dl, "download_subset") as mock_subset,
             patch.object(dl, "_retry_call", **self._NO_RETRY),
         ):
-            dl._execute_task(task, TimeResolution.MONTH)
+            dl._execute_task(task, FilePeriod.MONTH)
 
         assert mock_subset.call_count == 3  # Jan, Feb, Mar
 
@@ -291,7 +291,7 @@ class TestExecuteTask:
             patch.object(dl_no_subset, "download_original") as mock_original,
             patch.object(dl_no_subset, "_retry_call", **self._NO_RETRY),
         ):
-            dl_no_subset._execute_task(task, TimeResolution.MONTH)
+            dl_no_subset._execute_task(task, FilePeriod.MONTH)
 
         mock_original.assert_called_once()
 
@@ -309,7 +309,7 @@ class TestExecuteTask:
             patch.object(dl, "_retry_call", **self._NO_RETRY),
         ):
             with pytest.raises(ConnectionError, match="API down"):
-                dl._execute_task(task, TimeResolution.MONTH)
+                dl._execute_task(task, FilePeriod.MONTH)
 
     def test_subset_true_passes_chunk_dates_to_download_subset(self, dl):
         task = DownloadTask(
@@ -321,7 +321,7 @@ class TestExecuteTask:
             patch.object(dl, "download_subset") as mock_subset,
             patch.object(dl, "_retry_call", **self._NO_RETRY),
         ):
-            dl._execute_task(task, TimeResolution.MONTH)
+            dl._execute_task(task, FilePeriod.MONTH)
 
         call_args = mock_subset.call_args
         assert call_args[0][0] == "cmems-rep-sst"

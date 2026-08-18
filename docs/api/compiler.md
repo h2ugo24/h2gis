@@ -18,7 +18,7 @@ Compiler(
     app_config=None,
     remote_store_root=None,
     local_store_root=None,
-    time_resolution=TimeResolution.YEAR,
+    file_period=FilePeriod.YEAR,
     date_format="year",
 )
 ```
@@ -29,7 +29,7 @@ Compiler(
 | `app_config` | settings | Override the application configuration |
 | `remote_store_root` | `STORE_ROOT` | Root directory where source Zarr stores live |
 | `local_store_root` | `ZARR_DIR` | Local copy destination for the compiled output |
-| `time_resolution` | `YEAR` | Output file granularity: `YEAR` or `MONTH` |
+| `file_period` | `YEAR` | Output file granularity: `YEAR` or `MONTH` |
 | `date_format` | `"year"` | Output filename date format: `"year"`, `"yearmonth"`, or `"date"` |
 
 ---

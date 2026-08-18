@@ -19,7 +19,7 @@ from loguru import logger
 from h2mare.config import AppConfig
 from h2mare.downloader.base import BaseDownloader
 from h2mare.storage import get_store_coverage, split_time_range
-from h2mare.types import BBox, DateLike, DateRange, TimeResolution
+from h2mare.types import BBox, DateLike, DateRange, FilePeriod
 from h2mare.utils.datetime_utils import normalize_date
 from h2mare.utils.labels import create_filename_label
 
@@ -57,7 +57,7 @@ class CDSDownloader(BaseDownloader):
         end_date: Optional[DateLike] = None,
         output_dir: Optional[Path] = None,
         dry_run: bool = False,
-        time_split: TimeResolution = TimeResolution.MONTH,
+        time_split: FilePeriod = FilePeriod.MONTH,
     ) -> bool:
         """
         Run download for specified date range.

@@ -1262,13 +1262,15 @@ class TestRepr:
         assert "time_step=hourly" in repr(_make_catalog(tmp_path, time_step="hourly"))
         assert "time_step=daily" in repr(_make_catalog(tmp_path))
 
-    def test_file_period_is_not_labelled_as_a_time_resolution(self, tmp_path):
+    def test_reports_the_file_period_beside_the_cadence(self, tmp_path):
         """
-        Two different facts, and 'time_resolution' reads as the wrong one: it
-        controls how the store is cut into files, not how far apart its steps
-        are. An hourly store written one file per year is both at once.
+        Two different facts, and either alone gets read as the other: how the
+        store is cut into files, versus how far apart its steps are. An hourly
+        store written one file per year is both at once, so both are shown.
         """
         text = repr(_make_catalog(tmp_path, time_step="hourly"))
 
         assert "file_period=year" in text
-        assert "time_resolution" not in text
+        assert "time_step=hourly" in text
+        # The word this field used to carry, and the reason it was renamed.
+        assert "resolution" not in text

@@ -21,9 +21,9 @@ from h2mare.storage.coverage import split_time_range
 from h2mare.storage.parquet_indexer import ParquetIndexer
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import chunk_dataset, snap_grid_coords
-from h2mare.types import DateLike, DateRange, TimeResolution
+from h2mare.types import DateLike, DateRange, FilePeriod
 from h2mare.utils.labels import create_label_from_dataset
-from h2mare.validators import validate_time_resolution
+from h2mare.validators import validate_file_period
 
 # Hive partition columns the store derives from the time column; they are
 # storage bookkeeping, not data variables, so they never become Zarr arrays.
@@ -37,7 +37,7 @@ def convert_parquet_to_zarr(
     name: str = "data",
     start_date: DateLike | None = None,
     end_date: DateLike | None = None,
-    time_resolution: TimeResolution | str = TimeResolution.MONTH,
+    file_period: FilePeriod | str = FilePeriod.MONTH,
     date_format: Literal["year", "date", "yearmonth"] = "year",
     variables: list[str] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
@@ -57,7 +57,7 @@ def convert_parquet_to_zarr(
 
     Output is split into per-period Zarr files matching the pipeline store
     layout. ``date_format`` controls the *file* granularity (one ``.zarr`` per
-    year by default); ``time_resolution`` controls how much is read and pivoted
+    year by default); ``file_period`` controls how much is read and pivoted
     *at once* (monthly by default, to bound memory). With the defaults each
     month is read, pivoted, and appended into its year's ``.zarr`` file.
 
@@ -70,8 +70,8 @@ def convert_parquet_to_zarr(
             resolution. It need **not** exist in config.
         start_date: Start of the window. Defaults to the store's first time step.
         end_date: End of the window. Defaults to the store's last time step.
-        time_resolution: Granularity of each read/pivot batch. Defaults to
-            ``TimeResolution.MONTH`` so a single batch fits in memory.
+        file_period: Granularity of each read/pivot batch. Defaults to
+            ``FilePeriod.MONTH`` so a single batch fits in memory.
         date_format: Output file granularity / filename date label — ``"year"``
             (one file per year), ``"yearmonth"`` (per month), or ``"date"``
             (explicit start–end range).
@@ -92,7 +92,7 @@ def convert_parquet_to_zarr(
         ValueError: If the Parquet store is empty, or ``start_date`` is after
             ``end_date``.
     """
-    time_resolution = validate_time_resolution(time_resolution)
+    file_period = validate_file_period(file_period)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -115,7 +115,7 @@ def convert_parquet_to_zarr(
             f"end_date ({window.end.date()})"
         )
 
-    periods = split_time_range(window, time_resolution)
+    periods = split_time_range(window, file_period)
     logger.info(
         f"Parquet → Zarr conversion: {window.start.date()} → {window.end.date()} "
         f"({len(periods)} chunk(s), name={name!r}) → {out_dir}"

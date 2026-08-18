@@ -13,7 +13,7 @@ import pandas as pd
 import xarray as xr
 from loguru import logger
 
-from h2mare.types import TimeResolution
+from h2mare.types import FilePeriod
 from h2mare.utils.datetime_utils import end_of_day
 
 
@@ -55,12 +55,12 @@ class ZarrDirectoryScanner:
     def __init__(
         self,
         store_root: Path,
-        time_resolution: TimeResolution,
+        file_period: FilePeriod,
         var_config: "KeyVarConfigEntry",
         verbose: bool = False,
     ) -> None:
         self.store_root = store_root
-        self.time_resolution = time_resolution
+        self.file_period = file_period
         self.var_config = var_config
         self.verbose = verbose
         self._cached_state: Optional[DirectoryState] = None
@@ -227,7 +227,7 @@ class ZarrDirectoryScanner:
 
             period_value = (
                 time_min.year
-                if self.time_resolution == TimeResolution.YEAR
+                if self.file_period == FilePeriod.YEAR
                 else f"{time_min.year}-{time_min.month:02d}"
             )
 
