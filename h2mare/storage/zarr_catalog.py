@@ -18,6 +18,7 @@ import xarray as xr
 from loguru import logger
 
 from h2mare.config import AppConfig, get_settings
+from h2mare.models import TimeStep
 from h2mare.storage.zarr_index import ZarrIndex, _variables_list
 from h2mare.storage.zarr_reader import ZarrReader
 from h2mare.types import BBox, DateLike, DateRange, TimeResolution
@@ -108,10 +109,19 @@ class ZarrCatalog:
 
         bbox = self.get_bbox()
 
+        # Two different facts, and either one alone gets read as the other:
+        # how far apart the data's steps are, versus how the store is cut into
+        # files. An hourly store written one file per year is legitimately
+        # "hourly" and "year" at once. `file_period` names the second for what
+        # it is — the attribute behind it is `time_resolution`, whose name has
+        # always oversold what it controls.
+        step = getattr(self.var_config, "time_step", TimeStep.DAILY)
+
         return (
             f"ZarrCatalog(\n"
             f"  var_key={self.var_key},\n"
-            f"  time_resolution={self.time_resolution.value},\n"
+            f"  time_step={step.value},\n"
+            f"  file_period={self.time_resolution.value},\n"
             f"  files={df['path'].nunique() if not df.empty else 0},\n"
             f"  coverage={time_str},\n"
             f"  bbox={bbox.to_label() if bbox is not None else None},\n"

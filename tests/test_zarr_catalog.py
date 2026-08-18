@@ -1250,3 +1250,25 @@ class TestGetNonnullDays:
 
         assert pd.Timestamp("2020-01-10") in out["sst"]
         assert len(out["sst"]) == 10
+
+
+# ---------------------------------------------------------------------------
+# __repr__
+# ---------------------------------------------------------------------------
+
+
+class TestRepr:
+    def test_states_the_data_cadence(self, tmp_path):
+        assert "time_step=hourly" in repr(_make_catalog(tmp_path, time_step="hourly"))
+        assert "time_step=daily" in repr(_make_catalog(tmp_path))
+
+    def test_file_period_is_not_labelled_as_a_time_resolution(self, tmp_path):
+        """
+        Two different facts, and 'time_resolution' reads as the wrong one: it
+        controls how the store is cut into files, not how far apart its steps
+        are. An hourly store written one file per year is both at once.
+        """
+        text = repr(_make_catalog(tmp_path, time_step="hourly"))
+
+        assert "file_period=year" in text
+        assert "time_resolution" not in text
