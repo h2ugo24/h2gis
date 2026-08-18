@@ -25,6 +25,7 @@ from h2mare.storage.provenance import (
     merge_records,
     read_source_datasets,
     records_for_window,
+    refresh_root_attrs,
     write_compiled_provenance,
     write_provenance_for_window,
 )
@@ -456,3 +457,52 @@ class TestWriteCompiledProvenance:
 
         got = _read_compiled(path)["ssh"]
         assert [r["dataset_type"] for r in got] == ["rep", "nrt"]
+
+
+class TestRefreshRootAttrs:
+    """
+    Root attributes must come from config, not from whatever the file was first
+    created with. xr.concat keeps the first dataset's attrs, so an append leaves
+    the existing globals in place — h2ds advertised a products ID block for a
+    fortnight after the key was deleted from config.
+    """
+
+    def test_a_key_removed_from_config_is_removed_from_the_store(self, tmp_path):
+        path = _write_zarr(tmp_path)
+        zarr.open_group(str(path), mode="r+").attrs.put(
+            {"title": "old", "products ID": {"sst": "stale"}}
+        )
+
+        refresh_root_attrs(path, {"title": "new"})
+
+        got = dict(zarr.open_group(str(path), mode="r").attrs)
+        assert "products ID" not in got, "updating alone would leave it forever"
+        assert got["title"] == "new"
+
+    def test_a_stale_value_is_corrected(self, tmp_path):
+        path = _write_zarr(tmp_path)
+        zarr.open_group(str(path), mode="r+").attrs.put({"source": "typo"})
+
+        refresh_root_attrs(path, {"source": "corrected"})
+
+        assert dict(zarr.open_group(str(path), mode="r").attrs)["source"] == "corrected"
+
+    def test_provenance_survives_the_refresh(self, tmp_path):
+        """It is written by the pipeline and has no counterpart in config."""
+        path = _write_zarr(tmp_path)
+        write_compiled_provenance(
+            path, {"sst": [_rec("sst-rep", "rep", "2020-01-01", "2020-01-05")]}
+        )
+
+        refresh_root_attrs(path, {"title": "h2ds"})
+
+        got = dict(zarr.open_group(str(path), mode="r").attrs)
+        assert COMPILED_PROVENANCE_ATTR in got, "a refresh erased the provenance"
+        assert json.loads(got[COMPILED_PROVENANCE_ATTR])["sst"][0]["dataset_id"] == (
+            "sst-rep"
+        )
+        assert got["title"] == "h2ds"
+
+    def test_returns_what_it_wrote(self, tmp_path):
+        path = _write_zarr(tmp_path)
+        assert refresh_root_attrs(path, {"title": "h2ds"}) == {"title": "h2ds"}
