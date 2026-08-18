@@ -197,6 +197,21 @@ def _slabs(date_range: DateRange, days: int) -> list[DateRange]:
     return out
 
 
+def _covered_range(ds: xr.Dataset, date_range: DateRange) -> DateRange | None:
+    """
+    The part of *date_range* the opened store actually has days for.
+
+    ``None`` when the two do not overlap at all, which is a variable whose
+    store ends before the window opens rather than an error.
+    """
+    times = pd.DatetimeIndex(ds.time.values)
+    if len(times) == 0:
+        return None
+    start = max(pd.Timestamp(date_range.start), times.min().normalize())
+    end = min(pd.Timestamp(date_range.end), times.max().normalize())
+    return DateRange(start, end) if start <= end else None
+
+
 def _reduce_hourly_in_slabs(
     catalog: ZarrCatalog | None,
     var_key: str,
@@ -227,13 +242,39 @@ def _reduce_hourly_in_slabs(
     if ds is None:
         return None
 
+    # Slabs must tile what the store holds, not what was asked for. Each CDS
+    # variable lags its provider by a different amount — accum and waves run a
+    # month ahead of instante and radiation — so a compile window reaching
+    # today outruns whichever store is furthest behind. A slab past the last
+    # stamp selects nothing, and a reducer with no warm-up then resamples an
+    # empty axis and raises, taking the whole compile with it. atm-accum-avg
+    # only ever survived that by accident: its 20-day ekman warm-up widens the
+    # read backwards, so the slice stayed non-empty where atm-instante's did not.
+    covered = _covered_range(ds, date_range)
+    if covered is None:
+        logger.warning(
+            f"[{var_key}] store holds nothing within {date_range} — skipping. "
+            "Ordinary provider lag at the tail; the variable catches up on the "
+            "next compile."
+        )
+        return None
+    if covered != date_range:
+        logger.info(f"[{var_key}] reducing {covered}, the part the store covers")
+
     days = _slab_days(ds)
-    slabs = _slabs(date_range, days)
+    slabs = _slabs(covered, days)
     logger.debug(
         f"[{var_key}] hourly reduction in {len(slabs)} slab(s) of up to {days} day(s)"
     )
 
-    parts = [reduce_slab(ds, slab) for slab in slabs]
+    # An interior hole can still leave a slab with nothing in it, which clipping
+    # the ends cannot see. Skipping costs a coordinate read and keeps the same
+    # empty-resample crash from coming back by another route.
+    parts = [
+        reduce_slab(ds, slab)
+        for slab in slabs
+        if ds.sel(time=slice(slab.start, _end_of_day(slab.end))).sizes.get("time", 0)
+    ]
     if not parts:
         return None
     if len(parts) == 1:
