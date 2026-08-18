@@ -52,7 +52,7 @@ either on an existing variable means re-converting it.
 | `filename_date_range` | no | Set to `true` when the `pattern` captures a `(start, end)` date range (e.g. CMEMS/CDS files named `2021-01-01-2021-01-31.nc`). A **one-day** request is named with a single date instead (`2026-07-31.nc`), so make the second group optional and it will be read as that one day — without this a single-day repair download matches nothing and is discarded. Leave `false` (default) when the pattern yields a single date (e.g. AVISO FSLE: `_20210115_`). Controls how `Netcdf2Zarr` expands filenames into daily time steps. |
 | `known_gaps` | no | Days the provider never published, so they can never be downloaded, converted or backfilled. Each entry is a date (`2025-06-02`) or a closed interval (`2025-06-02/2025-06-05`). Excluded from the gap checks and from `h2mare audit`, which reports how many were suppressed. Needed because a source shipping one file per day leaves an *axis* hole when it skips one — AVISO has no `fsle` file for 2025-06-02 and its remote listing jumps `20250601` → `20250603` — which is otherwise indistinguishable from data the pipeline lost. Only for gaps confirmed absent at the source; anything else is a defect and belongs fixed, not listed. |
 | `time_step` | no | Cadence of this variable's own Zarr: `daily` (default) or `hourly`. An hourly store keeps the source's native axis and moves the daily reduction to compile time, so h2ds stays daily either way. Distinct from `time_resolution`, which chooses the *file* period (one Zarr per year or per month) — a store can be hourly and still written one file per year. The gap checks read this so they compare a store against a calendar at its own resolution; a daily grid cannot see a missing hour, and an hourly grid over a daily store would report 23 phantom gaps a day. Flipping it on an existing store requires re-converting: the store is written at one cadence and the check expects the other, which fails the write verification rather than corrupting anything. |
-| `store_dtype` | no | On-disk encoding: `float32` (default, byte-identical to what the pipeline has always written) or `int16`, which stores scale/offset-packed integers at roughly two thirds the size. Safe for ERA5, whose GRIB is already ~16-bit packed, so the packing discards quantisation noise rather than signal. The scale spans each variable's own measured range, so the encoding step makes one pass over the data before the first byte is written — expect a silent minutes-long pause on a large store. Applied only when a store is **created**; appends inherit whatever encoding the store already has, so changing this on an existing store does nothing until it is re-converted. |
+| `store_dtype` | no | On-disk encoding: `float32` (default, byte-identical to what the pipeline has always written) or `int16`, which stores scale/offset-packed integers at roughly two thirds the size. Safe for ERA5, whose GRIB is already ~16-bit packed, so the packing discards quantisation noise rather than signal. The scale spans each variable's own measured range, so the encoding step makes one pass over the data before the first byte is written — expect a silent minutes-long pause on a large store. Applied only when a store is **created**; appends inherit whatever encoding the store already has, so changing this on an existing store does nothing until it is re-converted. Safe for some variables and not others — see [Choosing `store_dtype`](#choosing-store_dtype). |
 | `expect_contiguous_time` | no | Whether this product publishes an unbroken time axis at its own cadence (see `time_step`). `true` (default) lets the convert step reject a Zarr whose axis skips a step inside the range it just wrote. Set `false` only for a source that legitimately publishes an irregular axis. Distinct from `known_gaps`, which suppresses named days on an otherwise contiguous axis, and from `time_step`, which asks how finely the axis is sampled rather than whether it may skip. |
 | `raw_include` | no | Regex matched (via `re.search`) against each raw filename; only matching files are converted. Use when a download directory holds files the pipeline must not read — AVISO ships META3.2 eddy trajectories as `long`/`short`/`untracked` variants side by side, and only the long ones belong in the store (the `untracked` files carry no `track` variable at all). Omit (default) to convert every file the date `pattern` matches. |
 | `bbox` | no | Bounding box for subset. If omitted, the full available extent is downloaded |
@@ -64,6 +64,48 @@ either on an existing variable means re-converting it.
 | `extract_depth_slices` | no | Depth levels (metres) to extract when slicing a 3-D variable during `Extractor` runs. Each level becomes a separate output column (e.g. `[0, 100, 500]` → `o2_0`, `o2_100`, `o2_500`). **Applies only to variables with a `depth` dimension** (`thetao`, `o2`); omit for every 2-D variable, including static fields such as `bathy` whose hires file is used for geometry extraction but which carry no depth axis. |
 | `compile_depth_slices` | no | Depth levels (metres) to select when compiling a 3-D variable into h2ds. Each level becomes a separate output variable (e.g. `[0, 100, 500, 1000]` → `o2_0`, `o2_100`, `o2_500`, `o2_1000`). Same 3-D-only rule as `extract_depth_slices`; can differ from it. |
 | `compiled_vars` | no | Exact variable names as they appear in the compiled h2ds Zarr for this var_key, accounting for any renames or derived variables produced during the Convert step (e.g. `sst` → `[sst, analysis_error, sst_std, sst_fdist]`). Used by `h2mare parquet --add-var` to select only the relevant columns from the h2ds Zarr without the caller needing to know internal variable names. |
+
+### Choosing `store_dtype`
+
+`int16` packs each variable over 65,000 levels spanning its own measured
+min→max, for roughly two thirds the size of `float32`. Nothing validates the
+choice, so it is worth knowing when it is free and when it costs.
+
+**It is near-free where the source was already packed at similar precision, and
+adds real error where the pipeline computed the value itself.** ERA5's GRIB is
+already ~16-bit packed, which is why the CDS variables use it — the packing
+reproduces quantisation the data already carried. Several CMEMS products ship
+int16-packed netCDF too, recognisable by a `valid_min`/`valid_max` pair that is
+plainly an integer range rather than a physical one (`thetao`:
+`[-32766, 21306]` "degrees_C"; `analysis_error`: `[0, 32767]` "kelvin").
+Anything h2mare derives in float32 has no such floor to hide under.
+
+The cost also depends on the *distribution*, not the source. The scale spans
+min→max, so a long tail spends the levels where the data is not:
+
+| variable | step vs median | why |
+|---|---|---|
+| `adt`, `sst`, `ac_speedrad_km` | <0.01% | bounded and roughly symmetric |
+| `sst_std` | 0.17% | derived, small values |
+| `fsle_max`, `chl` | 0.5–0.6% | log-distributed; `chl` median 0.16 against max 65 |
+| `gke` | **1.5%** | squared quantity — median 0.004 against max 4.2 |
+
+**Never for identity or index fields.** The eddy trajectory ids span a range
+wider than 65,000 (`ac_track`: `[176122, 242079]`, giving a step of 1.01;
+`c_track`: 1.24), so packing them collapses distinct eddies onto the same value
+— a loss of identity, not of precision.
+
+!!! warning "`store_dtype` is ignored for `trajectory_format` variables"
+
+    The trajectory path (`eddies`) writes its Zarr without consulting the
+    encoding, so setting `store_dtype: int16` there is accepted by config and
+    silently has no effect. Given what packing would do to the track ids, the
+    no-op is the safer outcome — but do not read the setting as evidence that
+    the store is packed.
+
+Reasonable candidates are the bounded, already-packed fields: `sst`, `thetao`,
+`o2`, `mld`, `adt`. Leave `chl`, `gke` and the other derived variables on
+`float32`.
 
 ### Validation
 
