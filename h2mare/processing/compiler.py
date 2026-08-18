@@ -24,6 +24,7 @@ from h2mare.storage.coverage import (
 )
 from h2mare.storage.provenance import (
     collect_source_datasets,
+    refresh_root_attrs,
     write_compiled_provenance,
 )
 from h2mare.storage.recovery import recover_zarr_store
@@ -249,6 +250,11 @@ class Compiler:
             )
             write_append_zarr(self.var_key, ds_final, path)
             written_paths.append(path)
+
+            try:
+                refresh_root_attrs(path, get_settings().global_attrs)
+            except Exception as e:
+                logger.warning(f"Could not refresh root attrs on {path.name}: {e}")
 
             if provenance:
                 try:

@@ -366,3 +366,33 @@ def write_compiled_provenance(
 
     root.attrs[COMPILED_PROVENANCE_ATTR] = json.dumps(combined, sort_keys=True)
     return combined
+
+
+#: Root attributes a refresh must carry across rather than overwrite, because
+#: they are written by the pipeline itself and have no counterpart in config.
+_DERIVED_ROOT_ATTRS = (COMPILED_PROVENANCE_ATTR,)
+
+
+def refresh_root_attrs(zarr_path: Path, global_attrs: dict) -> dict:
+    """
+    Make a store's root attributes match config rather than its own history.
+
+    ``xr.concat`` keeps the first dataset's attributes, so appending to an
+    existing store preserves whatever globals it was created with and a config
+    change never reaches it. h2ds went on advertising a ``products ID`` block
+    for a fortnight after that key was deleted from config — still holding two
+    dataset ids that had since been corrected — because no compile ever rewrote
+    the root.
+
+    Replaces rather than updates, so a key removed from config is removed here
+    too; updating alone would have left ``products ID`` in place forever.
+    Attributes the pipeline derives rather than reads from config are carried
+    across.
+    """
+    import zarr
+
+    root = zarr.open_group(str(zarr_path), mode="r+")
+    preserved = {k: root.attrs[k] for k in _DERIVED_ROOT_ATTRS if k in root.attrs}
+    merged = {**global_attrs, **preserved}
+    root.attrs.put(merged)
+    return merged
