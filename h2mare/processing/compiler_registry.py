@@ -244,6 +244,22 @@ def _reduce_hourly_in_slabs(
     return xr.concat(parts, dim="time", join="exact")
 
 
+def _daily_mean_for_slab(ds_hourly: xr.Dataset, slab: DateRange) -> xr.Dataset:
+    """
+    Reduce one slab of any hourly store to daily means, materialised.
+
+    The generic counterpart to the per-variable reducers below: no warm-up, no
+    derived fields, no unit conversion — every variable in the slab is averaged
+    over its own day. Used by ``compile_default`` for hourly variables with no
+    processor of their own, and by any registered processor whose reduction is
+    the same plain mean.
+    """
+    from h2mare.processing.core.cds import resample_daily_mean
+
+    sub = ds_hourly.sel(time=slice(slab.start, _end_of_day(slab.end)))
+    return resample_daily_mean(sub).compute()
+
+
 def _daily_features_for_slab(ds_hourly: xr.Dataset, slab: DateRange) -> xr.Dataset:
     """
     Reduce one slab of hourly source to its daily features, materialised.
@@ -388,48 +404,11 @@ def _compile_atm_instante(
     return ds.interp_like(compiler.base_grid, method="linear", assume_sorted=True)
 
 
-def _daily_radiation_for_slab(ds_hourly: xr.Dataset, slab: DateRange) -> xr.Dataset:
-    """
-    Reduce one slab of hourly radiation to daily means, materialised.
-
-    No warm-up and no unit conversion: the store already holds W/m², so the
-    daily value is a plain mean over the day's own hours.
-    """
-    from h2mare.processing.core.cds import resample_daily_mean
-
-    sub = ds_hourly.sel(time=slice(slab.start, _end_of_day(slab.end)))
-    return resample_daily_mean(sub).compute()
-
-
-def _compile_radiation(
-    compiler: Compiler,
-    catalog: ZarrCatalog | None,
-    date_range: DateRange,
-) -> xr.Dataset | None:
-    """
-    h2ds stays daily whatever cadence the radiation store is kept at.
-
-    Both cadences convert J/m²→W/m² at convert time, so an hourly store needs
-    only the daily mean here and a daily store needs nothing — the same h2ds
-    columns, in the same units, either way.
-    """
-    # .get, not [...]: step_freq already treats a missing entry as daily, which
-    # keeps stand-in configs on the path every existing store actually uses.
-    var_config = compiler.app_config.variables.get("radiation")
-    if step_freq(var_config) == "h":
-        ds = _reduce_hourly_in_slabs(
-            catalog,
-            "radiation",
-            compiler.var_config.bbox,
-            date_range,
-            # Indirect so monkeypatching the module attribute still takes effect.
-            lambda hourly, slab: _daily_radiation_for_slab(hourly, slab),
-        )
-    else:
-        ds = _open_or_warn(catalog, "radiation", date_range, compiler.var_config.bbox)
-    if ds is None:
-        return None
-    return ds.interp_like(compiler.base_grid, method="linear", assume_sorted=True)
+#: radiation has no entry here on purpose. Both cadences settle their units at
+#: convert time (J/m²→W/m²), so all compile owes is a daily mean for an hourly
+#: store and nothing for a daily one — which is precisely ``compile_default``.
+#: Its processor was a byte-identical copy of it and was removed rather than
+#: kept in sync by hand.
 
 
 def _compile_waves(
@@ -492,23 +471,49 @@ def compile_default(
     catalog: ZarrCatalog | None,
     date_range: DateRange,
 ) -> xr.Dataset | None:
-    """Fallback processor: open from catalog and interpolate to the base grid."""
-    from loguru import logger
+    """
+    Fallback processor: open from catalog, reduce an hourly store to daily, and
+    interpolate to the base grid.
 
+    h2ds is daily whatever cadence its sources are kept at, and the compiler
+    merges the per-variable results with an outer join. An hourly store handed
+    over unreduced would therefore not fail — it would union its stamps into the
+    axis, turning every day of h2ds into 24 rows with the daily variables null
+    in 23 of them. Reducing here is what keeps ``time_step: hourly`` a property
+    of the source store alone, and what lets an hourly variable be added by
+    config without also writing a processor for it.
+
+    The reduction is a daily mean, which is what an instantaneous field wants —
+    temperature, currents, sea level, the hourly products CMEMS publishes. An
+    accumulated variable (precipitation, radiation totals) needs its own
+    ``COMPILE_PROCESSORS`` entry instead: a mean of hourly accumulations is a
+    plausible-looking number rather than an error, so the reduction applied is
+    logged rather than left to be inferred.
+    """
     if catalog is None:
         return None
 
-    try:
-        ds = catalog.open_dataset(
-            start_date=date_range.start,
-            end_date=date_range.end,
-            bbox=compiler.var_config.bbox,
+    var_key = catalog.var_key
+    bbox = compiler.var_config.bbox
+
+    # .get, not [...]: step_freq already treats a missing entry as daily, which
+    # keeps stand-in configs on the path every existing store actually uses.
+    if step_freq(compiler.app_config.variables.get(var_key)) == "h":
+        from loguru import logger
+
+        logger.info(f"[{var_key}] hourly store — reducing to daily mean for h2ds")
+        ds = _reduce_hourly_in_slabs(
+            catalog,
+            var_key,
+            bbox,
+            date_range,
+            # Indirect so monkeypatching the module attribute still takes effect.
+            lambda hourly, slab: _daily_mean_for_slab(hourly, slab),
         )
-    except FileNotFoundError:
-        logger.warning(
-            f"No data during "
-            f"{date_range.start.date()}–{date_range.end.date()} — skipping."
-        )
+    else:
+        ds = _open_or_warn(catalog, var_key, date_range, bbox)
+
+    if ds is None:
         return None
     return ds.interp_like(compiler.base_grid, method="linear", assume_sorted=True)
 
@@ -524,7 +529,6 @@ COMPILE_PROCESSORS: dict[str, CompileProcessor] = {
     "thetao": _compile_depth_var,
     "atm-accum-avg": _compile_atm_accum_avg,
     "atm-instante": _compile_atm_instante,
-    "radiation": _compile_radiation,
     "sst": _compile_sst,
     "waves": _compile_waves,
 }

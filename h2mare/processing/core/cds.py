@@ -845,9 +845,10 @@ def process_radiation(
     adjacent days in monthly grib files.
 
     With ``time_step: hourly`` the daily mean is skipped here and happens at
-    compile instead (see ``compiler_registry._compile_radiation``), so the store
-    keeps ERA5's native hourly axis while h2ds stays daily. Both cadences share
-    the J/m²→W/m² conversion, so they publish the same units.
+    compile instead (see ``compiler_registry.compile_default``, which reduces
+    any hourly store it is handed), so the store keeps ERA5's native hourly axis
+    while h2ds stays daily. Both cadences share the J/m²→W/m² conversion, so
+    they publish the same units.
     """
     build = store_hourly_radiation if step_freq(var_config) == "h" else daily_radiation
     datasets = [build(ds[var]).sortby("time") for var in ds.data_vars]

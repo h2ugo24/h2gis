@@ -577,7 +577,7 @@ class TestAtmInstanteSlabbing:
 
 
 # ---------------------------------------------------------------------------
-# _compile_radiation
+# radiation through compile_default (it has no processor of its own)
 # ---------------------------------------------------------------------------
 
 
@@ -604,8 +604,21 @@ def _hourly_radiation_compiler(tmp_path) -> MagicMock:
     return compiler
 
 
+def _radiation_catalog(ds: xr.Dataset | None = None) -> MagicMock:
+    catalog = _make_catalog(ds)
+    catalog.var_key = "radiation"
+    return catalog
+
+
 class TestCompileRadiationHourly:
-    """An hourly store needs only the daily mean — the units were settled at convert."""
+    """
+    An hourly store needs only the daily mean — the units were settled at
+    convert. That is exactly what ``compile_default`` does, so radiation is
+    deliberately unregistered and these exercise it through the default.
+    """
+
+    def test_not_registered_so_it_rides_the_default(self):
+        assert "radiation" not in COMPILE_PROCESSORS
 
     def test_hourly_config_dispatches_to_the_hourly_path(self, tmp_path, monkeypatch):
         called = {}
@@ -617,8 +630,8 @@ class TestCompileRadiationHourly:
 
         monkeypatch.setattr(compiler_registry, "_reduce_hourly_in_slabs", _spy)
 
-        compiler_registry._compile_radiation(
-            _hourly_radiation_compiler(tmp_path), _make_catalog(None), _DR
+        compile_default(
+            _hourly_radiation_compiler(tmp_path), _radiation_catalog(None), _DR
         )
 
         assert called.get("var_key") == "radiation"
@@ -636,12 +649,12 @@ class TestCompileRadiationHourly:
             "radiation": SimpleNamespace(time_step=TimeStep.DAILY)
         }
 
-        compiler_registry._compile_radiation(compiler, _make_catalog(None), _DR)
+        compile_default(compiler, _radiation_catalog(None), _DR)
 
     def test_hourly_store_yields_daily_columns_unchanged_in_units(self, tmp_path):
         ds = _fake_hourly_radiation("2020-01-01", "2020-01-03")
-        out = compiler_registry._compile_radiation(
-            _hourly_radiation_compiler(tmp_path), _make_catalog(ds), _DR
+        out = compile_default(
+            _hourly_radiation_compiler(tmp_path), _radiation_catalog(ds), _DR
         )
 
         assert out is not None
@@ -652,8 +665,8 @@ class TestCompileRadiationHourly:
         np.testing.assert_allclose(out["slhf"].values, -100.0, rtol=1e-5)
 
     def test_returns_none_when_data_missing(self, tmp_path):
-        result = compiler_registry._compile_radiation(
-            _hourly_radiation_compiler(tmp_path), _make_catalog(None), _DR
+        result = compile_default(
+            _hourly_radiation_compiler(tmp_path), _radiation_catalog(None), _DR
         )
         assert result is None
 
@@ -662,8 +675,8 @@ class TestCompileRadiationHourly:
         ds = _fake_hourly_radiation("2020-01-01", "2020-01-03")
         ds["ssrd"].loc[{"time": slice("2020-01-03 01:00", None)}] = 800.0
 
-        out = compiler_registry._compile_radiation(
-            _hourly_radiation_compiler(tmp_path), _make_catalog(ds), _DR
+        out = compile_default(
+            _hourly_radiation_compiler(tmp_path), _radiation_catalog(ds), _DR
         )
 
         assert out is not None
@@ -743,6 +756,75 @@ class TestCompileDefault:
         catalog = _make_catalog(_daily_ds("ssh", _DATES))
         result = compile_default(compiler, catalog, _DR)
         assert isinstance(result, xr.Dataset)
+
+
+class TestCompileDefaultHourly:
+    """
+    An unregistered hourly variable must still reach h2ds on the daily axis.
+    Handed over unreduced it would not fail — the compiler's outer join would
+    union 24 stamps into every day, leaving the daily variables null in 23.
+    """
+
+    @staticmethod
+    def _setup(tmp_path, ds, *, time_step):
+        compiler = _make_compiler(tmp_path)
+        compiler.app_config.variables["newvar"] = SimpleNamespace(time_step=time_step)
+        catalog = _make_catalog(ds)
+        catalog.var_key = "newvar"
+        return compiler, catalog
+
+    def test_hourly_store_is_reduced_to_a_daily_axis(self, tmp_path):
+        compiler, catalog = self._setup(
+            tmp_path,
+            _fake_hourly("2020-01-01", "2020-01-03"),
+            time_step=TimeStep.HOURLY,
+        )
+
+        result = compile_default(compiler, catalog, _DR)
+
+        assert result is not None
+        assert list(pd.DatetimeIndex(result.time.values)) == list(_DATES)
+
+    def test_reduction_is_a_mean_over_the_whole_day(self, tmp_path):
+        """Every hour of the day must contribute — a midnight-stamped slab end
+        would average the single 00:00 step instead of all 24."""
+        ds = _fake_hourly("2020-01-01", "2020-01-01")
+        # Hour-of-day as the value: the day's mean is 11.5, its first step 0.
+        ds["v0"][:] = np.arange(24, dtype="float32")[:, None, None]
+        compiler, catalog = self._setup(tmp_path, ds, time_step=TimeStep.HOURLY)
+
+        result = compile_default(
+            compiler, catalog, DateRange("2020-01-01", "2020-01-01")
+        )
+
+        assert result is not None
+        assert float(result["v0"].isel(time=0).mean()) == pytest.approx(11.5)
+
+    def test_daily_store_keeps_the_unreduced_path(self, tmp_path):
+        compiler, catalog = self._setup(
+            tmp_path, _daily_ds("newvar", _DATES), time_step=TimeStep.DAILY
+        )
+
+        result = compile_default(compiler, catalog, _DR)
+
+        assert result is not None
+        assert list(pd.DatetimeIndex(result.time.values)) == list(_DATES)
+        # One plain read, not the slabbed hourly path.
+        catalog.open_dataset.assert_called_once_with(
+            start_date=_DR.start, end_date=_DR.end, bbox=compiler.var_config.bbox
+        )
+
+    def test_var_key_absent_from_config_is_treated_as_daily(self, tmp_path):
+        """A stand-in config without the entry must keep the path every existing
+        store uses, rather than reducing an axis that is already daily."""
+        compiler = _make_compiler(tmp_path)
+        catalog = _make_catalog(_daily_ds("newvar", _DATES))
+        catalog.var_key = "not-in-config"
+
+        result = compile_default(compiler, catalog, _DR)
+
+        assert result is not None
+        assert list(pd.DatetimeIndex(result.time.values)) == list(_DATES)
 
 
 # ---------------------------------------------------------------------------
