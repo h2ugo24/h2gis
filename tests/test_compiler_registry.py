@@ -972,6 +972,90 @@ class TestSlabs:
         assert compiler_registry._slabs(dr, 10**12) == [dr]
 
 
+class TestSlabsAgainstStoreCoverage:
+    """
+    A compile window routinely outruns an hourly store: the CDS variables lag
+    their provider by different amounts, so a range ending today reaches past
+    whichever one is furthest behind. Slabs past the last stamp select nothing,
+    and a reducer with no warm-up resamples an empty axis and raises — which is
+    how one lagging variable took a whole 29-chunk compile down with it.
+    """
+
+    @staticmethod
+    def _short_slabs(monkeypatch, ds, days: int = 5):
+        cells = ds.sizes["lat"] * ds.sizes["lon"]
+        per_day = cells * ds["v0"].dtype.itemsize * 24
+        monkeypatch.setattr(
+            compiler_registry, "_SLAB_SOURCE_BUDGET_BYTES", per_day * days
+        )
+
+    def test_a_range_past_the_end_of_the_store_still_reduces(self, monkeypatch):
+        """The reducer is the real one, so an empty slab would raise as it did."""
+        ds = _fake_hourly("2020-01-01", "2020-01-10")
+        self._short_slabs(monkeypatch, ds)
+
+        out = compiler_registry._reduce_hourly_in_slabs(
+            _make_catalog(ds),
+            "lagging-var",
+            None,
+            DateRange("2020-01-01", "2020-01-31"),
+            compiler_registry._daily_mean_for_slab,
+        )
+
+        assert out is not None
+        assert len(out.time) == 10, "only the days the store holds"
+
+    def test_a_range_starting_before_the_store_still_reduces(self, monkeypatch):
+        ds = _fake_hourly("2020-01-20", "2020-01-31")
+        self._short_slabs(monkeypatch, ds)
+
+        out = compiler_registry._reduce_hourly_in_slabs(
+            _make_catalog(ds),
+            "late-starting-var",
+            None,
+            DateRange("2020-01-01", "2020-01-31"),
+            compiler_registry._daily_mean_for_slab,
+        )
+
+        assert out is not None
+        assert len(out.time) == 12
+
+    def test_no_overlap_at_all_returns_none(self):
+        ds = _fake_hourly("2020-01-01", "2020-01-10")
+
+        out = compiler_registry._reduce_hourly_in_slabs(
+            _make_catalog(ds),
+            "stale-var",
+            None,
+            DateRange("2021-01-01", "2021-01-31"),
+            compiler_registry._daily_mean_for_slab,
+        )
+
+        assert out is None
+
+    def test_the_reducer_never_sees_an_empty_slab(self, monkeypatch):
+        ds = _fake_hourly("2020-01-01", "2020-01-10")
+        self._short_slabs(monkeypatch, ds)
+        seen: list[int] = []
+
+        def _record(hourly, slab):
+            sub = hourly.sel(
+                time=slice(slab.start, compiler_registry._end_of_day(slab.end))
+            )
+            seen.append(sub.sizes.get("time", 0))
+            return compiler_registry._daily_mean_for_slab(hourly, slab)
+
+        compiler_registry._reduce_hourly_in_slabs(
+            _make_catalog(ds),
+            "lagging-var",
+            None,
+            DateRange("2020-01-01", "2020-01-31"),
+            _record,
+        )
+
+        assert seen and all(n > 0 for n in seen)
+
+
 class TestSlabDays:
     def test_derived_from_data_volume_not_machine(self, monkeypatch):
         ds = _fake_hourly("2020-01-01", "2020-01-31")
