@@ -21,6 +21,7 @@ from h2mare.storage.audit import (
     format_date_blocks,
     interior_gaps,
 )
+from h2mare.types import DateRange
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -230,6 +231,38 @@ class TestCheckSliceHealth:
             coords={"lat": [30.0, 35.0, 40.0], "lon": [-10.0, -5.0, 0.0]},
         )
         assert check_slice_health(ds) == []
+
+    def test_window_end_covers_a_noon_stamped_last_day(self):
+        """
+        The window bound is a date; the store's stamps need not be midnight.
+        Sliced to the bound verbatim, the last day falls outside the scan and
+        its emptiness is never seen — the worst outcome for a check, which is
+        to report a bad day clean.
+        """
+        noon = pd.DatetimeIndex(_JAN) + pd.Timedelta(hours=12)
+        last = noon[-1]
+
+        issues = check_slice_health(
+            _ds(noon, null_days=[last]),
+            window=DateRange(pd.Timestamp(noon[0]).normalize(), last.normalize()),
+        )
+
+        assert [(k, d) for _, d, k, _ in issues] == [("empty", last.normalize())]
+
+    def test_window_end_covers_every_hour_of_an_hourly_last_day(self):
+        """Same bound, hourly store: 23 of the last day's steps sit after it."""
+        hours = pd.date_range("2020-01-01", "2020-01-03 23:00", freq="h")
+        empty = hours[hours.normalize() == pd.Timestamp("2020-01-03")]
+
+        issues = check_slice_health(
+            _ds(hours, null_days=empty),
+            window=DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-03")),
+        )
+
+        # One per hourly step, all on the last day — none of which a midnight
+        # bound would have reached beyond 00:00.
+        assert len(issues) == 24
+        assert {d for _, d, _, _ in issues} == {pd.Timestamp("2020-01-03")}
 
 
 # ---------------------------------------------------------------------------

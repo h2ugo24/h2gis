@@ -213,6 +213,43 @@ class TestDatasetColumn:
         assert rows[1]["dataset"] == "NRT_ID"
         assert rows[0]["end_date"] < rows[1]["start_date"]
 
+    def test_per_source_timestep_count_covers_a_noon_stamped_last_day(self, tmp_path):
+        """
+        Each source's num_timesteps is counted between two normalized dates, so
+        a midnight upper bound misses whatever the last day of that span holds:
+        its single noon stamp here, 23 of 24 steps on an hourly store. The
+        counts must still add up to the store.
+        """
+        import zarr
+
+        ds = _make_ds("2023-01-01", n_days=10)
+        ds = ds.assign_coords(time=ds.time.to_index() + pd.Timedelta(hours=12))
+        zarr_path = _write_zarr(tmp_path, ds)
+        root = zarr.open_group(str(zarr_path), mode="r+")
+        root.attrs["source_datasets"] = json.dumps(
+            [
+                {
+                    "dataset_id": "REP_ID",
+                    "dataset_type": "rep",
+                    "start_date": "2023-01-01",
+                    "end_date": "2023-01-05",
+                },
+                {
+                    "dataset_id": "NRT_ID",
+                    "dataset_type": "nrt",
+                    "start_date": "2023-01-06",
+                    "end_date": "2023-01-10",
+                },
+            ]
+        )
+        zarr.consolidate_metadata(str(zarr_path))
+        catalog = _make_catalog(tmp_path)
+
+        rows = catalog._index._scanner._extract_zarr_metadata(zarr_path)
+
+        assert [r["num_timesteps"] for r in rows] == [5, 5]
+        assert sum(r["num_timesteps"] for r in rows) == len(ds.time)
+
     def test_sidecar_fallback_still_works_for_old_files(self, tmp_path):
         ds = _make_ds("2023-01-01", n_days=365)
         zarr_path = _write_zarr(tmp_path, ds)
@@ -1123,8 +1160,10 @@ class TestOpenDatasetIntegration:
 
 
 class TestGetNonnullDays:
-    def _store(self, tmp_path, null_days=(), name="v_2020.zarr"):
-        times = pd.date_range("2020-01-01", "2020-01-10", freq="D")
+    def _store(self, tmp_path, null_days=(), name="v_2020.zarr", hour=0):
+        times = pd.date_range("2020-01-01", "2020-01-10", freq="D") + pd.Timedelta(
+            hours=hour
+        )
         nulls = pd.DatetimeIndex(null_days)
         data = np.random.default_rng(0).uniform(1, 2, size=(len(times), 2, 2))
         for i, t in enumerate(times):
@@ -1196,3 +1235,18 @@ class TestGetNonnullDays:
         window = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"))
 
         assert self._call(root, window, ["sst"], tmp_path) == {}
+
+    def test_last_day_of_a_noon_stamped_store_is_still_scanned(self, tmp_path):
+        """
+        The window end is a date, the store's stamps need not be midnight. A
+        bound taken verbatim drops the final day, so a day that has data is
+        reported as having none — and the compiler then treats it as a hole to
+        refill on every run.
+        """
+        root = self._store(tmp_path, hour=12)
+        window = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"))
+
+        out = self._call(root, window, ["sst"], tmp_path)
+
+        assert pd.Timestamp("2020-01-10") in out["sst"]
+        assert len(out["sst"]) == 10

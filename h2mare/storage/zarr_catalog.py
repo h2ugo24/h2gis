@@ -21,6 +21,7 @@ from h2mare.config import AppConfig, get_settings
 from h2mare.storage.zarr_index import ZarrIndex, _variables_list
 from h2mare.storage.zarr_reader import ZarrReader
 from h2mare.types import BBox, DateLike, DateRange, TimeResolution
+from h2mare.utils.datetime_utils import end_of_day
 from h2mare.utils.labels import create_label_from_dataset
 from h2mare.utils.paths import resolve_store_path
 from h2mare.validators import validate_time_resolution, validate_var_key
@@ -350,7 +351,11 @@ class ZarrCatalog:
             try:
                 if "time" not in ds.coords:
                     continue
-                ds = ds.sel(time=slice(window.start, window.end))
+                # end_of_day, not window.end: the bound is a date, and a store
+                # whose stamps are not at midnight would lose its last day —
+                # every sub-daily step after 00:00 on an hourly store, and the
+                # whole day on a noon-stamped daily one.
+                ds = ds.sel(time=slice(window.start, end_of_day(window.end)))
                 times = pd.DatetimeIndex(ds["time"].values).normalize()
                 if len(times) == 0:
                     continue
