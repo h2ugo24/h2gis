@@ -18,8 +18,8 @@ from h2mare.processing.extractor import (
     _keys_path,
     _save_completed_keys,
     ensure_row_id,
-    resolve_extraction_source,
-    resolve_h2ds_vars,
+    resolve_compiled_vars,
+    resolve_read_from,
     split_vars_by_source,
     warn_on_subdaily_store,
 )
@@ -511,16 +511,22 @@ def _atm_config(*, hourly: bool = True) -> SimpleNamespace:
         time_step=TimeStep.HOURLY if hourly else TimeStep.DAILY,
         extract_depth_slices=None,
         rename_lonlat=False,
+        source="cds",
     )
 
 
 def _h2ds_config() -> SimpleNamespace:
-    """h2ds config entry: daily, publishing nothing of its own."""
+    """Compiled-store config entry: daily, publishing nothing of its own.
+
+    ``source="h2mare"`` is the marker the compiled var_key is found by — it is
+    not located by the name "h2ds".
+    """
     return SimpleNamespace(
         compiled_vars=[],
         time_step=TimeStep.DAILY,
         extract_depth_slices=None,
         rename_lonlat=False,
+        source="h2mare",
     )
 
 
@@ -590,36 +596,76 @@ class TestSplitVarsBySource:
         assert "convert" in str(err.value)
 
 
-class TestResolveExtractionSource:
-    """Which store answers, per (store cadence x input cadence)."""
+class TestResolveReadFrom:
+    """Which store answers, per (store cadence x input cadence x read_from)."""
+
+    @staticmethod
+    def _daily_cfg() -> SimpleNamespace:
+        return SimpleNamespace(compiled_vars=_STORED, time_step=TimeStep.DAILY)
+
+    # --- read_from="auto": inferred per var_key -----------------------------
 
     @pytest.mark.parametrize("subdaily", [False, True])
-    def test_daily_store_always_answers_for_itself(self, subdaily):
-        cfg = SimpleNamespace(compiled_vars=_STORED, time_step=TimeStep.DAILY)
-        assert resolve_extraction_source(cfg, subdaily_input=subdaily) == "store"
+    def test_auto_daily_store_always_answers_for_itself(self, subdaily):
+        assert (
+            resolve_read_from(
+                self._daily_cfg(), read_from="auto", subdaily_input=subdaily
+            )
+            == "native"
+        )
 
-    def test_hourly_store_with_date_only_input_routes_to_h2ds(self):
-        assert resolve_extraction_source(_atm_config(), subdaily_input=False) == "h2ds"
+    def test_auto_hourly_store_with_date_only_input_routes_to_compiled(self):
+        assert (
+            resolve_read_from(_atm_config(), read_from="auto", subdaily_input=False)
+            == "compiled"
+        )
 
-    def test_hourly_store_with_subdaily_input_serves_itself(self):
-        assert resolve_extraction_source(_atm_config(), subdaily_input=True) == "store"
+    def test_auto_hourly_store_with_subdaily_input_serves_itself(self):
+        assert (
+            resolve_read_from(_atm_config(), read_from="auto", subdaily_input=True)
+            == "native"
+        )
 
-    def test_config_without_time_step_defaults_to_daily(self):
+    def test_auto_config_without_time_step_defaults_to_daily(self):
         """Stand-in configs predating the field must stay on the old path."""
         cfg = SimpleNamespace(compiled_vars=_STORED)
-        assert resolve_extraction_source(cfg, subdaily_input=False) == "store"
+        assert (
+            resolve_read_from(cfg, read_from="auto", subdaily_input=False) == "native"
+        )
+
+    # --- pinned: honoured whatever the cadences say -------------------------
+
+    @pytest.mark.parametrize("subdaily", [False, True])
+    @pytest.mark.parametrize("pinned", ["native", "compiled"])
+    def test_pinned_is_honoured_for_an_hourly_store(self, pinned, subdaily):
+        assert (
+            resolve_read_from(_atm_config(), read_from=pinned, subdaily_input=subdaily)
+            == pinned
+        )
+
+    @pytest.mark.parametrize("subdaily", [False, True])
+    @pytest.mark.parametrize("pinned", ["native", "compiled"])
+    def test_pinned_is_honoured_for_a_daily_store(self, pinned, subdaily):
+        """read_from='compiled' on a daily var_key is the new capability: it
+        was previously impossible to extract e.g. sst from the compiled store."""
+        assert (
+            resolve_read_from(
+                self._daily_cfg(), read_from=pinned, subdaily_input=subdaily
+            )
+            == pinned
+        )
 
 
 class TestResolveH2dsVars:
     def test_declared_vars_present_in_h2ds_pass_through(self):
         available = [*_STORED, "ekman_anom", "n_upwell_events_3d", "sst"]
-        got = resolve_h2ds_vars(available, None, "atm-accum-avg", _atm_config())
+        got = resolve_compiled_vars(available, None, "atm-accum-avg", _atm_config())
         assert got == _atm_config().compiled_vars
 
     def test_missing_column_blames_a_stale_compile(self):
         """The ekman chain absent from h2ds means compile trails convert."""
         with pytest.raises(ValueError) as err:
-            resolve_h2ds_vars(_STORED, None, "atm-accum-avg", _atm_config())
+            resolve_compiled_vars(_STORED, None, "atm-accum-avg", _atm_config())
 
         msg = str(err.value)
         assert "ekman_anom" in msg
@@ -628,7 +674,7 @@ class TestResolveH2dsVars:
     def test_var_key_publishing_nothing_is_rejected(self):
         cfg = SimpleNamespace(compiled_vars=[], time_step=TimeStep.HOURLY)
         with pytest.raises(ValueError, match="compiled_vars"):
-            resolve_h2ds_vars(_STORED, None, "waves", cfg)
+            resolve_compiled_vars(_STORED, None, "waves", cfg)
 
 
 class TestWarnOnSubdailyStore:
@@ -810,8 +856,132 @@ class TestProcessSingleVarkeyRouting:
 
         assert seen.count("h2ds") == 1
 
+    def test_compiled_store_is_found_by_source_not_by_name(self, monkeypatch):
+        """
+        Another deployment may name its compiled store something else. It is
+        identified by source: h2mare — the same marker _normalize_var_dict
+        already excludes from default runs — not by the literal name "h2ds".
+        """
+        seen: list[str] = []
 
-class TestTimeResolutionOverride:
+        def _factory(var_key, **_kw):
+            seen.append(var_key)
+            catalog = MagicMock()
+            catalog.var_key = var_key
+            catalog.get_time_coverage.return_value = DateRange(
+                pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05")
+            )
+            catalog.get_bbox.return_value = BBox(-20.0, 30.0, 20.0, 50.0)
+            catalog.open_dataset.return_value = self._h2ds()
+            return catalog
+
+        monkeypatch.setattr(extractor_module, "ZarrCatalog", _factory)
+        ext = self._extractor_for(_atm_config(), ["2020-01-01", "2020-01-02"])
+        ext.app_config = SimpleNamespace(
+            variables={"atm-accum-avg": _atm_config(), "my_compiled": _h2ds_config()}
+        )
+
+        out = ext.process_single_varkey("atm-accum-avg")
+
+        assert seen == ["my_compiled"]
+        assert out["ekman_anom"].tolist() == [400.0, 401.0]
+
+    def test_config_without_a_compiled_var_key_says_so(self, monkeypatch):
+        self._patch_catalogs(monkeypatch, self._hourly_ds(), self._h2ds())
+        ext = self._extractor_for(_atm_config(), ["2020-01-01", "2020-01-02"])
+        ext.app_config = SimpleNamespace(variables={"atm-accum-avg": _atm_config()})
+
+        with pytest.raises(ValueError, match="No compiled var_key"):
+            ext.process_single_varkey("atm-accum-avg")
+
+
+class TestPinnedReadFrom:
+    """read_from overrides the inference, in both directions."""
+
+    _R = TestProcessSingleVarkeyRouting
+
+    def _extractor(self, times, **kwargs) -> Extractor:
+        df = pd.DataFrame({"time": times, "lon": [-9.0, -1.0], "lat": [31.0, 39.0]})
+        ext = _extractor(df, time_col="time", **kwargs)
+        ext.app_config = SimpleNamespace(
+            variables={"atm-accum-avg": _atm_config(), "h2ds": _h2ds_config()}
+        )
+        return ext
+
+    def test_native_with_date_only_input_reads_the_hourly_store(self, monkeypatch):
+        """Pinning native overrides the date-only default of going compiled."""
+        seen = self._R()._patch_catalogs(
+            monkeypatch, self._R._hourly_ds(), self._R._h2ds()
+        )
+        ext = self._extractor(["2020-01-01", "2020-01-02"], read_from="native")
+
+        out = ext.process_single_varkey("atm-accum-avg", vars=["tp"])
+
+        assert seen == ["atm-accum-avg"]
+        assert out["tp"].tolist() == [0.0, 24.0]  # hour 00:00 of each day
+
+    def test_native_still_sources_compile_derived_vars_from_compiled(self, monkeypatch):
+        """
+        An hourly store never held the derived chain, so honouring native to the
+        letter would mean returning nothing. Route and warn instead — the same
+        var_key converted daily holds them natively and never reaches here.
+        """
+        seen = self._R()._patch_catalogs(
+            monkeypatch, self._R._hourly_ds(), self._R._h2ds()
+        )
+        warned: list[str] = []
+        monkeypatch.setattr(
+            extractor_module.logger, "warning", lambda m, *a, **k: warned.append(str(m))
+        )
+        ext = self._extractor(["2020-01-01", "2020-01-02"], read_from="native")
+
+        out = ext.process_single_varkey("atm-accum-avg")
+
+        assert seen == ["atm-accum-avg", "h2ds"]
+        assert out["ekman_anom"].tolist() == [400.0, 401.0]
+        assert any("compile time" in m for m in warned)
+
+    def test_compiled_on_a_daily_var_key(self, monkeypatch):
+        """Previously impossible: reading a daily var_key from the compiled store."""
+        cfg = SimpleNamespace(
+            compiled_vars=["tp"],
+            time_step=TimeStep.DAILY,
+            extract_depth_slices=None,
+            rename_lonlat=False,
+            source="cmems",
+        )
+        seen = self._R()._patch_catalogs(
+            monkeypatch, self._R._hourly_ds(), self._R._h2ds()
+        )
+        ext = self._extractor(["2020-01-01", "2020-01-02"], read_from="compiled")
+        ext.app_config = SimpleNamespace(
+            variables={"atm-accum-avg": cfg, "h2ds": _h2ds_config()}
+        )
+
+        out = ext.process_single_varkey("atm-accum-avg")
+
+        assert seen == ["h2ds"]
+        assert out["tp"].tolist() == [100.0, 101.0]  # compiled values, not native
+
+    def test_compiled_with_subdaily_input_warns_it_can_only_give_days(
+        self, monkeypatch
+    ):
+        self._R()._patch_catalogs(monkeypatch, self._R._hourly_ds(), self._R._h2ds())
+        warned: list[str] = []
+        monkeypatch.setattr(
+            extractor_module.logger, "warning", lambda m, *a, **k: warned.append(str(m))
+        )
+        ext = self._extractor(
+            ["2020-01-01 03:00:00", "2020-01-01 18:00:00"], read_from="compiled"
+        )
+
+        out = ext.process_single_varkey("atm-accum-avg")
+
+        assert any("daily" in m and "read_from='compiled'" in m for m in warned)
+        assert out["tp"].tolist() == [100.0, 100.0]  # same day, same value
+
+
+class TestTimeCadenceOverride:
     @staticmethod
     def _df(times: list[str]) -> pd.DataFrame:
         return pd.DataFrame({"time": times, "lon": [10.0, 11.0], "lat": [40.0, 41.0]})
@@ -826,7 +996,7 @@ class TestTimeResolutionOverride:
     def test_native_honours_a_uniform_stamp_as_a_real_hour(self):
         ext = _extractor(
             self._df(["2020-01-01 14:00:00", "2020-01-02 14:00:00"]),
-            time_resolution="native",
+            time_cadence="hourly",
         )
 
         assert ext.input_is_subdaily is True
@@ -835,7 +1005,7 @@ class TestTimeResolutionOverride:
     def test_daily_truncates_even_varying_stamps(self):
         ext = _extractor(
             self._df(["2020-01-01 06:00:00", "2020-01-01 18:00:00"]),
-            time_resolution="daily",
+            time_cadence="daily",
         )
 
         assert ext.input_is_subdaily is False

@@ -29,15 +29,20 @@ from h2mare.utils.logging import configure_extraction_logging, log_time
 from h2mare.utils.paths import resolve_store_path
 from h2mare.utils.spatial import sel_padded_bbox
 
-#: var_key of the compiled daily dataset. An hourly per-variable store is the raw
-#: *source*; h2ds is the daily *product*, so a date-only query against an hourly
-#: var_key is answered from here rather than by snapping to one arbitrary hour.
-_H2DS_KEY = "h2ds"
+#: ``source`` marking the var_key that holds the compiled dataset, rather than
+#: its name — the same marker ``_normalize_var_dict`` excludes from default runs,
+#: so a compiled store named something other than ``h2ds`` is still found.
+_COMPILED_SOURCE = "h2mare"
 
-#: How the input's own timestamps are read. ``auto`` infers from the data (a
-#: varying sub-daily component means the caller wants hours); ``daily`` and
-#: ``native`` force one reading regardless.
-TimeResolution = Literal["auto", "daily", "native"]
+#: How the input's own timestamps are read. ``auto`` infers it from the data;
+#: ``daily`` and ``hourly`` state it outright. Purely about parsing ``time_col``
+#: — which store answers is :data:`ReadFrom`.
+TimeCadence = Literal["auto", "daily", "hourly"]
+
+#: Which store a var_key is read from. ``native`` is its own per-variable Zarr,
+#: ``compiled`` is the h2ds every var_key is merged into, and ``auto`` picks per
+#: var_key from the cadence the input asked for.
+ReadFrom = Literal["auto", "native", "compiled"]
 
 #: Coordinate columns that ride out of ``to_dataframe()`` alongside the real
 #: values. Carried by every engine result, so they are stripped before a join
@@ -185,24 +190,30 @@ def _declared_vars(var_config) -> list[str]:
     return list(getattr(var_config, "compiled_vars", None) or [])
 
 
-def resolve_extraction_source(var_config, *, subdaily_input: bool) -> str:
+def resolve_read_from(var_config, *, read_from: ReadFrom, subdaily_input: bool) -> str:
     """
-    Which store answers this var_key at the cadence the input asked for.
+    Which store answers this var_key.
 
-    A daily store is the only thing that ever held its var_key's full published
-    set, so it keeps answering for itself. An hourly store is the raw *source*:
-    it holds neither the daily reduction nor the features derived from it, and
-    snapping a date-only row to the nearest stored step lands it on one
-    arbitrary hour. So a date-only query against an hourly var_key is answered
-    from the compiled daily product instead, which is where those numbers
-    actually live — the same ones ``ParquetIndexer.scan`` returns.
+    ``native`` and ``compiled`` are honoured as given. ``auto`` decides per
+    var_key from the cadence the input asked for:
+
+    - A **daily** store holds everything its var_key publishes, so it always
+      answers for itself.
+    - An **hourly** store is the raw *source*: it holds neither the daily
+      reduction nor the features derived from it, and snapping a date-only row
+      to the nearest stored step lands it on one arbitrary hour. A date-only
+      query is therefore answered from the compiled store, where those numbers
+      actually live — the same ones ``ParquetIndexer.scan`` returns. A sub-daily
+      query reads the hourly store, since that is the only thing that has hours.
 
     Returns:
-        ``"store"`` for the per-variable Zarr, ``"h2ds"`` for the compiled one.
+        ``"native"`` for the per-variable Zarr, ``"compiled"`` for h2ds.
     """
+    if read_from != "auto":
+        return read_from
     if step_freq(var_config) != "h":
-        return "store"
-    return "store" if subdaily_input else _H2DS_KEY
+        return "native"
+    return "native" if subdaily_input else "compiled"
 
 
 def warn_on_subdaily_store(var_key: str, var_config, ds: xr.Dataset) -> None:
@@ -210,7 +221,7 @@ def warn_on_subdaily_store(var_key: str, var_config, ds: xr.Dataset) -> None:
     Say out loud that native hourly values do not read like daily ones.
 
     Only fires when the hourly store is actually being served — a date-only
-    query routes to h2ds (see :func:`resolve_extraction_source`), where the
+    query routes to the compiled store (see :func:`resolve_read_from`), where the
     semantics and units are the daily ones the caller already expects, so
     warning there would be noise.
 
@@ -239,20 +250,28 @@ def split_vars_by_source(
     var_config,
 ) -> tuple[list[str], list[str]]:
     """
-    Split a request into what the per-variable store holds and what h2ds owes.
+    Split a request into what the native store holds and what the compiled owes.
 
-    A var_key's ``compiled_vars`` are what it *publishes*; an hourly store holds
-    strictly less, because the daily reduction and every feature derived from it
-    (the ekman chain, ``wind_*``) are produced at compile time and written only
-    to h2ds. This says which side each requested variable comes from so the
-    caller can read both and join, rather than returning a quietly thinner frame.
+    A var_key's ``compiled_vars`` are what it *publishes*. Whether its own store
+    holds all of that depends on its ``time_step``: converting at **daily**
+    cadence runs the reductions and the derived chain up front and writes them
+    alongside the raw fields, so the store is complete; converting at **hourly**
+    cadence keeps the raw source only and moves everything derived to compile
+    time, where it is written to the compiled store instead. The same var_key is
+    therefore complete in one deployment and thin in another — which is why the
+    gap is routed rather than refused.
 
     ``requested=None`` means "everything this var_key publishes".
 
+    The rule, uniformly: absent where the design puts it elsewhere is a routing
+    decision; absent where the design says it should be present is a defect. A
+    daily store missing what it publishes is the second kind, so it raises here
+    rather than being quietly backfilled from the compiled store — that would
+    mask a hole in the store.
+
     Returns:
-        ``(from_store, from_h2ds)``. For a daily store ``from_h2ds`` is always
-        empty — a daily store holds everything it publishes, so a gap there is a
-        defect rather than a routing decision.
+        ``(from_native, from_compiled)``. For a daily store ``from_compiled`` is
+        always empty.
 
     Raises:
         ValueError: for names that belong to neither side, and for a daily store
@@ -271,21 +290,21 @@ def split_vars_by_source(
             + (f"; config publishes {sorted(declared)}." if declared else ".")
         )
 
-    from_store = [v for v in wanted if v in stored_set]
-    from_h2ds = [v for v in wanted if v not in stored_set]
+    from_native = [v for v in wanted if v in stored_set]
+    from_compiled = [v for v in wanted if v not in stored_set]
 
-    if from_h2ds and step_freq(var_config) != "h":
+    if from_compiled and step_freq(var_config) != "h":
         raise ValueError(
             f"[{var_key}] daily store holds {sorted(stored)} but this variable "
-            f"publishes {sorted(declared)}. Absent: {sorted(from_h2ds)}. A daily "
+            f"publishes {sorted(declared)}. Absent: {sorted(from_compiled)}. A daily "
             f"store is written with everything it publishes, so this is a gap in "
             f"the store — re-run `uv run h2mare convert -v {var_key}`."
         )
 
-    return from_store, from_h2ds
+    return from_native, from_compiled
 
 
-def resolve_h2ds_vars(
+def resolve_compiled_vars(
     available: list[str],
     requested: list[str] | None,
     var_key: str,
@@ -384,7 +403,8 @@ class Extractor:
         app_config: Optional[AppConfig] = None,
         store_root: Optional[Union[str, Path]] = None,
         crs: int | None = 4326,
-        time_resolution: TimeResolution = "auto",
+        time_cadence: TimeCadence = "auto",
+        read_from: ReadFrom = "auto",
         log_file: Optional[Union[str, Path]] = None,
     ):
         """
@@ -402,14 +422,24 @@ class Extractor:
             app_config (AppConfig, optional): Dataclass with environmental data specifics. Defaults to cfg.
             store_root (Union[str, Path], optional): Path for environmental data main folder. Defaults to STORE_ROOT.
             crs (int | None, optional): Projection EPSG code for geometry extraction. Defaults to 4326.
-            time_resolution ("auto" | "daily" | "native"): how the input's own
-                timestamps are read, which decides what an hourly var_key
-                returns. ``"auto"`` (default) infers it: a time component that
-                *varies* across rows means the caller wants hours, a date-only
-                or uniformly-stamped input means days. ``"daily"`` forces the
-                daily reading (from h2ds) even for varying stamps; ``"native"``
-                honours a uniform stamp as a real hour instead of truncating it.
-                Ignored by daily stores, which have only one cadence to give.
+            time_cadence ("auto" | "daily" | "hourly"): how ``time_col`` is read.
+                ``"auto"`` (default) infers it: a time component that *varies*
+                across rows means the caller wants hours; a date-only input, or
+                one stamped identically on every row (an export default rather
+                than a real hour), means days. ``"daily"`` truncates to midnight
+                regardless; ``"hourly"`` keeps whatever precision is there. This
+                only decides how the input is parsed — which store answers is
+                ``read_from``.
+            read_from ("auto" | "native" | "compiled"): which store each var_key
+                is read from. ``"native"`` is its own per-variable Zarr,
+                ``"compiled"`` is the h2ds every var_key is merged into, and
+                ``"auto"`` (default) picks per var_key: a daily store answers for
+                itself, while an hourly one answers only a sub-daily request and
+                otherwise defers to the compiled store, which is where its daily
+                values live. Note the two are not interchangeable — the compiled
+                store is on the 0.25° base grid and carries the pipeline's units
+                (ERA5 ``msl`` in hPa), while an hourly native store holds the raw
+                source as published (``msl`` in Pa).
             log_file (str | Path, optional): Extraction log file for this session.
                 Defaults to LOGS_DIR/extractor.log (first Extractor in the
                 process decides; subsequent values are ignored).
@@ -422,7 +452,8 @@ class Extractor:
         self.lon_col = lon_col if lon_col is not None else "lon"
         self.lat_col = lat_col if lat_col is not None else "lat"
         self.crs = crs
-        self.time_resolution: TimeResolution = time_resolution
+        self.time_cadence: TimeCadence = time_cadence
+        self.read_from: ReadFrom = read_from
 
         self.app_config = app_config or get_settings().app_config
 
@@ -441,21 +472,21 @@ class Extractor:
         """
         Resolve time column to date or datetime based on time variance.
 
-        Logic (``time_resolution="auto"``):
+        Logic (``time_cadence="auto"``):
             - If time_col strings contain no time component → keep as date.
             - If time_col contains datetimes:
                 - If time component is identical across all rows → truncate to date.
                 - If time component varies → keep full datetime.
 
-        ``"daily"`` always truncates; ``"native"`` never does, so a uniform
+        ``"daily"`` always truncates; ``"hourly"`` never does, so a uniform
         stamp is honoured as a real hour rather than read as a nominal one.
 
         The verdict is kept on ``self.input_is_subdaily`` rather than thrown
-        away: it is what decides whether an hourly var_key is served from its
-        own store or from the compiled daily one (:func:`resolve_extraction_source`).
-        Nothing else needs a second time column — the branch below already
-        leaves ``time`` at full precision exactly when the sub-daily route wants
-        it, and at midnight when the daily route does.
+        away: with ``read_from="auto"`` it is what decides whether an hourly
+        var_key is served from its own store or the compiled one
+        (:func:`resolve_read_from`). Nothing else needs a second time column —
+        the branch below already leaves ``time`` at full precision exactly when
+        the sub-daily route wants it, and at midnight when the daily route does.
         """
         data = data.rename(columns={self.time_col: "time"})
 
@@ -465,9 +496,9 @@ class Extractor:
 
         data["time"] = pd.to_datetime(data["time"], utc=True).dt.tz_convert(None)
 
-        if self.time_resolution == "daily":
+        if self.time_cadence == "daily":
             subdaily = False
-        elif self.time_resolution == "native":
+        elif self.time_cadence == "hourly":
             subdaily = bool(has_time_component)
         elif has_time_component:
             # A stamp identical on every row reads as nominal (someone's export
@@ -699,14 +730,16 @@ class Extractor:
             return self._extract_bathy(self.data)
 
         var_cfg = self.app_config.variables[var_key]
-        source = resolve_extraction_source(
-            var_cfg, subdaily_input=self.input_is_subdaily
+        source = resolve_read_from(
+            var_cfg,
+            read_from=self.read_from,
+            subdaily_input=self.input_is_subdaily,
         )
 
-        if source == _H2DS_KEY:
+        if source == "compiled":
             # Date-only query against an hourly var_key: the daily numbers it
             # publishes live in the compiled store, not in its own.
-            return self._extract_from_h2ds(var_key, vars, var_cfg, n_workers)
+            return self._extract_compiled(var_key, vars, var_cfg, n_workers)
 
         vr_catalog = ZarrCatalog(var_key)
         dates_resolved = self._resolve_coverage(vr_catalog)
@@ -723,12 +756,12 @@ class Extractor:
         ds = vr_catalog.open_dataset(dates=dates_resolved, bbox=bounds)
 
         warn_on_subdaily_store(var_key, var_cfg, ds)
-        from_store, from_h2ds = split_vars_by_source(
+        from_native, from_compiled = split_vars_by_source(
             vars, [str(v) for v in ds.data_vars], var_key, var_cfg
         )
 
-        if from_store:
-            ds = ds[from_store]
+        if from_native:
+            ds = ds[from_native]
 
         ds = ds.sortby("time")
 
@@ -738,15 +771,20 @@ class Extractor:
 
         result = self._extract(data_resolved, ds, var_cfg.rename_lonlat, n_workers)
 
-        if from_h2ds:
-            # Features that are daily by construction — a 7-day rolling mean
-            # against a day-of-year climatology has no hourly value to give.
-            # Serve each sample the value for the day it falls in.
-            logger.info(
-                f"[{var_key}] {sorted(from_h2ds)} are daily by construction; "
-                f"taking them from h2ds and broadcasting over each day."
+        if from_compiled:
+            # Reached only when this var_key converts hourly, so its derived
+            # features were never written to its own store (converting the same
+            # variable daily computes them up front and this branch is dead).
+            # They are daily by construction — a 7-day rolling mean against a
+            # day-of-year climatology has no hourly value to give — so each
+            # sample takes the value for the day it falls in.
+            logger.warning(
+                f"[{var_key}] {sorted(from_compiled)} are not in the native "
+                f"store: this variable converts hourly, so they are derived at "
+                f"compile time. Reading them from the compiled store and "
+                f"broadcasting each day's value across that day's samples."
             )
-            daily = self._extract_from_h2ds(var_key, from_h2ds, var_cfg, n_workers)
+            daily = self._extract_compiled(var_key, from_compiled, var_cfg, n_workers)
             # Both engines carry the coordinate columns out of to_dataframe();
             # keeping them on both sides would collide on join. _run_impl strips
             # them from the final frame anyway, so the store side's copy stands.
@@ -788,17 +826,43 @@ class Extractor:
         raise ValueError(f"Unsupported input_type: {self.input_type}")
 
     @cached_property
-    def _h2ds_catalog(self) -> ZarrCatalog:
+    def _compiled_var_key(self) -> str:
+        """
+        The var_key holding the compiled dataset, found by its ``source``.
+
+        Identified the same way :meth:`_normalize_var_dict` excludes it from
+        default runs — by ``source: h2mare`` rather than by the name ``h2ds`` —
+        so a deployment that names its compiled store differently still routes.
+        """
+        keys = [
+            k
+            for k, cfg in self.app_config.variables.items()
+            if getattr(cfg, "source", None) == _COMPILED_SOURCE
+        ]
+        if not keys:
+            raise ValueError(
+                f"No compiled var_key in config: none has source "
+                f"'{_COMPILED_SOURCE}'. Reading a variable from the compiled "
+                f"store needs one (conventionally 'h2ds')."
+            )
+        if len(keys) > 1:
+            raise ValueError(
+                f"Ambiguous compiled var_key: {sorted(keys)} all declare source "
+                f"'{_COMPILED_SOURCE}'. Exactly one is expected."
+            )
+        return keys[0]
+
+    @cached_property
+    def _compiled_catalog(self) -> ZarrCatalog:
         """
         The compiled daily store, opened once per Extractor.
 
-        ``run()`` walks several hourly var_keys and every one of them routes
-        here, so the catalog (and its index scan) is cached rather than rebuilt
-        per var_key.
+        ``run()`` can route several var_keys here, so the catalog (and its index
+        scan) is cached rather than rebuilt per var_key.
         """
-        return ZarrCatalog(_H2DS_KEY, app_config=self.app_config)
+        return ZarrCatalog(self._compiled_var_key, app_config=self.app_config)
 
-    def _extract_from_h2ds(
+    def _extract_compiled(
         self,
         var_key: str,
         vars: list[str] | None,
@@ -808,24 +872,39 @@ class Extractor:
         """
         Extract *var_key*'s columns from the compiled daily store.
 
-        Coverage is resolved against h2ds rather than the per-variable store:
-        the two do not move together, since each CDS variable lags its provider
-        differently and compile trails convert. Asking the hourly store what is
-        available would over-promise.
+        Coverage is resolved against the compiled store rather than the
+        per-variable one: the two do not move together, since each source lags
+        its provider differently and compile trails convert. Asking the native
+        store what is available would over-promise.
 
-        Sample times are normalised to the day, because h2ds is daily and the
-        caller may be on the broadcast path with sub-daily stamps in hand.
-        ``rename_lonlat`` and depth slicing are both skipped: h2ds is lon/lat on
-        the base grid, and it already holds depth levels as separate variables
-        (``o2_0``, ``o2_100``, …) rather than on a ``depth`` axis.
+        Sample times are normalised to the day, because the compiled store is
+        daily and the caller may arrive here holding sub-daily stamps — either
+        via the broadcast path or by pinning ``read_from="compiled"``. Each
+        sample then takes the value for the day it falls in.
+
+        ``rename_lonlat`` and depth slicing are both skipped: the compiled store
+        is lon/lat on the base grid, and it already holds depth levels as
+        separate variables (``o2_0``, ``o2_100``, …) rather than on a ``depth``
+        axis.
         """
-        catalog = self._h2ds_catalog
+        catalog = self._compiled_catalog
         dates_resolved = self._resolve_coverage(catalog)
         data_resolved = self._subset_to_coverage(dates_resolved).copy()
+
+        # Only for a pinned read_from: on the broadcast path the caller has
+        # already been told, in terms of the specific variables involved.
+        if self.input_is_subdaily and self.read_from == "compiled":
+            logger.warning(
+                f"[{var_key}] read_from='compiled' and the compiled store is "
+                f"daily: sub-daily samples take the value for the day they fall "
+                f"in, not the value for their hour."
+            )
         data_resolved["time"] = data_resolved["time"].dt.normalize()
         bounds = self._define_bbox(data_resolved)
 
-        logger.info(f"Extracting {var_key} data from the compiled {_H2DS_KEY}")
+        logger.info(
+            f"Extracting {var_key} data from the compiled {self._compiled_var_key}"
+        )
         logger.info(
             f"{data_resolved.shape[0]} samples | "
             f"{min(dates_resolved).date()} -> {max(dates_resolved).date()} | "
@@ -836,7 +915,7 @@ class Extractor:
             dates=sorted({pd.Timestamp(d).normalize() for d in dates_resolved}),
             bbox=bounds,
         )
-        wanted = resolve_h2ds_vars(
+        wanted = resolve_compiled_vars(
             [str(v) for v in ds.data_vars], vars, var_key, var_cfg
         )
 
