@@ -1,8 +1,9 @@
 # Extractor
 
 `Extractor` extracts environmental values at point locations (CSV / `DataFrame`) or
-spatial geometries (SHP / `GeoDataFrame`). By default it reads from the h2ds Zarr stores
-via `ZarrCatalog`, but it can also extract against an arbitrary in-memory `xarray` dataset
+spatial geometries (SHP / `GeoDataFrame`). By default it reads the per-variable Zarr stores
+via `ZarrCatalog`, falling back to the compiled h2ds for variables stored hourly (see
+[Cadence](#cadence)); it can also extract against an arbitrary in-memory `xarray` dataset
 that is not yet in the store (see [`extract_from_dataset()`](#extract_from_dataset)).
 
 ```python
@@ -32,6 +33,7 @@ Extractor(
     app_config=None,      # default: settings.app_config
     store_root=None,      # default: STORE_ROOT
     crs=4326,             # EPSG code for geometry extraction (SHP only)
+    time_resolution="auto",  # "auto" | "daily" | "native" — see Cadence
     log_file=None,        # default: LOGS_DIR/extractor.log
 )
 ```
@@ -46,7 +48,61 @@ Extractor(
 | `app_config` | `settings.app_config` | Override the application configuration (variable registry, depth slices, etc.). |
 | `store_root` | `STORE_ROOT` | Root directory of the Zarr stores. |
 | `crs` | `4326` | EPSG code that geometries are reprojected to (SHP/geometry input only). |
+| `time_resolution` | `"auto"` | How the input's own timestamps are read, which decides what an hourly `var_key` returns. See [Cadence](#cadence). |
 | `log_file` | `LOGS_DIR/extractor.log` | Extraction log file. The first `Extractor` in the process fixes this; later values are ignored. |
+
+---
+
+## Cadence
+
+Some variables are stored **hourly** (`time_step: hourly` in `config.yaml` — currently
+`atm-instante`, `atm-accum-avg`, `radiation`, `waves`), and the daily reduction plus every
+feature derived from it is produced at compile time and written only to h2ds. The
+per-variable Zarr is therefore the raw *source*; **h2ds is the daily *product***.
+
+The Extractor picks which one answers, per `var_key`, from what your input asks for:
+
+| store cadence | input cadence | source | you get |
+|---|---|---|---|
+| daily | any | per-variable Zarr | unchanged — the day's value |
+| hourly | date-only | **h2ds** | the daily aggregate and every derived feature |
+| hourly | sub-daily | hourly Zarr + h2ds | stored fields at the nearest hour; daily-by-construction features broadcast across the day |
+
+Consequences worth knowing:
+
+- **Extraction of an hourly `var_key` at daily cadence needs a current compile.** If h2ds
+  is missing a column the `var_key` publishes, extraction raises and names
+  `uv run h2mare compile` rather than returning a thinner frame.
+- **Units differ between the two sources.** The hourly store holds the raw source, so ERA5
+  `msl` is **Pa** there and **hPa** in h2ds, and `tp` is a per-hour accumulation rather
+  than the day's total. Column names stay the same either way, so a sub-daily run logs a
+  warning naming the stored units.
+- **Some features have no hourly value at all.** `ekman_anom` is a 7-day rolling mean
+  against a day-of-year climatology; `wind_max` is a maximum over a day. These are daily by
+  construction, so a sub-daily run serves each sample the value for the day it falls in.
+- The store the input never reaches is never opened, and h2ds is opened **once** per
+  `Extractor` no matter how many hourly `var_keys` a `run()` walks.
+
+### `time_resolution`
+
+`"auto"` (default) infers the input cadence: a time component that **varies** across rows
+means you want hours; a date-only input, or one uniformly stamped (`14:00:00` on every
+row — someone's export default rather than a real hour), means you want days.
+
+Override it when that inference is wrong for your data:
+
+| value | behaviour |
+|---|---|
+| `"auto"` | infer, as above |
+| `"daily"` | always truncate to the day, even for varying stamps — forces the h2ds route |
+| `"native"` | never truncate, so a uniform `14:00` is honoured as a real hour |
+
+```python
+# A uniform 14:00 stamp that really does mean 14:00
+Extractor(pts, index_col="row_id", time_resolution="native").run("radiation")
+```
+
+Daily stores have only one cadence to give, so this argument does not affect them.
 
 ---
 

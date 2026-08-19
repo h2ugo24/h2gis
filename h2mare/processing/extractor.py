@@ -7,8 +7,9 @@ from __future__ import annotations
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import cached_property
 from pathlib import Path
-from typing import Optional, Union, overload
+from typing import Literal, Optional, Union, overload
 
 import ephem
 import geopandas as gpd
@@ -23,9 +24,25 @@ from h2mare import AppConfig, get_settings
 from h2mare.models import step_freq
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import BBox, DateRange
+from h2mare.utils.datetime_utils import end_of_day
 from h2mare.utils.logging import configure_extraction_logging, log_time
 from h2mare.utils.paths import resolve_store_path
 from h2mare.utils.spatial import sel_padded_bbox
+
+#: var_key of the compiled daily dataset. An hourly per-variable store is the raw
+#: *source*; h2ds is the daily *product*, so a date-only query against an hourly
+#: var_key is answered from here rather than by snapping to one arbitrary hour.
+_H2DS_KEY = "h2ds"
+
+#: How the input's own timestamps are read. ``auto`` infers from the data (a
+#: varying sub-daily component means the caller wants hours); ``daily`` and
+#: ``native`` force one reading regardless.
+TimeResolution = Literal["auto", "daily", "native"]
+
+#: Coordinate columns that ride out of ``to_dataframe()`` alongside the real
+#: values. Carried by every engine result, so they are stripped before a join
+#: and again from the final frame.
+_COORD_COLS = ["time", "lat", "lon", "geom"]
 
 # Module-level KDTree cache keyed on grid identity (shape + first/last values).
 # All var_keys produced by this pipeline share the same 0.25° grid, so the tree
@@ -168,16 +185,41 @@ def _declared_vars(var_config) -> list[str]:
     return list(getattr(var_config, "compiled_vars", None) or [])
 
 
+def resolve_extraction_source(var_config, *, subdaily_input: bool) -> str:
+    """
+    Which store answers this var_key at the cadence the input asked for.
+
+    A daily store is the only thing that ever held its var_key's full published
+    set, so it keeps answering for itself. An hourly store is the raw *source*:
+    it holds neither the daily reduction nor the features derived from it, and
+    snapping a date-only row to the nearest stored step lands it on one
+    arbitrary hour. So a date-only query against an hourly var_key is answered
+    from the compiled daily product instead, which is where those numbers
+    actually live — the same ones ``ParquetIndexer.scan`` returns.
+
+    Returns:
+        ``"store"`` for the per-variable Zarr, ``"h2ds"`` for the compiled one.
+    """
+    if step_freq(var_config) != "h":
+        return "store"
+    return "store" if subdaily_input else _H2DS_KEY
+
+
 def warn_on_subdaily_store(var_key: str, var_config, ds: xr.Dataset) -> None:
     """
-    Say out loud that an hourly store does not extract like a daily one.
+    Say out loud that native hourly values do not read like daily ones.
 
-    Extraction snaps each sample to the nearest stored step. Against a daily
-    store that is the day's aggregate; against an hourly store it is one
-    instantaneous hour, and a date-only input row silently lands on 00:00.
-    Units differ too, because an hourly store holds the raw source rather than
-    the pipeline's daily reduction — so the stored units are reported here
-    instead of being left for the caller to discover in the numbers.
+    Only fires when the hourly store is actually being served — a date-only
+    query routes to h2ds (see :func:`resolve_extraction_source`), where the
+    semantics and units are the daily ones the caller already expects, so
+    warning there would be noise.
+
+    Each sample snaps to the nearest stored step, which here is one
+    instantaneous hour rather than the day's aggregate. Units differ too,
+    because an hourly store holds the raw source rather than the pipeline's
+    daily reduction (ERA5 ``msl`` is Pa here and hPa in h2ds) — so the stored
+    units are reported instead of being left for the caller to discover in the
+    numbers.
     """
     if step_freq(var_config) != "h":
         return
@@ -185,69 +227,101 @@ def warn_on_subdaily_store(var_key: str, var_config, ds: xr.Dataset) -> None:
     units = {str(v): ds[v].attrs.get("units", "?") for v in ds.data_vars}
     logger.warning(
         f"[{var_key}] hourly store: each sample snaps to the nearest hour and "
-        f"returns that instantaneous value, NOT a daily aggregate — a date-only "
-        f"timestamp lands on 00:00. Units are the raw source's and may differ "
-        f"from the daily store: {units}"
+        f"returns that instantaneous value, NOT a daily aggregate. Units are "
+        f"the raw source's and may differ from the daily store: {units}"
     )
 
 
-def resolve_extraction_vars(
+def split_vars_by_source(
+    requested: list[str] | None,
+    stored: list[str],
+    var_key: str,
+    var_config,
+) -> tuple[list[str], list[str]]:
+    """
+    Split a request into what the per-variable store holds and what h2ds owes.
+
+    A var_key's ``compiled_vars`` are what it *publishes*; an hourly store holds
+    strictly less, because the daily reduction and every feature derived from it
+    (the ekman chain, ``wind_*``) are produced at compile time and written only
+    to h2ds. This says which side each requested variable comes from so the
+    caller can read both and join, rather than returning a quietly thinner frame.
+
+    ``requested=None`` means "everything this var_key publishes".
+
+    Returns:
+        ``(from_store, from_h2ds)``. For a daily store ``from_h2ds`` is always
+        empty — a daily store holds everything it publishes, so a gap there is a
+        defect rather than a routing decision.
+
+    Raises:
+        ValueError: for names that belong to neither side, and for a daily store
+            that cannot satisfy what its own config publishes.
+    """
+    declared = _declared_vars(var_config)
+    stored_set, declared_set = set(stored), set(declared)
+
+    wanted = list(requested) if requested is not None else (declared or list(stored))
+
+    unknown = sorted(v for v in wanted if v not in stored_set and v not in declared_set)
+    if unknown:
+        raise ValueError(
+            f"[{var_key}] cannot extract {unknown}: not variables of "
+            f"'{var_key}'. Store holds {sorted(stored)}"
+            + (f"; config publishes {sorted(declared)}." if declared else ".")
+        )
+
+    from_store = [v for v in wanted if v in stored_set]
+    from_h2ds = [v for v in wanted if v not in stored_set]
+
+    if from_h2ds and step_freq(var_config) != "h":
+        raise ValueError(
+            f"[{var_key}] daily store holds {sorted(stored)} but this variable "
+            f"publishes {sorted(declared)}. Absent: {sorted(from_h2ds)}. A daily "
+            f"store is written with everything it publishes, so this is a gap in "
+            f"the store — re-run `uv run h2mare convert -v {var_key}`."
+        )
+
+    return from_store, from_h2ds
+
+
+def resolve_h2ds_vars(
     available: list[str],
     requested: list[str] | None,
     var_key: str,
     var_config,
-) -> list[str] | None:
+) -> list[str]:
     """
-    Reconcile what was asked for against what the store actually holds.
+    The compiled-h2ds columns that belong to *var_key*.
 
-    A var_key's ``compiled_vars`` are what it *publishes*; once features are
-    derived at compile time the store holds strictly less than that. Both ways
-    of hitting the gap used to pass silently or unhelpfully: ``requested=None``
-    returned a thinner frame with no complaint, and a named missing variable
-    raised a bare ``KeyError`` that said nothing about where it went.
-
-    Returns the requested selection unchanged when it is satisfiable.
+    ``compiled_vars`` is already the var_key -> h2ds-column mapping (it is what
+    ``h2mare parquet --add-var`` selects on), so it is reused here rather than
+    re-derived.
 
     Raises:
-        ValueError: if the store cannot satisfy the request, naming which
-            variables moved to compile time and where to read them instead.
+        ValueError: if the var_key publishes nothing, or if h2ds does not yet
+            hold a requested column — which means compile is behind convert, not
+            that the request was wrong.
     """
     declared = _declared_vars(var_config)
-    missing = sorted(v for v in declared if v not in available)
+    wanted = list(requested) if requested is not None else declared
 
-    if requested is None:
-        if missing:
-            raise ValueError(
-                f"[{var_key}] store holds {sorted(available)}, but this variable "
-                f"publishes {len(declared)}. Absent: {missing}. Those are derived "
-                f"at compile time and never written to the per-variable Zarr — "
-                f"read them from the compiled h2ds (Extractor.extract_from_dataset) "
-                f"or the Parquet store (ParquetIndexer.scan). To extract only the "
-                f"stored fields, pass vars={sorted(available)} explicitly."
-            )
-        return requested
-
-    unknown = [v for v in requested if v not in available]
-    if not unknown:
-        return requested
-
-    compile_time = sorted(v for v in unknown if v in declared)
-    unrecognised = sorted(v for v in unknown if v not in declared)
-
-    detail = []
-    if compile_time:
-        detail.append(
-            f"{compile_time} are derived at compile time — read them from the "
-            f"compiled h2ds or the Parquet store, not the per-variable Zarr."
+    if not wanted:
+        raise ValueError(
+            f"[{var_key}] declares no compiled_vars, so there is no mapping onto "
+            f"h2ds columns. Add compiled_vars to its config entry."
         )
-    if unrecognised:
-        detail.append(f"{unrecognised} are not variables of '{var_key}'.")
 
-    raise ValueError(
-        f"[{var_key}] cannot extract {sorted(unknown)} from the store. "
-        + " ".join(detail)
-        + f" Store holds: {sorted(available)}."
-    )
+    missing = sorted(v for v in wanted if v not in available)
+    if missing:
+        raise ValueError(
+            f"[{var_key}] the compiled h2ds is missing {missing}. These are "
+            f"derived at compile time from the hourly store, so compile is "
+            f"behind convert — run `uv run h2mare compile`. h2ds holds: "
+            f"{sorted(v for v in declared if v in available)}."
+        )
+
+    return wanted
 
 
 @log_time
@@ -310,6 +384,7 @@ class Extractor:
         app_config: Optional[AppConfig] = None,
         store_root: Optional[Union[str, Path]] = None,
         crs: int | None = 4326,
+        time_resolution: TimeResolution = "auto",
         log_file: Optional[Union[str, Path]] = None,
     ):
         """
@@ -327,6 +402,14 @@ class Extractor:
             app_config (AppConfig, optional): Dataclass with environmental data specifics. Defaults to cfg.
             store_root (Union[str, Path], optional): Path for environmental data main folder. Defaults to STORE_ROOT.
             crs (int | None, optional): Projection EPSG code for geometry extraction. Defaults to 4326.
+            time_resolution ("auto" | "daily" | "native"): how the input's own
+                timestamps are read, which decides what an hourly var_key
+                returns. ``"auto"`` (default) infers it: a time component that
+                *varies* across rows means the caller wants hours, a date-only
+                or uniformly-stamped input means days. ``"daily"`` forces the
+                daily reading (from h2ds) even for varying stamps; ``"native"``
+                honours a uniform stamp as a real hour instead of truncating it.
+                Ignored by daily stores, which have only one cadence to give.
             log_file (str | Path, optional): Extraction log file for this session.
                 Defaults to LOGS_DIR/extractor.log (first Extractor in the
                 process decides; subsequent values are ignored).
@@ -339,6 +422,7 @@ class Extractor:
         self.lon_col = lon_col if lon_col is not None else "lon"
         self.lat_col = lat_col if lat_col is not None else "lat"
         self.crs = crs
+        self.time_resolution: TimeResolution = time_resolution
 
         self.app_config = app_config or get_settings().app_config
 
@@ -357,11 +441,21 @@ class Extractor:
         """
         Resolve time column to date or datetime based on time variance.
 
-        Logic:
+        Logic (``time_resolution="auto"``):
             - If time_col strings contain no time component → keep as date.
             - If time_col contains datetimes:
                 - If time component is identical across all rows → truncate to date.
                 - If time component varies → keep full datetime.
+
+        ``"daily"`` always truncates; ``"native"`` never does, so a uniform
+        stamp is honoured as a real hour rather than read as a nominal one.
+
+        The verdict is kept on ``self.input_is_subdaily`` rather than thrown
+        away: it is what decides whether an hourly var_key is served from its
+        own store or from the compiled daily one (:func:`resolve_extraction_source`).
+        Nothing else needs a second time column — the branch below already
+        leaves ``time`` at full precision exactly when the sub-daily route wants
+        it, and at midnight when the daily route does.
         """
         data = data.rename(columns={self.time_col: "time"})
 
@@ -371,16 +465,24 @@ class Extractor:
 
         data["time"] = pd.to_datetime(data["time"], utc=True).dt.tz_convert(None)
 
-        if has_time_component:
-            time_is_uniform = data["time"].dt.time.nunique() == 1
-            if time_is_uniform:
-                logger.debug("Uniform time component detected. Truncating to date.")
-                data["time"] = data["time"].dt.normalize()
-            else:
-                logger.debug("Variable time component detected. Keeping full datetime.")
+        if self.time_resolution == "daily":
+            subdaily = False
+        elif self.time_resolution == "native":
+            subdaily = bool(has_time_component)
+        elif has_time_component:
+            # A stamp identical on every row reads as nominal (someone's export
+            # default), not as a deliberate hour — hence uniform means daily.
+            subdaily = data["time"].dt.time.nunique() > 1
         else:
-            logger.debug("No time component detected. Keeping as date.")
+            subdaily = False
 
+        if subdaily:
+            logger.debug("Sub-daily input detected. Keeping full datetime.")
+        else:
+            logger.debug("Daily input detected. Truncating to date.")
+            data["time"] = data["time"].dt.normalize()
+
+        self.input_is_subdaily = subdaily
         return data
 
     def _resolve_file_format(
@@ -523,8 +625,14 @@ class Extractor:
         if store_dates is None or store_bbox is None:
             raise ValueError(f"No coverage data for {catalog.var_key}")
 
+        # `end` names a calendar day, so the window runs to the *end* of that
+        # day. Compared bare against a full input timestamp it clips every
+        # sample stamped after midnight on the final covered day — 23 hours'
+        # worth against an hourly store, reported as "after store coverage".
+        # Every other date-bounded read pairs the bound with end_of_day; this
+        # one is the last that didn't.
         start_store = pd.Timestamp(store_dates.start)
-        end_store = pd.Timestamp(store_dates.end)
+        end_store = end_of_day(store_dates.end)
 
         # Input Data coverage
         dates = self._extract_unique_dates(self.data)
@@ -590,13 +698,19 @@ class Extractor:
         if var_key == "bathy":
             return self._extract_bathy(self.data)
 
-        # Remaining Key Variable
-        vr_catalog = ZarrCatalog(var_key)
+        var_cfg = self.app_config.variables[var_key]
+        source = resolve_extraction_source(
+            var_cfg, subdaily_input=self.input_is_subdaily
+        )
 
-        # Resolve coverage and subset data if necessary
+        if source == _H2DS_KEY:
+            # Date-only query against an hourly var_key: the daily numbers it
+            # publishes live in the compiled store, not in its own.
+            return self._extract_from_h2ds(var_key, vars, var_cfg, n_workers)
+
+        vr_catalog = ZarrCatalog(var_key)
         dates_resolved = self._resolve_coverage(vr_catalog)
-        mask = self.data["time"].between(min(dates_resolved), max(dates_resolved))
-        data_resolved = self.data.loc[mask]
+        data_resolved = self._subset_to_coverage(dates_resolved)
         bounds = self._define_bbox(data_resolved)
 
         logger.info(f"Extracting {var_key} data")
@@ -606,19 +720,15 @@ class Extractor:
             f"{bounds}"
         )
 
-        ## Get datasets covering the dates values and bounds
         ds = vr_catalog.open_dataset(dates=dates_resolved, bbox=bounds)
 
-        var_cfg = self.app_config.variables[var_key]
-
-        # A store no longer necessarily holds everything its var_key publishes:
-        # once features are derived at compile time they live only in h2ds. Say
-        # so before extracting, rather than returning a quietly thinner frame.
         warn_on_subdaily_store(var_key, var_cfg, ds)
-        vars = resolve_extraction_vars(list(ds.data_vars), vars, var_key, var_cfg)
+        from_store, from_h2ds = split_vars_by_source(
+            vars, [str(v) for v in ds.data_vars], var_key, var_cfg
+        )
 
-        if vars:
-            ds = ds[vars]
+        if from_store:
+            ds = ds[from_store]
 
         ds = ds.sortby("time")
 
@@ -626,13 +736,46 @@ class Extractor:
         if depth_slices is not None:
             ds = self._preprocess_depth_slices(ds, var_key, depth_slices)
 
+        result = self._extract(data_resolved, ds, var_cfg.rename_lonlat, n_workers)
+
+        if from_h2ds:
+            # Features that are daily by construction — a 7-day rolling mean
+            # against a day-of-year climatology has no hourly value to give.
+            # Serve each sample the value for the day it falls in.
+            logger.info(
+                f"[{var_key}] {sorted(from_h2ds)} are daily by construction; "
+                f"taking them from h2ds and broadcasting over each day."
+            )
+            daily = self._extract_from_h2ds(var_key, from_h2ds, var_cfg, n_workers)
+            # Both engines carry the coordinate columns out of to_dataframe();
+            # keeping them on both sides would collide on join. _run_impl strips
+            # them from the final frame anyway, so the store side's copy stands.
+            result = result.join(
+                daily.drop(columns=_COORD_COLS, errors="ignore"), how="left"
+            )
+
+        return result
+
+    def _subset_to_coverage(self, dates_resolved: list[pd.Timestamp]):
+        """Rows of the input that fall inside the resolved coverage window."""
+        mask = self.data["time"].between(min(dates_resolved), max(dates_resolved))
+        return self.data.loc[mask]
+
+    def _extract(
+        self,
+        data_resolved,
+        ds: xr.Dataset,
+        rename_lonlat: bool,
+        n_workers: int,
+    ) -> pd.DataFrame:
+        """Run the point or geometry engine, whichever this input calls for."""
         if self.input_type == "shp":
             if not isinstance(data_resolved, gpd.GeoDataFrame):
                 raise TypeError("Data must be a GeoDataFrame for shapefile extraction")
 
             ds = self.ensure_crs(data_resolved, ds)
 
-            if var_cfg.rename_lonlat:
+            if rename_lonlat:
                 ds = ds.rename({"lon": "x", "lat": "y"})
 
             return self.extract_from_shp(
@@ -643,6 +786,64 @@ class Extractor:
             return self.extract_from_csv(data_resolved, ds, self.index_col)
 
         raise ValueError(f"Unsupported input_type: {self.input_type}")
+
+    @cached_property
+    def _h2ds_catalog(self) -> ZarrCatalog:
+        """
+        The compiled daily store, opened once per Extractor.
+
+        ``run()`` walks several hourly var_keys and every one of them routes
+        here, so the catalog (and its index scan) is cached rather than rebuilt
+        per var_key.
+        """
+        return ZarrCatalog(_H2DS_KEY, app_config=self.app_config)
+
+    def _extract_from_h2ds(
+        self,
+        var_key: str,
+        vars: list[str] | None,
+        var_cfg,
+        n_workers: int,
+    ) -> pd.DataFrame:
+        """
+        Extract *var_key*'s columns from the compiled daily store.
+
+        Coverage is resolved against h2ds rather than the per-variable store:
+        the two do not move together, since each CDS variable lags its provider
+        differently and compile trails convert. Asking the hourly store what is
+        available would over-promise.
+
+        Sample times are normalised to the day, because h2ds is daily and the
+        caller may be on the broadcast path with sub-daily stamps in hand.
+        ``rename_lonlat`` and depth slicing are both skipped: h2ds is lon/lat on
+        the base grid, and it already holds depth levels as separate variables
+        (``o2_0``, ``o2_100``, …) rather than on a ``depth`` axis.
+        """
+        catalog = self._h2ds_catalog
+        dates_resolved = self._resolve_coverage(catalog)
+        data_resolved = self._subset_to_coverage(dates_resolved).copy()
+        data_resolved["time"] = data_resolved["time"].dt.normalize()
+        bounds = self._define_bbox(data_resolved)
+
+        logger.info(f"Extracting {var_key} data from the compiled {_H2DS_KEY}")
+        logger.info(
+            f"{data_resolved.shape[0]} samples | "
+            f"{min(dates_resolved).date()} -> {max(dates_resolved).date()} | "
+            f"{bounds}"
+        )
+
+        ds = catalog.open_dataset(
+            dates=sorted({pd.Timestamp(d).normalize() for d in dates_resolved}),
+            bbox=bounds,
+        )
+        wanted = resolve_h2ds_vars(
+            [str(v) for v in ds.data_vars], vars, var_key, var_cfg
+        )
+
+        ds = ds[wanted].sortby("time")
+        return self._extract(
+            data_resolved, ds, rename_lonlat=False, n_workers=n_workers
+        )
 
     def extract_from_dataset(
         self,
@@ -891,7 +1092,7 @@ class Extractor:
                     )
 
                     result.drop(
-                        columns=["time", "lat", "lon", "geom"],
+                        columns=_COORD_COLS,
                         errors="ignore",
                         inplace=True,
                     )
@@ -976,9 +1177,23 @@ class Extractor:
 
         Picks whichever grid step (left or right of the insertion point) is
         closer, matching xarray's method='nearest' semantics exactly.
+
+        Both sides are pinned to nanoseconds before the integer cast. The two
+        arrive at different resolutions — a Zarr time axis decodes to
+        ``datetime64[ns]`` while pandas parses input strings to ``[us]`` (or
+        coarser, since pandas 2 stopped forcing nanoseconds) — and casting
+        those to int64 compares counts of different units. A microsecond query
+        reads as 1/1000th of its true instant, sorts before every stored step,
+        and every row silently lands on index 0: one arbitrary time returned
+        for the whole input, varying only by location.
         """
-        grid_times = ds.time.values.astype("int64")
-        q = pd.to_datetime(query_times).to_numpy().astype("int64")
+        grid_times = ds.time.values.astype("datetime64[ns]").astype("int64")
+        q = (
+            pd.to_datetime(query_times)
+            .to_numpy()
+            .astype("datetime64[ns]")
+            .astype("int64")
+        )
 
         right = np.searchsorted(grid_times, q).clip(0, len(grid_times) - 1)
         left = (right - 1).clip(0, len(grid_times) - 1)
