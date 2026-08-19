@@ -966,9 +966,12 @@ class Extractor:
         ``self.data`` are reused as-is.
 
         Only the config-free prep is applied here. Config-driven steps that
-        :meth:`process_single_varkey` performs — depth-slice expansion
-        (``extract_depth_slices``), ``rename_lonlat``, and store date/bbox coverage
+        :meth:`process_single_varkey` performs — depth-slice expansion, store
+        selection (``read_from``), ``rename_lonlat``, and store date/bbox coverage
         resolution — are the caller's responsibility: prepare ``ds`` beforehand.
+        A ``ds`` handed over with a ``depth`` axis still on it is extracted as-is,
+        which for geometry input means that axis is averaged away along with the
+        spatial one; slice it yourself first.
 
         Parameters:
             ds (xr.Dataset | xr.DataArray): gridded data with coords ``lon``, ``lat``

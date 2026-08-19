@@ -118,13 +118,18 @@ class KeyVarConfigEntry(msgspec.Struct):
     # Set True for variables whose Zarr store uses lon/lat coordinate names that
     # must be renamed to x/y before rioxarray clip (e.g. AVISO fsle, eddies).
     rename_lonlat: bool = False
-    # Depth levels (metres) to extract when slicing a 3-D variable during
-    # Extractor runs. Each level becomes a separate output column
-    # (e.g. [0, 100, 500] → o2_0, o2_100, o2_500). None = no depth slicing.
+    # Depth levels (metres) to slice at during Extractor runs, when they should
+    # differ from compile_depth_slices. Each level becomes a separate output
+    # column (e.g. [0, 100, 500] → o2_0, o2_100, o2_500). None (the default, and
+    # what every shipped variable uses) falls back to compile_depth_slices, so
+    # extraction returns what the variable publishes; set it only to narrow a
+    # variable to fewer levels than it compiles.
     extract_depth_slices: Optional[list[int]] = None
     # Depth levels (metres) to select when compiling a 3-D variable into h2ds.
     # Each level becomes a separate output variable (e.g. [0, 100, 500, 1000]
     # → o2_0, o2_100, o2_500, o2_1000). None = no depth slicing in compiler.
+    # Also the default for extract_depth_slices, so this is the single place a
+    # 3-D variable's levels are declared unless extraction is narrowed.
     compile_depth_slices: Optional[list[int]] = None
     # Exact variable names as they appear in the compiled h2ds Zarr for this
     # var_key. Used to select only these columns when adding a variable to an
