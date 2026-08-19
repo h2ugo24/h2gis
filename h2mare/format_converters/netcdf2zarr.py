@@ -22,7 +22,7 @@ from h2mare.models import StoreDtype, step_freq
 from h2mare.processing.registry import PROCESSORS
 from h2mare.storage.audit import format_date_blocks, known_gap_days
 from h2mare.storage.provenance import (
-    annotate_delivered,
+    annotate_covered,
     merge_records,
     read_store_dates,
 )
@@ -511,6 +511,8 @@ class Netcdf2Zarr(BaseConverter):
         if not dataset_info:
             return
 
+        # The raw files say where each dataset's contribution begins; what the
+        # file holds from it is read back off the axis by annotate_covered.
         records = sorted(
             [
                 {
@@ -534,7 +536,7 @@ class Netcdf2Zarr(BaseConverter):
         raw = root.attrs.get("source_datasets")
         existing = json.loads(raw) if isinstance(raw, str) and raw else []
         combined = merge_records(existing, records)
-        combined = annotate_delivered(
+        combined = annotate_covered(
             combined, stored if stored is not None else read_store_dates(zarr_path)
         )
 

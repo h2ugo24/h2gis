@@ -20,11 +20,13 @@ import zarr
 
 from h2mare.storage.provenance import (
     COMPILED_PROVENANCE_ATTR,
-    annotate_delivered,
+    MODIFIED_ATTR,
+    annotate_covered,
     collect_source_datasets,
     merge_records,
     read_source_datasets,
     records_for_window,
+    refresh_provenance,
     refresh_root_attrs,
     write_compiled_provenance,
     write_provenance_for_window,
@@ -93,7 +95,8 @@ class TestRecordsForWindow:
 
     def test_records_are_sorted_by_start(self):
         got = records_for_window(_MANIFEST, _window("2020-01-01", "2020-12-31"))
-        assert [r["start_date"] for r in got] == sorted(r["start_date"] for r in got)
+        starts = [r["start_date"] for r in got]
+        assert starts == sorted(starts)
 
 
 class TestMergeRecords:
@@ -152,6 +155,132 @@ class TestMergeRecords:
         ]
         assert merge_records([], new) == new
 
+    def test_a_republished_window_takes_the_days_from_its_old_owner(self):
+        """
+        CMEMS extends its reprocessed product periodically, so re-downloading
+        the newly-reprocessed days means rep now supplies dates nrt supplied
+        before. Widening alone would leave both claiming them.
+        """
+        existing = [
+            {
+                "dataset_id": "REP",
+                "dataset_type": "rep",
+                "start_date": "2025-01-01",
+                "end_date": "2025-12-18",
+            },
+            {
+                "dataset_id": "NRT",
+                "dataset_type": "nrt",
+                "start_date": "2025-12-19",
+                "end_date": "2025-12-31",
+            },
+        ]
+        republished = [
+            {
+                "dataset_id": "REP",
+                "dataset_type": "rep",
+                "start_date": "2025-12-19",
+                "end_date": "2025-12-31",
+            }
+        ]
+
+        merged = merge_records(existing, republished)
+
+        assert [r["dataset_id"] for r in merged] == ["REP"]
+        assert merged[0]["end_date"] == "2025-12-31"
+
+    def test_a_partly_republished_window_moves_the_handover(self):
+        existing = [
+            {
+                "dataset_id": "REP",
+                "dataset_type": "rep",
+                "start_date": "2025-01-01",
+                "end_date": "2025-06-30",
+            },
+            {
+                "dataset_id": "NRT",
+                "dataset_type": "nrt",
+                "start_date": "2025-07-01",
+                "end_date": "2025-12-31",
+            },
+        ]
+        republished = [
+            {
+                "dataset_id": "REP",
+                "dataset_type": "rep",
+                "start_date": "2025-07-01",
+                "end_date": "2025-09-30",
+            }
+        ]
+
+        rep, nrt = merge_records(existing, republished)
+
+        assert rep["dataset_id"] == "REP"
+        assert nrt["start_date"] == "2025-10-01", "nrt keeps only what rep left"
+
+    def test_an_older_record_cannot_take_days_back(self):
+        """Only the run that just wrote gets to supersede."""
+        existing = [
+            {
+                "dataset_id": "REP",
+                "dataset_type": "rep",
+                "start_date": "2025-01-01",
+                "end_date": "2025-12-31",
+            }
+        ]
+        new = [
+            {
+                "dataset_id": "NRT",
+                "dataset_type": "nrt",
+                "start_date": "2025-12-19",
+                "end_date": "2025-12-31",
+            }
+        ]
+
+        merged = merge_records(existing, new)
+
+        assert [r["dataset_id"] for r in merged] == ["REP", "NRT"]
+        assert merged[0]["start_date"] == "2025-01-01"
+
+    def test_fields_from_a_previous_layout_do_not_survive(self):
+        """
+        h2ds only ever merges — nothing at that level recomputes a record — so
+        a merge that copied unknown keys through kept every field any past
+        version wrote. It carried `requested_*` long after that layout was gone.
+        """
+        stale = [
+            {
+                "dataset_id": "a",
+                "dataset_type": "rep",
+                "start_date": "2020-01-01",
+                "end_date": "2020-06-30",
+                "requested_start": "2020-01-01",
+                "requested_end": "2020-12-31",
+                "delivered_days": 180,
+            }
+        ]
+
+        [got] = merge_records(stale, [])
+
+        assert set(got) == {"dataset_id", "dataset_type", "start_date", "end_date"}
+
+    def test_per_write_fields_are_not_carried_through(self):
+        """days and updated describe a write, not a span, so a merge drops
+        them for annotate_covered to set again."""
+        existing = [
+            {
+                "dataset_id": "a",
+                "dataset_type": "nrt",
+                "start_date": "2020-01-01",
+                "end_date": "2020-04-20",
+                "days": 111,
+                "updated": "2020-04-20",
+            }
+        ]
+        [got] = merge_records(existing, [])
+
+        assert "days" not in got and "updated" not in got
+
 
 class TestWriteProvenanceForWindow:
     def test_writes_records_to_zarr_attrs(self, tmp_path):
@@ -164,8 +293,12 @@ class TestWriteProvenanceForWindow:
         got = _read_records(path)
         assert [r["dataset_type"] for r in got] == ["rep"]
 
-    def test_second_append_widens_coverage(self, tmp_path):
-        """Two runs over the same period must not lose the first one's span."""
+    def test_two_runs_still_describe_one_file(self, tmp_path):
+        """
+        Two runs over the same period must not leave the file claiming only the
+        second one. The fixture holds 2020-01-01..2020-01-05 throughout, and
+        both runs name the same dataset, so the file says so once.
+        """
         path = _write_zarr(tmp_path)
         write_provenance_for_window(
             path, _MANIFEST, _window("2020-07-01", "2020-08-31")
@@ -177,8 +310,32 @@ class TestWriteProvenanceForWindow:
         got = _read_records(path)
 
         assert len(got) == 1
-        assert got[0]["start_date"] == "2020-07-01"
-        assert got[0]["end_date"] == "2020-10-31"
+        assert got[0]["start_date"] == "2020-01-01"
+        assert got[0]["end_date"] == "2020-01-05"
+
+    def test_dates_come_from_the_file_not_the_window(self, tmp_path):
+        """The window asked for July; the file holds the first five days of
+        January, and that is what it has to report."""
+        path = _write_zarr(tmp_path)
+        write_provenance_for_window(
+            path, _MANIFEST, _window("2020-07-01", "2020-08-31")
+        )
+
+        [got] = _read_records(path)
+
+        assert got["start_date"] == "2020-01-01"
+        assert got["end_date"] == "2020-01-05"
+        assert got["days"] == 5
+
+    def test_the_write_is_stamped(self, tmp_path):
+        path = _write_zarr(tmp_path)
+        write_provenance_for_window(
+            path, _MANIFEST, _window("2020-01-01", "2020-06-30")
+        )
+
+        [got] = _read_records(path)
+
+        assert got["updated"] == pd.Timestamp.today().strftime("%Y-%m-%d")
 
     def test_window_outside_manifest_writes_nothing(self, tmp_path):
         path = _write_zarr(tmp_path)
@@ -193,65 +350,93 @@ class TestWriteProvenanceForWindow:
 
 
 # ---------------------------------------------------------------------------
-# annotate_delivered
+# annotate_covered
 #
-# start_date/end_date say what was *asked* for. chl's 1999 record reads
-# 1999-01-01 → 1999-12-31 because that is what the request was, and nothing in
-# the file states what actually arrived — so every later integrity question had
-# to reopen the data. Recording the delivered count alongside makes it a
-# metadata comparison, and conversion time is the only moment the truth is
-# available for archive_raw: false variables.
+# start_date/end_date are what the store actually holds, so a reader can answer
+# "which product covers which part of the archive, and where does rep hand over
+# to nrt" from metadata alone. The requested window stays alongside, because
+# comparing the two is what turns "did this product deliver what it was asked
+# for" into a metadata comparison rather than a re-read of the data.
 # ---------------------------------------------------------------------------
 
 
-class TestAnnotateDelivered:
-    _RECORD = {
-        "dataset_id": "ds-rep",
-        "dataset_type": "rep",
-        "start_date": "2020-01-01",
-        "end_date": "2020-01-10",
+def _rec(dataset_id, kind, start, end) -> dict:
+    return {
+        "dataset_id": dataset_id,
+        "dataset_type": kind,
+        "start_date": start,
+        "end_date": end,
     }
 
-    def test_counts_the_days_inside_the_span(self):
-        stored = pd.date_range("2020-01-01", "2020-01-10", freq="D")
-        [out] = annotate_delivered([self._RECORD], stored)
-        assert out["delivered_days"] == 10
 
-    def test_a_missing_day_shows_up_as_a_shortfall(self):
-        stored = pd.date_range("2020-01-01", "2020-01-10", freq="D").drop(
-            pd.Timestamp("2020-01-05")
-        )
-        [out] = annotate_delivered([self._RECORD], stored)
-        assert out["delivered_days"] == 9
+class TestAnnotateCovered:
+    _RECORD = _rec("ds-rep", "rep", "2020-01-01", "2020-01-10")
+    _YEAR = pd.date_range("2020-01-01", "2020-12-31", freq="D")
 
-    def test_records_delivered_bounds(self):
-        stored = pd.date_range("2020-01-03", "2020-01-08", freq="D")
-        [out] = annotate_delivered([self._RECORD], stored)
-        assert out["delivered_start"] == "2020-01-03"
-        assert out["delivered_end"] == "2020-01-08"
+    def test_the_file_is_accounted_for_end_to_end(self):
+        [out] = annotate_covered([self._RECORD], self._YEAR)
 
-    def test_days_outside_the_span_are_not_counted(self):
-        stored = pd.date_range("2019-01-01", "2021-12-31", freq="D")
-        [out] = annotate_delivered([self._RECORD], stored)
-        assert out["delivered_days"] == 10
-
-    def test_empty_span_gets_zero_and_no_bounds(self):
-        [out] = annotate_delivered([self._RECORD], pd.DatetimeIndex([]))
-        assert out["delivered_days"] == 0
-        assert "delivered_start" not in out
-
-    def test_requested_span_is_preserved(self):
-        [out] = annotate_delivered(
-            [self._RECORD], pd.date_range("2020-01-01", periods=3)
-        )
         assert out["start_date"] == "2020-01-01"
-        assert out["end_date"] == "2020-01-10"
+        assert out["end_date"] == "2020-12-31"
+        assert out["days"] == 366
+
+    def test_a_record_naming_one_week_still_claims_the_whole_file(self):
+        """
+        The shape that made 2026 unreadable: a store filled week by week kept a
+        record naming the most recent week, so the year appeared to hold seven
+        days. One dataset means the file is made of that dataset.
+        """
+        last_week = _rec("ds-nrt", "nrt", "2020-12-25", "2020-12-31")
+
+        [out] = annotate_covered([last_week], self._YEAR)
+
+        assert out["start_date"] == "2020-01-01"
+        assert out["end_date"] == "2020-12-31"
+
+    def test_a_handover_splits_at_the_second_dataset(self):
+        records = [
+            _rec("REP", "rep", "2020-01-01", "2020-06-30"),
+            _rec("NRT", "nrt", "2020-07-01", "2020-12-31"),
+        ]
+
+        rep, nrt = annotate_covered(records, self._YEAR)
+
+        assert (rep["start_date"], rep["end_date"]) == ("2020-01-01", "2020-06-30")
+        assert (nrt["start_date"], nrt["end_date"]) == ("2020-07-01", "2020-12-31")
+        assert rep["days"] + nrt["days"] == len(self._YEAR)
+
+    def test_days_counts_what_is_present_not_the_span(self):
+        gappy = self._YEAR.drop(pd.date_range("2020-03-01", "2020-03-10"))
+
+        [out] = annotate_covered([self._RECORD], gappy)
+
+        assert out["start_date"] == "2020-01-01"
+        assert out["end_date"] == "2020-12-31"
+        assert out["days"] == 356
+
+    def test_the_write_is_stamped(self):
+        [out] = annotate_covered([self._RECORD], self._YEAR)
+        assert out["updated"] == pd.Timestamp.today().strftime("%Y-%m-%d")
+
+    def test_a_file_with_no_axis_yields_nothing(self):
+        assert annotate_covered([self._RECORD], pd.DatetimeIndex([])) == []
+
+    def test_legacy_delivered_fields_do_not_survive(self):
+        legacy = {
+            **self._RECORD,
+            "delivered_days": 4,
+            "delivered_start": "2020-01-01",
+            "delivered_end": "2020-01-04",
+        }
+        [out] = annotate_covered([legacy], self._YEAR)
+
+        assert not [k for k in out if k.startswith("delivered_")]
 
     def test_is_idempotent(self):
         """Recomputed from the store, so re-running must not accumulate."""
         stored = pd.date_range("2020-01-01", "2020-01-10", freq="D")
-        once = annotate_delivered([self._RECORD], stored)
-        twice = annotate_delivered(once, stored)
+        once = annotate_covered([self._RECORD], stored)
+        twice = annotate_covered(once, stored)
         assert twice == once
 
 
@@ -322,15 +507,6 @@ def _seed_source_datasets(path, records: list[dict]) -> None:
     root.attrs["source_datasets"] = json.dumps(records)
 
 
-def _rec(dataset_id, kind, start, end) -> dict:
-    return {
-        "dataset_id": dataset_id,
-        "dataset_type": kind,
-        "start_date": start,
-        "end_date": end,
-    }
-
-
 def _read_compiled(path) -> dict:
     raw = zarr.open_group(str(path), mode="r").attrs.get(COMPILED_PROVENANCE_ATTR)
     return json.loads(raw) if raw else {}
@@ -380,7 +556,112 @@ class TestCollectSourceDatasets:
         )
 
 
+class TestRefreshProvenance:
+    """
+    The repair for records left narrower than the file. Convert fixes the period
+    it converts; the finished years behind it are never touched again.
+    """
+
+    def _store(self, tmp_path, records, n_days=365):
+        root = tmp_path / "store"
+        root.mkdir()
+        times = pd.date_range("2025-01-01", periods=n_days, freq="D")
+        xr.Dataset(
+            {"sst": (["time", "lat", "lon"], np.ones((n_days, 2, 2)))},
+            coords={"time": times, "lat": [0.0, 1.0], "lon": [0.0, 1.0]},
+        ).to_zarr(root / "sst_2025.zarr")
+        zarr.open_group(str(root / "sst_2025.zarr"), mode="r+").attrs[
+            "source_datasets"
+        ] = json.dumps(records)
+        return SimpleNamespace(store_root=root, _log=lambda *a: None)
+
+    def test_a_week_wide_record_is_widened_to_the_file(self, tmp_path):
+        catalog = self._store(
+            tmp_path, [_rec("NRT", "nrt", "2025-12-25", "2025-12-31")]
+        )
+
+        assert refresh_provenance(catalog) == 1
+
+        [got] = read_source_datasets(tmp_path / "store" / "sst_2025.zarr")
+        assert got["start_date"] == "2025-01-01"
+        assert got["end_date"] == "2025-12-31"
+        assert got["days"] == 365
+
+    def test_a_handover_is_kept(self, tmp_path):
+        catalog = self._store(
+            tmp_path,
+            [
+                _rec("REP", "rep", "2025-01-01", "2025-06-30"),
+                _rec("NRT", "nrt", "2025-07-01", "2025-12-31"),
+            ],
+        )
+
+        refresh_provenance(catalog)
+
+        rep, nrt = read_source_datasets(tmp_path / "store" / "sst_2025.zarr")
+        assert rep["end_date"] == "2025-06-30"
+        assert nrt["start_date"] == "2025-07-01"
+
+    def test_a_file_already_right_is_left_alone(self, tmp_path):
+        catalog = self._store(
+            tmp_path, [_rec("NRT", "nrt", "2025-12-25", "2025-12-31")]
+        )
+        refresh_provenance(catalog)
+
+        assert refresh_provenance(catalog) == 0, "second pass has nothing to do"
+
+    def test_a_file_with_no_records_is_left_for_backfill(self, tmp_path):
+        catalog = self._store(tmp_path, [])
+
+        assert refresh_provenance(catalog) == 0
+
+
 class TestWriteCompiledProvenance:
+    def test_the_file_is_stamped_once(self, tmp_path):
+        """
+        One stamp for the file, not one per variable: how current a variable is
+        already reads off its own end_date, and what that cannot say is when the
+        file itself last changed.
+        """
+        path = _write_zarr(tmp_path)
+
+        write_compiled_provenance(
+            path,
+            {
+                "sst": [_rec("sst-rep", "rep", "2020-01-01", "2020-01-05")],
+                "ssh": [_rec("ssh-rep", "rep", "2020-01-01", "2020-01-05")],
+            },
+        )
+
+        attrs = zarr.open_group(str(path), mode="r").attrs
+        assert attrs[MODIFIED_ATTR] == pd.Timestamp.today().strftime("%Y-%m-%d")
+        for records in _read_compiled(path).values():
+            assert all("updated" not in r for r in records)
+
+    def test_the_stamp_is_rewritten_not_kept(self, tmp_path):
+        path = _write_zarr(tmp_path)
+        zarr.open_group(str(path), mode="r+").attrs[MODIFIED_ATTR] = "2020-01-06"
+
+        write_compiled_provenance(
+            path, {"sst": [_rec("sst-rep", "rep", "2020-01-01", "2020-01-05")]}
+        )
+
+        attrs = zarr.open_group(str(path), mode="r").attrs
+        assert attrs[MODIFIED_ATTR] == pd.Timestamp.today().strftime("%Y-%m-%d")
+
+    def test_a_config_refresh_does_not_wipe_the_stamp(self, tmp_path):
+        """refresh_root_attrs replaces the root wholesale, and the stamp has no
+        counterpart in config to restore it from."""
+        path = _write_zarr(tmp_path)
+        write_compiled_provenance(
+            path, {"sst": [_rec("sst-rep", "rep", "2020-01-01", "2020-01-05")]}
+        )
+
+        refresh_root_attrs(path, {"title": "h2ds"})
+
+        attrs = zarr.open_group(str(path), mode="r").attrs
+        assert attrs[MODIFIED_ATTR] == pd.Timestamp.today().strftime("%Y-%m-%d")
+
     def test_keyed_by_variable_not_a_flat_list(self, tmp_path):
         """h2ds merges many sources, so a record has to say which one it came from."""
         path = _write_zarr(tmp_path)
