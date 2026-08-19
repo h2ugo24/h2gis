@@ -76,6 +76,25 @@ def _load_completed_keys(tmp_path: Path) -> set[str]:
         return set(json.load(f))
 
 
+def null_summary_lines(result: pd.DataFrame, columns: list[str]) -> list[str]:
+    """
+    One line per extracted variable: its null count, and what share that is.
+
+    The share is shown only where something is actually null. A clean run
+    should read as a column of zeros rather than a column of "(0.0%)" to scan
+    past, and the point of the percentage is to tell a couple of stray
+    geometries from a variable that came back mostly empty.
+    """
+    total = len(result)
+    lines = []
+
+    for col, count in result[columns].isnull().sum().items():
+        share = f" ({count / total:.1%})" if count and total else ""
+        lines.append(f"  {col}: {count}{share}")
+
+    return lines
+
+
 def _warn_if_wholly_failed(result: pd.DataFrame, errors: list[Exception]) -> None:
     """
     Say something when *every* geometry came back empty.
@@ -1280,8 +1299,8 @@ class Extractor:
         logger.info("=" * 60)
         logger.info("  Number of null values per variable:")
         result_cols = [c for c in df_processed.columns if c not in self.data.columns]
-        for col, count in df_processed[result_cols].isnull().sum().items():
-            logger.info(f"  {col}: {count}")
+        for line in null_summary_lines(df_processed, result_cols):
+            logger.info(line)
         logger.info("=" * 60)
 
         if all_succeeded:

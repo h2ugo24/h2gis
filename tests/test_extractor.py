@@ -19,6 +19,7 @@ from h2mare.processing.extractor import (
     _save_completed_keys,
     _warn_if_wholly_failed,
     ensure_row_id,
+    null_summary_lines,
     resolve_compiled_vars,
     resolve_read_from,
     split_vars_by_source,
@@ -1373,3 +1374,52 @@ class TestEmptyVarsMeansEverything:
         cfg = SimpleNamespace(compiled_vars=[], time_step=TimeStep.HOURLY)
         with pytest.raises(ValueError, match="compiled_vars"):
             resolve_compiled_vars(_STORED, None, "waves", cfg)
+
+
+class TestNullSummaryLines:
+    """The end-of-run tally: a count always, a share only where it means something."""
+
+    @staticmethod
+    def _df(**cols) -> pd.DataFrame:
+        return pd.DataFrame(cols)
+
+    def test_a_clean_variable_shows_no_share(self):
+        df = self._df(sst=[1.0, 2.0, 3.0])
+
+        assert null_summary_lines(df, ["sst"]) == ["  sst: 0"]
+
+    def test_a_partial_null_shows_its_share(self):
+        df = self._df(sst=[1.0, float("nan"), 3.0])
+
+        assert null_summary_lines(df, ["sst"]) == ["  sst: 1 (33.3%)"]
+
+    def test_an_all_null_variable_reads_100_percent(self):
+        df = self._df(sst=[float("nan")] * 4)
+
+        assert null_summary_lines(df, ["sst"]) == ["  sst: 4 (100.0%)"]
+
+    def test_one_decimal_place(self):
+        df = self._df(sst=[float("nan")] + [1.0] * 6)
+
+        assert null_summary_lines(df, ["sst"]) == ["  sst: 1 (14.3%)"]
+
+    def test_columns_are_reported_in_order(self):
+        df = self._df(
+            a=[1.0, 2.0], b=[float("nan"), float("nan")], c=[1.0, float("nan")]
+        )
+
+        assert null_summary_lines(df, ["a", "b", "c"]) == [
+            "  a: 0",
+            "  b: 2 (100.0%)",
+            "  c: 1 (50.0%)",
+        ]
+
+    def test_an_empty_frame_does_not_divide_by_zero(self):
+        df = pd.DataFrame({"sst": pd.Series(dtype=float)})
+
+        assert null_summary_lines(df, ["sst"]) == ["  sst: 0"]
+
+    def test_only_the_requested_columns_are_tallied(self):
+        df = self._df(sst=[float("nan")], lon=[float("nan")])
+
+        assert null_summary_lines(df, ["sst"]) == ["  sst: 1 (100.0%)"]
