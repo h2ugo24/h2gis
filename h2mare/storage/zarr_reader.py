@@ -26,12 +26,65 @@ from h2mare.utils.spatial import sel_padded_bbox
 # whole-day upper bound the compile and download paths do.
 _end_of_day = end_of_day
 
+#: Spatial coordinates whose float drift between files is worth snapping away.
+_SNAPPABLE_COORDS = ("lat", "lon")
+
+#: Largest per-point disagreement (degrees) still treated as one grid written
+#: twice rather than two different grids. Observed drift is ~5e-12 degrees — a
+#: sub-micrometre relabel — while the coarsest grid step in the pipeline is
+#: 0.25, so the gap between "noise" and "genuinely different" is nine orders of
+#: magnitude wide and the exact threshold is not delicate.
+_AXIS_SNAP_TOL = 1e-9
+
+
+def snap_axes_to_reference(
+    ds: xr.Dataset,
+    reference: dict[str, np.ndarray],
+    tol: float = _AXIS_SNAP_TOL,
+) -> tuple[xr.Dataset, dict[str, float]]:
+    """
+    Replace spatial axes that differ from *reference* only by float noise.
+
+    ``open_mfdataset(combine="by_coords")`` compares coordinate arrays exactly.
+    Two files written from the same grid at different times can disagree in the
+    last floating-point bits, and xarray then stops treating the axis as shared
+    and starts treating it as one to concatenate along — surfacing as
+    "Resulting object does not have monotonic global indexes along dimension
+    lon", which says nothing about the actual cause.
+
+    Only axes of identical length and within *tol* everywhere are snapped, so a
+    genuinely different grid — different extent, spacing or size — still reaches
+    xarray and still raises.
+
+    Returns:
+        The dataset, and ``{coord: max_abs_delta}`` for whatever was snapped.
+    """
+    snapped: dict[str, float] = {}
+
+    for name, ref in reference.items():
+        if name not in ds.coords:
+            continue
+        current = ds.coords[name].values
+        if current.shape != ref.shape or np.array_equal(current, ref):
+            continue
+
+        delta = float(np.abs(current - ref).max())
+        if delta > tol:
+            continue
+
+        ds = ds.assign_coords({name: ref})
+        snapped[name] = delta
+
+    return ds, snapped
+
 
 class ZarrReader:
     """Opens Zarr datasets for the store catalogued by *index*."""
 
     def __init__(self, index: ZarrIndex) -> None:
         self._index = index
+        # One warning per coordinate per reader, not one per drifted file.
+        self._drift_reported: set[str] = set()
 
     # ---- index queries the opening paths rely on -------------------------
     # Named to match the index so the opening logic reads the same either way.
@@ -156,6 +209,7 @@ class ZarrReader:
             raise FileNotFoundError(f"No zarr files contain dates: {date_list}")
 
         paths = list(path_mapping.keys())
+        reference = self._reference_axes(paths)
 
         # Open datasets
         try:
@@ -168,7 +222,9 @@ class ZarrReader:
                 coords="minimal",  # type: ignore[arg-type]
                 compat="override",
                 chunks=chunks,
-                preprocess=lambda d: self._preprocess_dataset(d, bbox, variables),
+                preprocess=lambda d: self._preprocess_dataset(
+                    d, bbox, variables, reference
+                ),
             )
         except Exception as e:
             raise RuntimeError(f"Failed to open zarr files: {e}") from e
@@ -261,6 +317,8 @@ class ZarrReader:
                 f"No zarr files found for range: {start.date()} to {end.date()}"
             )
 
+        reference = self._reference_axes(paths)
+
         # Open datasets
         try:
             ds = xr.open_mfdataset(
@@ -272,7 +330,9 @@ class ZarrReader:
                 coords="minimal",  # type: ignore[arg-type]
                 compat="override",
                 chunks=chunks,
-                preprocess=lambda d: self._preprocess_dataset(d, bbox, variables),
+                preprocess=lambda d: self._preprocess_dataset(
+                    d, bbox, variables, reference
+                ),
             )
         except Exception as e:
             raise RuntimeError(f"Failed to open zarr files: {e}") from e
@@ -346,11 +406,38 @@ class ZarrReader:
         """
         return getattr(self._index.var_config, "time_step", TimeStep.DAILY)
 
+    @staticmethod
+    def _reference_axes(paths: Sequence) -> dict[str, np.ndarray]:
+        """
+        The spatial axes every file in this open is snapped onto.
+
+        Taken from the lowest-sorted path so one read is self-consistent and
+        repeatable, and only when more than one file is involved — a single
+        file is never combined against anything and defines its own axes.
+
+        Failure here is not fatal: without a reference the snap is skipped and
+        xarray behaves exactly as it did before.
+        """
+        if len(paths) < 2:
+            return {}
+
+        try:
+            with xr.open_zarr(sorted(map(str, paths))[0], consolidated=False) as ds:
+                return {
+                    name: ds.coords[name].values
+                    for name in _SNAPPABLE_COORDS
+                    if name in ds.coords
+                }
+        except Exception as e:  # noqa: BLE001 - advisory only
+            logger.debug(f"Could not read reference axes for snapping: {e}")
+            return {}
+
     def _preprocess_dataset(
         self,
         ds: xr.Dataset,
         bbox: BBox | None,
         variables: str | Sequence[str] | None,
+        reference: dict[str, np.ndarray] | None = None,
     ) -> xr.Dataset:
         """
         Preprocess dataset: apply bbox and variable selection.
@@ -361,6 +448,9 @@ class ZarrReader:
             ds: Input dataset
             bbox: Bounding box to apply
             variables: Variables to select
+            reference: Spatial axes to snap float-drifted ones onto, from
+                :meth:`_reference_axes`. Omitted for a single-file open, where
+                there is nothing to combine against.
 
         Returns:
             Preprocessed dataset
@@ -384,6 +474,24 @@ class ZarrReader:
         # Ensure lat is monotonically increasing (ERA5 comes north→south)
         if "lat" in ds.coords and ds.lat.values[0] > ds.lat.values[-1]:
             ds = ds.sortby("lat")
+
+        # After the orientation fix so both sides are compared the same way
+        # round, and before the bbox subset so every file is cut from an
+        # identical axis and the subsets line up too.
+        if reference:
+            ds, snapped = snap_axes_to_reference(ds, reference)
+            for coord, delta in snapped.items():
+                if coord in self._drift_reported:
+                    continue
+                self._drift_reported.add(coord)
+                self._log(
+                    "warning",
+                    f"[{self.var_key}] '{coord}' differs between store files by "
+                    f"up to {delta:.2e}° — float noise from the same grid being "
+                    f"written more than once, snapped so the files can be "
+                    f"combined. The store is inconsistent; re-converting the odd "
+                    f"file out settles it.",
+                )
 
         # Apply spatial subset
         if bbox is not None:
