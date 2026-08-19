@@ -413,6 +413,14 @@ def backfill_provenance(catalog: "ZarrCatalog", rep_end_date: DateLike) -> int:
 #: the name would hand a reader a dict where it expected a list.
 COMPILED_PROVENANCE_ATTR = "source_datasets_by_variable"
 
+#: Root attribute holding the date h2ds was last written.
+#:
+#: ACDD's own name for it, and the counterpart to the ``date_created`` the
+#: configured globals already carry. One per file rather than one per variable:
+#: how current a variable is reads off its own ``end_date``, and the question
+#: that leaves unanswered is when the file itself last changed.
+MODIFIED_ATTR = "date_modified"
+
 
 def read_source_datasets(zarr_path: Path) -> list[dict]:
     """
@@ -473,24 +481,22 @@ def write_compiled_provenance(
     raw = root.attrs.get(COMPILED_PROVENANCE_ATTR)
     existing = json.loads(raw) if isinstance(raw, str) and raw else {}
 
-    # Stamped here rather than by annotate_covered, which never runs at this
-    # level: h2ds has no per-variable time axis to recompute a record from, so
-    # it merges what its sources worked out. The date it can supply is its own —
-    # when this compile last refreshed the variable.
-    today = pd.Timestamp.today().strftime("%Y-%m-%d")
-
     combined = dict(existing)
     for var_key, records in by_variable.items():
-        merged = merge_records(existing.get(var_key, []), records)
-        combined[var_key] = [{**record, "updated": today} for record in merged]
+        combined[var_key] = merge_records(existing.get(var_key, []), records)
 
     root.attrs[COMPILED_PROVENANCE_ATTR] = json.dumps(combined, sort_keys=True)
+    # One stamp for the file, not one per variable. How current each variable is
+    # already reads off its own end_date; what that cannot say is when the file
+    # was last written. Named for the ACDD attribute that means exactly this,
+    # beside the date_created the globals already carry.
+    root.attrs[MODIFIED_ATTR] = pd.Timestamp.today().strftime("%Y-%m-%d")
     return combined
 
 
 #: Root attributes a refresh must carry across rather than overwrite, because
 #: they are written by the pipeline itself and have no counterpart in config.
-_DERIVED_ROOT_ATTRS = (COMPILED_PROVENANCE_ATTR,)
+_DERIVED_ROOT_ATTRS = (COMPILED_PROVENANCE_ATTR, MODIFIED_ATTR)
 
 
 def refresh_root_attrs(zarr_path: Path, global_attrs: dict) -> dict:

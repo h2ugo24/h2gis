@@ -20,6 +20,7 @@ import zarr
 
 from h2mare.storage.provenance import (
     COMPILED_PROVENANCE_ATTR,
+    MODIFIED_ATTR,
     annotate_covered,
     collect_source_datasets,
     merge_records,
@@ -555,41 +556,50 @@ class TestCollectSourceDatasets:
 
 
 class TestWriteCompiledProvenance:
-    def test_every_record_is_stamped_with_the_compile(self, tmp_path):
+    def test_the_file_is_stamped_once(self, tmp_path):
         """
-        annotate_covered never runs here — h2ds has no per-variable axis to
-        recompute from — so without this the records reach h2ds unstamped.
+        One stamp for the file, not one per variable: how current a variable is
+        already reads off its own end_date, and what that cannot say is when the
+        file itself last changed.
         """
         path = _write_zarr(tmp_path)
+
+        write_compiled_provenance(
+            path,
+            {
+                "sst": [_rec("sst-rep", "rep", "2020-01-01", "2020-01-05")],
+                "ssh": [_rec("ssh-rep", "rep", "2020-01-01", "2020-01-05")],
+            },
+        )
+
+        attrs = zarr.open_group(str(path), mode="r").attrs
+        assert attrs[MODIFIED_ATTR] == pd.Timestamp.today().strftime("%Y-%m-%d")
+        for records in _read_compiled(path).values():
+            assert all("updated" not in r for r in records)
+
+    def test_the_stamp_is_rewritten_not_kept(self, tmp_path):
+        path = _write_zarr(tmp_path)
+        zarr.open_group(str(path), mode="r+").attrs[MODIFIED_ATTR] = "2020-01-06"
 
         write_compiled_provenance(
             path, {"sst": [_rec("sst-rep", "rep", "2020-01-01", "2020-01-05")]}
         )
 
-        [got] = _read_compiled(path)["sst"]
-        assert got["updated"] == pd.Timestamp.today().strftime("%Y-%m-%d")
+        attrs = zarr.open_group(str(path), mode="r").attrs
+        assert attrs[MODIFIED_ATTR] == pd.Timestamp.today().strftime("%Y-%m-%d")
 
-    def test_a_stale_stamp_is_replaced_not_kept(self, tmp_path):
+    def test_a_config_refresh_does_not_wipe_the_stamp(self, tmp_path):
+        """refresh_root_attrs replaces the root wholesale, and the stamp has no
+        counterpart in config to restore it from."""
         path = _write_zarr(tmp_path)
-        zarr.open_group(str(path), mode="r+").attrs[COMPILED_PROVENANCE_ATTR] = (
-            json.dumps(
-                {
-                    "sst": [
-                        {
-                            **_rec("sst-rep", "rep", "2020-01-01", "2020-01-05"),
-                            "updated": "2020-01-06",
-                        }
-                    ]
-                }
-            )
-        )
-
         write_compiled_provenance(
             path, {"sst": [_rec("sst-rep", "rep", "2020-01-01", "2020-01-05")]}
         )
 
-        [got] = _read_compiled(path)["sst"]
-        assert got["updated"] == pd.Timestamp.today().strftime("%Y-%m-%d")
+        refresh_root_attrs(path, {"title": "h2ds"})
+
+        attrs = zarr.open_group(str(path), mode="r").attrs
+        assert attrs[MODIFIED_ATTR] == pd.Timestamp.today().strftime("%Y-%m-%d")
 
     def test_keyed_by_variable_not_a_flat_list(self, tmp_path):
         """h2ds merges many sources, so a record has to say which one it came from."""
