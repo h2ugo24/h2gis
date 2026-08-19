@@ -1310,3 +1310,66 @@ class TestWarnIfWhollyFailed:
         _warn_if_wholly_failed(pd.DataFrame(), [ValueError("boom")])
 
         assert seen == []
+
+
+class TestEmptyVarsMeansEverything:
+    """
+    `run({"waves": []})` is the documented way to ask for everything a var_key
+    publishes. Read as an explicit selection of nothing it reached the compiled
+    reader with an empty request, which blamed the config — "declares no
+    compiled_vars" — for something the caller had said perfectly well.
+    """
+
+    _R = TestProcessSingleVarkeyRouting
+
+    def _extractor(self, times, **kwargs) -> Extractor:
+        df = pd.DataFrame({"time": times, "lon": [-9.0, -1.0], "lat": [31.0, 39.0]})
+        ext = _extractor(df, time_col="time", **kwargs)
+        ext.app_config = SimpleNamespace(
+            variables={"atm-accum-avg": _atm_config(), "h2ds": _h2ds_config()}
+        )
+        return ext
+
+    def test_empty_list_reads_everything_from_the_compiled_store(self, monkeypatch):
+        """Regression: raised 'declares no compiled_vars' for a populated config."""
+        self._R()._patch_catalogs(monkeypatch, self._R._hourly_ds(), self._R._h2ds())
+        ext = self._extractor(["2020-01-01", "2020-01-02"])
+
+        out = ext.process_single_varkey("atm-accum-avg", vars=[])
+
+        assert set(_atm_config().compiled_vars) <= set(out.columns)
+
+    def test_empty_list_matches_none(self, monkeypatch):
+        self._R()._patch_catalogs(monkeypatch, self._R._hourly_ds(), self._R._h2ds())
+        ext = self._extractor(["2020-01-01", "2020-01-02"])
+
+        by_empty = ext.process_single_varkey("atm-accum-avg", vars=[])
+        by_none = ext.process_single_varkey("atm-accum-avg", vars=None)
+
+        assert list(by_empty.columns) == list(by_none.columns)
+
+    def test_empty_list_on_the_native_path_too(self, monkeypatch):
+        self._R()._patch_catalogs(monkeypatch, self._R._hourly_ds(), self._R._h2ds())
+        ext = self._extractor(
+            ["2020-01-01 03:00:00", "2020-01-01 15:00:00"], read_from="native"
+        )
+
+        out = ext.process_single_varkey("atm-accum-avg", vars=[])
+
+        assert set(_atm_config().compiled_vars) <= set(out.columns)
+
+    def test_a_real_selection_is_still_honoured(self, monkeypatch):
+        """The collapse must not swallow an actual one-variable request."""
+        self._R()._patch_catalogs(monkeypatch, self._R._hourly_ds(), self._R._h2ds())
+        ext = self._extractor(["2020-01-01", "2020-01-02"])
+
+        out = ext.process_single_varkey("atm-accum-avg", vars=["ekman_anom"])
+
+        assert "ekman_anom" in out.columns
+        assert "tp" not in out.columns
+
+    def test_a_var_key_publishing_nothing_still_says_so(self):
+        """The original message stays reachable for the case it describes."""
+        cfg = SimpleNamespace(compiled_vars=[], time_step=TimeStep.HOURLY)
+        with pytest.raises(ValueError, match="compiled_vars"):
+            resolve_compiled_vars(_STORED, None, "waves", cfg)

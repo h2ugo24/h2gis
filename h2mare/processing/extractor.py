@@ -772,6 +772,14 @@ class Extractor:
         """
         vars = [vars] if isinstance(vars, str) else vars
 
+        # An empty list is the documented way to say "everything this var_key
+        # publishes" — `run({"seapodym": [], "radiation": ["tisr"]})` — not an
+        # explicit selection of nothing. Collapsed to None here so every
+        # helper downstream sees one sentinel for "all" instead of each having
+        # to remember there are two.
+        if not vars:
+            vars = None
+
         # Moon and bathy first since they do not need data from ZarCatalog
         if var_key == "moon":
             return self._extract_moon_phase(self.data)
