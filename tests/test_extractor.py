@@ -1060,3 +1060,159 @@ class TestResolveCoverageEndOfDay:
         dates = ext._resolve_coverage(self._catalog())
 
         assert dates == [pd.Timestamp("2020-01-05 23:00:00")]
+
+
+def _depth_config(
+    *, extract: list[int] | None = None, compile_: list[int] | None = None
+) -> SimpleNamespace:
+    """thetao/o2-shaped config: one stored var on a depth axis, sliced names published."""
+    return SimpleNamespace(
+        compiled_vars=[f"thetao_{d}" for d in (compile_ or [])],
+        compile_depth_slices=compile_,
+        extract_depth_slices=extract,
+        time_step=TimeStep.DAILY,
+        rename_lonlat=False,
+        source="cmems",
+    )
+
+
+def _depth_ds(levels: list[float] = [0.0, 100.0, 500.0, 1000.0]) -> xr.Dataset:
+    """One variable on a depth axis, valued so each level is identifiable."""
+    times = pd.date_range("2020-01-01", periods=5, freq="D")
+    lats, lons = [30.0, 35.0, 40.0], [-10.0, -5.0, 0.0]
+    data = np.zeros((len(times), len(levels), len(lats), len(lons)))
+    for i, lvl in enumerate(levels):
+        data[:, i, :, :] = lvl
+    return xr.Dataset(
+        {"thetao": (["time", "depth", "lat", "lon"], data)},
+        coords={"time": times, "depth": levels, "lat": lats, "lon": lons},
+    )
+
+
+class TestDepthVariables:
+    """
+    A 3-D variable's compiled_vars name post-slicing columns (thetao_100, …)
+    while its store holds one variable on a depth axis. Comparing the two — as
+    the publish/store reconciliation did — reported every level as a gap in the
+    store and refused to extract at all.
+    """
+
+    def _extractor(self, cfg, monkeypatch, ds) -> Extractor:
+        catalog = MagicMock()
+        catalog.var_key = "thetao"
+        catalog.get_time_coverage.return_value = DateRange(
+            pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05")
+        )
+        catalog.get_bbox.return_value = BBox(-20.0, 30.0, 20.0, 50.0)
+        catalog.open_dataset.return_value = ds
+        monkeypatch.setattr(extractor_module, "ZarrCatalog", lambda _vk, **_kw: catalog)
+
+        df = pd.DataFrame(
+            {
+                "time": ["2020-01-01", "2020-01-02"],
+                "lon": [-9.0, -1.0],
+                "lat": [31.0, 39.0],
+            }
+        )
+        ext = _extractor(df, time_col="time")
+        ext.app_config = SimpleNamespace(
+            variables={"thetao": cfg, "h2ds": _h2ds_config()}
+        )
+        return ext
+
+    def test_depth_levels_are_not_reported_as_a_gap_in_the_store(self, monkeypatch):
+        """Regression: raised 'this is a gap in the store — re-run convert'."""
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100, 500, 1000])
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
+
+        out = ext.process_single_varkey("thetao")
+
+        assert set(out.columns) >= {"thetao_0", "thetao_100"}
+        assert out["thetao_0"].tolist() == [0.0, 0.0]
+        assert out["thetao_100"].tolist() == [100.0, 100.0]
+
+    def test_extract_slices_may_differ_from_compile_slices(self, monkeypatch):
+        """o2 extracts 3 levels and compiles 4; the two lists are independent."""
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100, 500, 1000])
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
+
+        out = ext.process_single_varkey("thetao")
+
+        sliced = {c for c in out.columns if c.startswith("thetao_")}
+        assert sliced == {"thetao_0", "thetao_100"}  # not the four compiled ones
+
+    def test_missing_extract_slices_falls_back_to_compile_slices(self, monkeypatch):
+        """
+        thetao declares only compile_depth_slices. Without a fallback the depth
+        axis survives into extraction and the geometry engine's dimensionless
+        .mean() averages it away into one value spanning the whole range.
+        """
+        cfg = _depth_config(extract=None, compile_=[0, 500])
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
+
+        out = ext.process_single_varkey("thetao")
+
+        assert {"thetao_0", "thetao_500"} <= set(out.columns)
+        assert out["thetao_500"].tolist() == [500.0, 500.0]
+
+    def test_no_declared_levels_at_all_is_refused(self, monkeypatch):
+        cfg = _depth_config(extract=None, compile_=None)
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
+
+        with pytest.raises(ValueError, match="declares no depth levels"):
+            ext.process_single_varkey("thetao")
+
+    def test_a_single_level_can_be_named(self, monkeypatch):
+        """vars= on a depth variable names the post-expansion columns."""
+        cfg = _depth_config(extract=[0, 100, 500], compile_=[0, 100, 500])
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
+
+        out = ext.process_single_varkey("thetao", vars=["thetao_100"])
+
+        sliced = {c for c in out.columns if c.startswith("thetao_")}
+        assert sliced == {"thetao_100"}
+        assert out["thetao_100"].tolist() == [100.0, 100.0]
+
+    def test_the_bare_var_key_means_every_level(self, monkeypatch):
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100])
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
+
+        out = ext.process_single_varkey("thetao", vars=["thetao"])
+
+        assert {"thetao_0", "thetao_100"} <= set(out.columns)
+
+    def test_an_unavailable_level_names_the_ones_that_exist(self, monkeypatch):
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100, 500, 1000])
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
+
+        with pytest.raises(ValueError) as err:
+            ext.process_single_varkey("thetao", vars=["thetao_1000"])
+
+        msg = str(err.value)
+        assert "thetao_1000" in msg
+        assert "thetao_100" in msg  # what it does yield
+        assert "extract_depth_slices" in msg
+
+
+class TestSplitVarsBySourceDepth:
+    def test_depth_disables_the_reconciliation(self):
+        """The two sides are not comparable, so nothing is reported missing."""
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100, 500, 1000])
+        assert split_vars_by_source(
+            None, ["thetao"], "thetao", cfg, has_depth=True
+        ) == (
+            [],
+            [],
+        )
+
+    def test_depth_passes_a_request_through_untouched(self):
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100])
+        assert split_vars_by_source(
+            ["thetao_100"], ["thetao"], "thetao", cfg, has_depth=True
+        ) == (["thetao_100"], [])
+
+    def test_without_depth_the_reconciliation_still_runs(self):
+        """The flag must not weaken the check for flat variables."""
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100])
+        with pytest.raises(ValueError, match="gap in"):
+            split_vars_by_source(None, ["thetao"], "thetao", cfg, has_depth=False)

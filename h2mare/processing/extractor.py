@@ -248,6 +248,8 @@ def split_vars_by_source(
     stored: list[str],
     var_key: str,
     var_config,
+    *,
+    has_depth: bool = False,
 ) -> tuple[list[str], list[str]]:
     """
     Split a request into what the native store holds and what the compiled owes.
@@ -269,14 +271,28 @@ def split_vars_by_source(
     rather than being quietly backfilled from the compiled store — that would
     mask a hole in the store.
 
+    ``has_depth`` disables the reconciliation entirely, because for a 3-D
+    variable ``compiled_vars`` and the store are not comparable: the store holds
+    one variable on a ``depth`` axis (``thetao``) while ``compiled_vars`` names
+    the columns it becomes after slicing (``thetao_100``, …). Nor can the check
+    simply be deferred until after the expansion — extraction slices at
+    ``extract_depth_slices`` while ``compiled_vars`` follows
+    ``compile_depth_slices``, and config explicitly allows the two to differ
+    (``o2`` extracts 3 levels and compiles 4). There is nothing to reconcile;
+    :meth:`Extractor._preprocess_depth_slices` owns which levels appear.
+
     Returns:
         ``(from_native, from_compiled)``. For a daily store ``from_compiled`` is
-        always empty.
+        always empty. With ``has_depth`` the request passes through untouched,
+        to be validated against the post-expansion names instead.
 
     Raises:
         ValueError: for names that belong to neither side, and for a daily store
             that cannot satisfy what its own config publishes.
     """
+    if has_depth:
+        return (list(requested) if requested is not None else []), []
+
     declared = _declared_vars(var_config)
     stored_set, declared_set = set(stored), set(declared)
 
@@ -756,18 +772,26 @@ class Extractor:
         ds = vr_catalog.open_dataset(dates=dates_resolved, bbox=bounds)
 
         warn_on_subdaily_store(var_key, var_cfg, ds)
+        has_depth = "depth" in ds.dims
         from_native, from_compiled = split_vars_by_source(
-            vars, [str(v) for v in ds.data_vars], var_key, var_cfg
+            vars,
+            [str(v) for v in ds.data_vars],
+            var_key,
+            var_cfg,
+            has_depth=has_depth,
         )
 
-        if from_native:
+        # Gated on the store's own dims rather than on the config key: a depth
+        # axis left in place is not an error, it is silently averaged away by
+        # the geometry engine's dimensionless .mean().
+        if has_depth:
+            ds = self._preprocess_depth_slices(ds, var_key, var_cfg)
+            if from_native:
+                ds = self._select_depth_columns(ds, from_native, var_key)
+        elif from_native:
             ds = ds[from_native]
 
         ds = ds.sortby("time")
-
-        depth_slices = var_cfg.extract_depth_slices
-        if depth_slices is not None:
-            ds = self._preprocess_depth_slices(ds, var_key, depth_slices)
 
         result = self._extract(data_resolved, ds, var_cfg.rename_lonlat, n_workers)
 
@@ -1495,10 +1519,68 @@ class Extractor:
             return pd.DataFrame(out).set_index(self.index_col)
         return out
 
+    @staticmethod
+    def _resolve_depth_slices(var_key: str, var_config) -> list[int]:
+        """
+        Depth levels to slice at, falling back to the compile-time ones.
+
+        ``extract_depth_slices`` is optional and several 3-D variables omit it
+        (``thetao``). Left unsliced, the ``depth`` axis survives into extraction
+        and the geometry engine's dimensionless ``.mean()`` silently averages it
+        away — a single 0-1000 m number reported under the plain variable name.
+        So fall back to ``compile_depth_slices``, which is the same variable's
+        own statement of which levels are worth publishing, and makes extraction
+        agree with the compiled store and Parquet.
+        """
+        levels = getattr(var_config, "extract_depth_slices", None)
+        if levels is not None:
+            return list(levels)
+
+        fallback = getattr(var_config, "compile_depth_slices", None)
+        if fallback is None:
+            raise ValueError(
+                f"[{var_key}] has a depth axis but declares no depth levels. "
+                f"Set extract_depth_slices (or compile_depth_slices) in its "
+                f"config entry — without them the depth axis would be averaged "
+                f"away into one value spanning the whole range."
+            )
+
+        logger.info(
+            f"[{var_key}] no extract_depth_slices; slicing at the "
+            f"compile_depth_slices levels instead: {list(fallback)}"
+        )
+        return list(fallback)
+
+    def _select_depth_columns(
+        self, ds: xr.Dataset, requested: list[str], var_key: str
+    ) -> xr.Dataset:
+        """
+        Subset an expanded 3-D dataset by the names the caller actually sees.
+
+        After expansion the columns are ``<var_key>_<level>``, so that is what
+        ``vars=`` names here. The bare ``var_key`` is accepted as "every level",
+        which is what asking for the variable itself means.
+        """
+        available = [str(v) for v in ds.data_vars]
+        wanted = [v for v in requested if v != var_key]
+        if not wanted:
+            return ds
+
+        missing = sorted(set(wanted) - set(available))
+        if missing:
+            raise ValueError(
+                f"[{var_key}] cannot extract {missing}: this variable is sliced "
+                f"by depth, and at the configured levels it yields {available}. "
+                f"Pass one of those, '{var_key}' for all of them, or change "
+                f"extract_depth_slices."
+            )
+        return ds[wanted]
+
     def _preprocess_depth_slices(
-        self, ds: xr.Dataset | xr.DataArray, var_key: str, depth_intervals: list[int]
+        self, ds: xr.Dataset | xr.DataArray, var_key: str, var_config
     ) -> xr.Dataset:
         """Slice a 3-D variable at configured depth levels, returning one column per depth."""
+        depth_intervals = self._resolve_depth_slices(var_key, var_config)
         da = ds[var_key].sel(depth=depth_intervals, method="nearest")
         ds_out = xr.Dataset(
             {
