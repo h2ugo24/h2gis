@@ -26,6 +26,7 @@ from h2mare.storage.provenance import (
     merge_records,
     read_source_datasets,
     records_for_window,
+    refresh_provenance,
     refresh_root_attrs,
     write_compiled_provenance,
     write_provenance_for_window,
@@ -553,6 +554,66 @@ class TestCollectSourceDatasets:
         assert (
             collect_source_datasets(catalog, _window("2020-01-01", "2020-12-31")) == []
         )
+
+
+class TestRefreshProvenance:
+    """
+    The repair for records left narrower than the file. Convert fixes the period
+    it converts; the finished years behind it are never touched again.
+    """
+
+    def _store(self, tmp_path, records, n_days=365):
+        root = tmp_path / "store"
+        root.mkdir()
+        times = pd.date_range("2025-01-01", periods=n_days, freq="D")
+        xr.Dataset(
+            {"sst": (["time", "lat", "lon"], np.ones((n_days, 2, 2)))},
+            coords={"time": times, "lat": [0.0, 1.0], "lon": [0.0, 1.0]},
+        ).to_zarr(root / "sst_2025.zarr")
+        zarr.open_group(str(root / "sst_2025.zarr"), mode="r+").attrs[
+            "source_datasets"
+        ] = json.dumps(records)
+        return SimpleNamespace(store_root=root, _log=lambda *a: None)
+
+    def test_a_week_wide_record_is_widened_to_the_file(self, tmp_path):
+        catalog = self._store(
+            tmp_path, [_rec("NRT", "nrt", "2025-12-25", "2025-12-31")]
+        )
+
+        assert refresh_provenance(catalog) == 1
+
+        [got] = read_source_datasets(tmp_path / "store" / "sst_2025.zarr")
+        assert got["start_date"] == "2025-01-01"
+        assert got["end_date"] == "2025-12-31"
+        assert got["days"] == 365
+
+    def test_a_handover_is_kept(self, tmp_path):
+        catalog = self._store(
+            tmp_path,
+            [
+                _rec("REP", "rep", "2025-01-01", "2025-06-30"),
+                _rec("NRT", "nrt", "2025-07-01", "2025-12-31"),
+            ],
+        )
+
+        refresh_provenance(catalog)
+
+        rep, nrt = read_source_datasets(tmp_path / "store" / "sst_2025.zarr")
+        assert rep["end_date"] == "2025-06-30"
+        assert nrt["start_date"] == "2025-07-01"
+
+    def test_a_file_already_right_is_left_alone(self, tmp_path):
+        catalog = self._store(
+            tmp_path, [_rec("NRT", "nrt", "2025-12-25", "2025-12-31")]
+        )
+        refresh_provenance(catalog)
+
+        assert refresh_provenance(catalog) == 0, "second pass has nothing to do"
+
+    def test_a_file_with_no_records_is_left_for_backfill(self, tmp_path):
+        catalog = self._store(tmp_path, [])
+
+        assert refresh_provenance(catalog) == 0
 
 
 class TestWriteCompiledProvenance:

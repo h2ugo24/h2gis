@@ -257,6 +257,56 @@ def read_store_dates(zarr_path: Path) -> pd.DatetimeIndex:
         return pd.DatetimeIndex([])
 
 
+def refresh_provenance(catalog: "ZarrCatalog") -> int:
+    """
+    Rebuild every stored file's records from its own time axis.
+
+    The repair for a file whose records are narrower than the file: a store
+    filled week by week keeps whatever window the last run happened to write,
+    and reading that literally claims the year holds seven days. Convert fixes
+    it on the next run, but only for the period it converts — the finished years
+    behind it never get touched again.
+
+    Needs nothing but what is already there. The existing records name the
+    datasets and where each takes over, the axis says what the file holds, and
+    :func:`annotate_covered` puts the two together. No manifest, no raw files,
+    and no rep/nrt boundary to supply — unlike :func:`backfill_provenance`,
+    which reconstructs records for a file that has none.
+
+    Files with no records are left alone: there is nothing to recompute from,
+    and inventing a dataset id is what backfill is for.
+
+    Returns:
+        Number of files rewritten.
+    """
+    import zarr
+
+    if not catalog.store_root.exists():
+        catalog._log("warning", f"Store root not found: {catalog.store_root}")
+        return 0
+
+    rewritten = 0
+    for zarr_path in sorted(catalog.store_root.glob("*.zarr")):
+        records = read_source_datasets(zarr_path)
+        if not records:
+            continue
+
+        refreshed = annotate_covered(records, read_store_dates(zarr_path))
+        if not refreshed or refreshed == records:
+            continue
+
+        zarr.open_group(str(zarr_path), mode="r+").attrs["source_datasets"] = (
+            json.dumps(refreshed)
+        )
+        spans = ", ".join(
+            f"{r['dataset_type']} {r['start_date']}→{r['end_date']}" for r in refreshed
+        )
+        catalog._log("info", f"{zarr_path.name}: {spans}")
+        rewritten += 1
+
+    return rewritten
+
+
 def backfill_provenance(catalog: "ZarrCatalog", rep_end_date: DateLike) -> int:
     """
     Retroactively write provenance for existing Zarr files that pre-date

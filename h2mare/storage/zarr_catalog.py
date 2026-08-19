@@ -485,6 +485,17 @@ class ZarrCatalog:
 
     # ==================== Migration Helpers ====================
 
+    def refresh_provenance(self) -> int:
+        """
+        Rebuild every stored file's ``source_datasets`` from its own time axis,
+        repairing records left narrower than the file they describe. Returns the
+        number of files rewritten. See
+        :func:`h2mare.storage.provenance.refresh_provenance`.
+        """
+        from h2mare.storage.provenance import refresh_provenance
+
+        return refresh_provenance(self)
+
     def backfill_provenance(self, rep_end_date: DateLike) -> int:
         """
         One-time migration: retroactively write provenance for Zarr files
