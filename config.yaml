@@ -103,7 +103,6 @@ variables:
     filename_date_range: true
     bbox: [-80, 0, 10, 70]
     depth_range: [0, 1000]
-    extract_depth_slices: [0, 100, 500]
     compile_depth_slices: [0, 100, 500, 1000]
     
   fsle:
