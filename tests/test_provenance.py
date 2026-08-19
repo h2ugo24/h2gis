@@ -153,6 +153,93 @@ class TestMergeRecords:
         ]
         assert merge_records([], new) == new
 
+    def test_a_republished_window_takes_the_days_from_its_old_owner(self):
+        """
+        CMEMS extends its reprocessed product periodically, so re-downloading
+        the newly-reprocessed days means rep now supplies dates nrt supplied
+        before. Widening alone would leave both claiming them.
+        """
+        existing = [
+            {
+                "dataset_id": "REP",
+                "dataset_type": "rep",
+                "start_date": "2025-01-01",
+                "end_date": "2025-12-18",
+            },
+            {
+                "dataset_id": "NRT",
+                "dataset_type": "nrt",
+                "start_date": "2025-12-19",
+                "end_date": "2025-12-31",
+            },
+        ]
+        republished = [
+            {
+                "dataset_id": "REP",
+                "dataset_type": "rep",
+                "start_date": "2025-12-19",
+                "end_date": "2025-12-31",
+            }
+        ]
+
+        merged = merge_records(existing, republished)
+
+        assert [r["dataset_id"] for r in merged] == ["REP"]
+        assert merged[0]["end_date"] == "2025-12-31"
+
+    def test_a_partly_republished_window_moves_the_handover(self):
+        existing = [
+            {
+                "dataset_id": "REP",
+                "dataset_type": "rep",
+                "start_date": "2025-01-01",
+                "end_date": "2025-06-30",
+            },
+            {
+                "dataset_id": "NRT",
+                "dataset_type": "nrt",
+                "start_date": "2025-07-01",
+                "end_date": "2025-12-31",
+            },
+        ]
+        republished = [
+            {
+                "dataset_id": "REP",
+                "dataset_type": "rep",
+                "start_date": "2025-07-01",
+                "end_date": "2025-09-30",
+            }
+        ]
+
+        rep, nrt = merge_records(existing, republished)
+
+        assert rep["dataset_id"] == "REP"
+        assert nrt["start_date"] == "2025-10-01", "nrt keeps only what rep left"
+
+    def test_an_older_record_cannot_take_days_back(self):
+        """Only the run that just wrote gets to supersede."""
+        existing = [
+            {
+                "dataset_id": "REP",
+                "dataset_type": "rep",
+                "start_date": "2025-01-01",
+                "end_date": "2025-12-31",
+            }
+        ]
+        new = [
+            {
+                "dataset_id": "NRT",
+                "dataset_type": "nrt",
+                "start_date": "2025-12-19",
+                "end_date": "2025-12-31",
+            }
+        ]
+
+        merged = merge_records(existing, new)
+
+        assert [r["dataset_id"] for r in merged] == ["REP", "NRT"]
+        assert merged[0]["start_date"] == "2025-01-01"
+
     def test_per_write_fields_are_not_carried_through(self):
         """days and updated describe a write, not a span, so a merge drops
         them for annotate_covered to set again."""

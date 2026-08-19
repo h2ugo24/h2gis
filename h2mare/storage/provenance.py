@@ -115,7 +115,38 @@ def merge_records(existing: list[dict], new: list[dict]) -> list[dict]:
         held = merged[key]
         held["start_date"] = min(held["start_date"], span["start_date"])
         held["end_date"] = max(held["end_date"], span["end_date"])
+
+    _supersede(merged, new)
     return sorted(merged.values(), key=_anchor)
+
+
+def _supersede(merged: dict[str, dict], new: list[dict]) -> None:
+    """
+    Let a freshly written window take days off whichever dataset held them.
+
+    Widening alone cannot express a handover moving. CMEMS extends its
+    reprocessed product periodically, and re-downloading the newly-reprocessed
+    days means rep now supplies dates nrt supplied before. Merged by widening
+    only, both would claim them and the file would go on naming nrt for days it
+    no longer holds from nrt — the staleness the backfill tool used to warn
+    about and tell you to re-convert for. Re-converting is exactly what this is,
+    so it should be enough on its own.
+
+    A dataset whose start falls inside a new window is pushed past it, and
+    dropped when nothing is left. Only windows written by *this* run supersede:
+    an older record cannot take days back from the run that just overwrote them.
+    """
+    for record in new:
+        start, end = record["start_date"], record["end_date"]
+        after = (pd.Timestamp(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        for key, held in list(merged.items()):
+            if key == record["dataset_id"]:
+                continue
+            if start <= held["start_date"] <= end:
+                if after > held["end_date"]:
+                    del merged[key]
+                else:
+                    held["start_date"] = after
 
 
 def annotate_covered(records: list[dict], stored: pd.DatetimeIndex) -> list[dict]:
