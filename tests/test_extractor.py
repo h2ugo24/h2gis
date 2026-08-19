@@ -17,6 +17,7 @@ from h2mare.processing.extractor import (
     Extractor,
     _keys_path,
     _save_completed_keys,
+    _warn_if_wholly_failed,
     ensure_row_id,
     resolve_compiled_vars,
     resolve_read_from,
@@ -1216,3 +1217,96 @@ class TestSplitVarsBySourceDepth:
         cfg = _depth_config(extract=[0, 100], compile_=[0, 100])
         with pytest.raises(ValueError, match="gap in"):
             split_vars_by_source(None, ["thetao"], "thetao", cfg, has_depth=False)
+
+
+class TestGeometryPathSpatialDims:
+    """
+    rio.clip resolves spatial dims by name, falling back to lon/lat only when
+    they carry CF attributes. CMEMS and AVISO stores inherit those from source,
+    so every var_key but fsle/eddies passed the precondition by luck; CDS
+    stores and the compiled h2ds carry no coordinate attributes at all and
+    clipped to nothing but NaN — reported only as a per-geometry DEBUG line.
+    """
+
+    @staticmethod
+    def _bare_ds() -> xr.Dataset:
+        """A store-shaped dataset whose lon/lat carry no CF attributes."""
+        ds = _make_spatial_ds()
+        ds.lon.attrs.clear()
+        ds.lat.attrs.clear()
+        return ds
+
+    def _run(self, cfg) -> pd.DataFrame:
+        geoms = [box(-12, 28, -3, 36), box(-1, 38, 1, 42)]
+        gdf = _make_geodf(geoms, ["2020-01-01", "2020-01-01"])
+        ext = _extractor(gdf)
+        ext.app_config = SimpleNamespace(variables={"x": cfg, "h2ds": _h2ds_config()})
+        return ext._extract(ext.data, self._bare_ds(), n_workers=2).sort_index()
+
+    def test_attribute_less_lon_lat_still_clip(self):
+        """Regression: returned all-NaN because rioxarray could not find x/y."""
+        out = self._run(SimpleNamespace(rename_lonlat=False))
+
+        assert out["sst"].notna().all()
+        assert out.loc[0, "sst"] == pytest.approx(2.0)  # mean(0,1,3,4)
+        assert out.loc[1, "sst"] == pytest.approx(8.0)
+
+    def test_rename_lonlat_true_is_not_applied_twice(self):
+        """The config flag is now redundant, and must not double-rename."""
+        out = self._run(SimpleNamespace(rename_lonlat=True))
+
+        assert out["sst"].notna().all()
+
+    def test_a_dataset_already_on_x_y_is_untouched(self):
+        geoms = [box(-12, 28, -3, 36)]
+        gdf = _make_geodf(geoms, ["2020-01-01"])
+        ext = _extractor(gdf)
+        ds = self._bare_ds().rename({"lon": "x", "lat": "y"})
+
+        out = ext._extract(ext.data, ds, n_workers=1)
+
+        assert out["sst"].notna().all()
+
+
+class TestWarnIfWhollyFailed:
+    @staticmethod
+    def _capture(monkeypatch) -> list[str]:
+        seen: list[str] = []
+        monkeypatch.setattr(
+            extractor_module.logger, "warning", lambda m, *a, **k: seen.append(str(m))
+        )
+        return seen
+
+    def test_all_nan_with_errors_warns(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+        df = pd.DataFrame({"sst": [float("nan"), float("nan")]})
+
+        _warn_if_wholly_failed(df, [ValueError("x dimension not found")])
+
+        assert len(seen) == 1
+        assert "x dimension not found" in seen[0]
+
+    def test_a_partial_failure_is_ordinary(self, monkeypatch):
+        """Geometries outside the grid are data, not a broken precondition."""
+        seen = self._capture(monkeypatch)
+        df = pd.DataFrame({"sst": [1.0, float("nan")]})
+
+        _warn_if_wholly_failed(df, [ValueError("boom")])
+
+        assert seen == []
+
+    def test_all_nan_without_errors_is_silent(self, monkeypatch):
+        """Genuinely empty data raised nothing, so there is nothing to report."""
+        seen = self._capture(monkeypatch)
+        df = pd.DataFrame({"sst": [float("nan")]})
+
+        _warn_if_wholly_failed(df, [])
+
+        assert seen == []
+
+    def test_an_empty_frame_is_silent(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+
+        _warn_if_wholly_failed(pd.DataFrame(), [ValueError("boom")])
+
+        assert seen == []

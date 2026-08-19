@@ -184,7 +184,7 @@ extractor.extract_from_dataset(
 | `clip_to_coverage` | When `True`, input rows whose location (and time, if `ds` has a time coord) fall outside the `ds` extent are dropped and surface as `NaN` in the result. Default `False`, since nearest-neighbour (CSV) and clip-or-NaN (SHP) already handle out-of-extent inputs. |
 
 Only config-free preparation is applied. Config-driven steps that the store path performs
-— depth-slice expansion, `rename_lonlat`, and store date/bbox coverage resolution — are
+— depth-slice expansion, store selection (`read_from`), and store date/bbox coverage resolution — are
 the **caller's** responsibility: prepare `ds` beforehand.
 
 ```python

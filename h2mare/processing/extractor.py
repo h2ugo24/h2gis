@@ -76,8 +76,38 @@ def _load_completed_keys(tmp_path: Path) -> set[str]:
         return set(json.load(f))
 
 
+def _warn_if_wholly_failed(result: pd.DataFrame, errors: list[Exception]) -> None:
+    """
+    Say something when *every* geometry came back empty.
+
+    A few NaN rows are ordinary — geometries outside the grid clip to nothing,
+    and that is data, not a fault. Every row failing is not: it means the
+    dataset could not be clipped at all, usually because rioxarray cannot
+    identify the spatial dims or there is no CRS. That used to surface only as
+    a DEBUG line per geometry, leaving an all-null column looking like absent
+    data rather than a broken precondition.
+    """
+    if result.empty or not errors:
+        return
+
+    values = result.select_dtypes("number")
+    if values.empty or not bool(values.isna().all().all()):
+        return
+
+    logger.warning(
+        f"Every geometry returned NaN across {len(result)} row(s) — the dataset "
+        f"could not be clipped at all, rather than the geometries falling "
+        f"outside it. First error: {type(errors[0]).__name__}: {errors[0]}"
+    )
+
+
 def _extract_geometry(
-    id: str, date, geom, ds: xr.DataArray | xr.Dataset, index_col: str
+    id: str,
+    date,
+    geom,
+    ds: xr.DataArray | xr.Dataset,
+    index_col: str,
+    errors: list[Exception] | None = None,
 ) -> dict:
     """
     Extract data and return as dictionary for a single geometry row.
@@ -120,8 +150,12 @@ def _extract_geometry(
 
     except (OSError, ValueError, RuntimeError) as e:
         # Per-geometry detail only — thousands of geometries would flood the
-        # log at ERROR. The end-of-run null summary carries the aggregate.
+        # log at ERROR. The end-of-run null summary carries the aggregate, and
+        # `errors` lets the caller tell "all of them failed" (a broken
+        # precondition) from "some fell outside the grid" (ordinary).
         logger.debug(f"Extraction failed for id={id}, date={date}: {e}")
+        if errors is not None:
+            errors.append(e)
 
     # --- Return NaNs for failed geometry to preserve structure ---
     nan_result: dict = {index_col: id}
@@ -793,7 +827,7 @@ class Extractor:
 
         ds = ds.sortby("time")
 
-        result = self._extract(data_resolved, ds, var_cfg.rename_lonlat, n_workers)
+        result = self._extract(data_resolved, ds, n_workers)
 
         if from_compiled:
             # Reached only when this var_key converts hourly, so its derived
@@ -827,7 +861,6 @@ class Extractor:
         self,
         data_resolved,
         ds: xr.Dataset,
-        rename_lonlat: bool,
         n_workers: int,
     ) -> pd.DataFrame:
         """Run the point or geometry engine, whichever this input calls for."""
@@ -837,8 +870,18 @@ class Extractor:
 
             ds = self.ensure_crs(data_resolved, ds)
 
-            if rename_lonlat:
-                ds = ds.rename({"lon": "x", "lat": "y"})
+            # Unconditional, as extract_from_dataset already does and as
+            # extract_from_shp documents it needs: rio.clip resolves dims by
+            # name, and only falls back to lon/lat when they carry CF
+            # attributes. CMEMS and AVISO stores inherit those from source, so
+            # every var_key but fsle/eddies passed the precondition by luck;
+            # CDS stores and the compiled h2ds carry no coordinate attributes
+            # at all, and clipped to nothing but NaN.
+            rename = {
+                old: new for old, new in (("lon", "x"), ("lat", "y")) if old in ds.dims
+            }
+            if rename:
+                ds = ds.rename(rename)
 
             return self.extract_from_shp(
                 data_resolved, ds, self.index_col, n_workers=n_workers
@@ -906,7 +949,7 @@ class Extractor:
         via the broadcast path or by pinning ``read_from="compiled"``. Each
         sample then takes the value for the day it falls in.
 
-        ``rename_lonlat`` and depth slicing are both skipped: the compiled store
+        Depth slicing is skipped here: the compiled store
         is lon/lat on the base grid, and it already holds depth levels as
         separate variables (``o2_0``, ``o2_100``, …) rather than on a ``depth``
         axis.
@@ -944,9 +987,7 @@ class Extractor:
         )
 
         ds = ds[wanted].sortby("time")
-        return self._extract(
-            data_resolved, ds, rename_lonlat=False, n_workers=n_workers
-        )
+        return self._extract(data_resolved, ds, n_workers=n_workers)
 
     def extract_from_dataset(
         self,
@@ -967,7 +1008,7 @@ class Extractor:
 
         Only the config-free prep is applied here. Config-driven steps that
         :meth:`process_single_varkey` performs — depth-slice expansion, store
-        selection (``read_from``), ``rename_lonlat``, and store date/bbox coverage
+        selection (``read_from``) and store date/bbox coverage
         resolution — are the caller's responsibility: prepare ``ds`` beforehand.
         A ``ds`` handed over with a ``depth`` axis still on it is extracted as-is,
         which for geometry input means that axis is averaged away along with the
@@ -1417,13 +1458,19 @@ class Extractor:
             ]
 
         out = []
+        errors: list[Exception] = []
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = [executor.submit(_extract_geometry, *task) for task in tasks]
+            futures = [
+                executor.submit(_extract_geometry, *task, errors) for task in tasks
+            ]
             for future in as_completed(futures):
                 result = future.result()
                 if result is not None:
                     out.append(result)
-        return pd.DataFrame(out).set_index(index_col)
+
+        result_df = pd.DataFrame(out).set_index(index_col)
+        _warn_if_wholly_failed(result_df, errors)
+        return result_df
 
     def _extract_bathy(
         self, data: pd.DataFrame | gpd.GeoDataFrame, n_workers: int = 8
