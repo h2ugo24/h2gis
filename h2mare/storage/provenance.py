@@ -103,10 +103,15 @@ def merge_records(existing: list[dict], new: list[dict]) -> list[dict]:
     merged: dict[str, dict] = {}
     for record in [*existing, *new]:
         key = record["dataset_id"]
+        # Whitelisted, not filtered: a merge that copies unknown keys through
+        # keeps every field any past version ever wrote, forever. h2ds went on
+        # carrying `requested_*` from a layout that no longer exists, because
+        # nothing at that level recomputes records — it only merges what its
+        # sources hand up.
         span = {
-            k: v
-            for k, v in record.items()
-            if not k.startswith("delivered_") and k not in ("days", "updated")
+            k: record[k]
+            for k in ("dataset_id", "dataset_type", "start_date", "end_date")
+            if k in record
         }
         if key not in merged:
             merged[key] = span
@@ -468,9 +473,16 @@ def write_compiled_provenance(
     raw = root.attrs.get(COMPILED_PROVENANCE_ATTR)
     existing = json.loads(raw) if isinstance(raw, str) and raw else {}
 
+    # Stamped here rather than by annotate_covered, which never runs at this
+    # level: h2ds has no per-variable time axis to recompute a record from, so
+    # it merges what its sources worked out. The date it can supply is its own —
+    # when this compile last refreshed the variable.
+    today = pd.Timestamp.today().strftime("%Y-%m-%d")
+
     combined = dict(existing)
     for var_key, records in by_variable.items():
-        combined[var_key] = merge_records(existing.get(var_key, []), records)
+        merged = merge_records(existing.get(var_key, []), records)
+        combined[var_key] = [{**record, "updated": today} for record in merged]
 
     root.attrs[COMPILED_PROVENANCE_ATTR] = json.dumps(combined, sort_keys=True)
     return combined

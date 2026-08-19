@@ -240,6 +240,28 @@ class TestMergeRecords:
         assert [r["dataset_id"] for r in merged] == ["REP", "NRT"]
         assert merged[0]["start_date"] == "2025-01-01"
 
+    def test_fields_from_a_previous_layout_do_not_survive(self):
+        """
+        h2ds only ever merges — nothing at that level recomputes a record — so
+        a merge that copied unknown keys through kept every field any past
+        version wrote. It carried `requested_*` long after that layout was gone.
+        """
+        stale = [
+            {
+                "dataset_id": "a",
+                "dataset_type": "rep",
+                "start_date": "2020-01-01",
+                "end_date": "2020-06-30",
+                "requested_start": "2020-01-01",
+                "requested_end": "2020-12-31",
+                "delivered_days": 180,
+            }
+        ]
+
+        [got] = merge_records(stale, [])
+
+        assert set(got) == {"dataset_id", "dataset_type", "start_date", "end_date"}
+
     def test_per_write_fields_are_not_carried_through(self):
         """days and updated describe a write, not a span, so a merge drops
         them for annotate_covered to set again."""
@@ -533,6 +555,42 @@ class TestCollectSourceDatasets:
 
 
 class TestWriteCompiledProvenance:
+    def test_every_record_is_stamped_with_the_compile(self, tmp_path):
+        """
+        annotate_covered never runs here — h2ds has no per-variable axis to
+        recompute from — so without this the records reach h2ds unstamped.
+        """
+        path = _write_zarr(tmp_path)
+
+        write_compiled_provenance(
+            path, {"sst": [_rec("sst-rep", "rep", "2020-01-01", "2020-01-05")]}
+        )
+
+        [got] = _read_compiled(path)["sst"]
+        assert got["updated"] == pd.Timestamp.today().strftime("%Y-%m-%d")
+
+    def test_a_stale_stamp_is_replaced_not_kept(self, tmp_path):
+        path = _write_zarr(tmp_path)
+        zarr.open_group(str(path), mode="r+").attrs[COMPILED_PROVENANCE_ATTR] = (
+            json.dumps(
+                {
+                    "sst": [
+                        {
+                            **_rec("sst-rep", "rep", "2020-01-01", "2020-01-05"),
+                            "updated": "2020-01-06",
+                        }
+                    ]
+                }
+            )
+        )
+
+        write_compiled_provenance(
+            path, {"sst": [_rec("sst-rep", "rep", "2020-01-01", "2020-01-05")]}
+        )
+
+        [got] = _read_compiled(path)["sst"]
+        assert got["updated"] == pd.Timestamp.today().strftime("%Y-%m-%d")
+
     def test_keyed_by_variable_not_a_flat_list(self, tmp_path):
         """h2ds merges many sources, so a record has to say which one it came from."""
         path = _write_zarr(tmp_path)
