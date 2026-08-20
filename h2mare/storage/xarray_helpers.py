@@ -355,7 +355,7 @@ _SOURCE_ENCODING_PREFIXES = ("GRIB_",)
 _SOURCE_ENCODING_ATTRS = ("valid_min", "valid_max")
 
 
-def drop_source_encoding_attrs(ds: xr.Dataset) -> xr.Dataset:
+def drop_source_encoding_attrs(ds: xr.Dataset, *, drop_grib: bool = True) -> xr.Dataset:
     """
     Strip attributes that describe the source file rather than this dataset.
 
@@ -372,13 +372,106 @@ def drop_source_encoding_attrs(ds: xr.Dataset) -> xr.Dataset:
     ``cell_methods``, ``unit_long`` and the rest still describe the quantity
     itself and survive. Provenance is not lost with ``GRIB_paramId`` — the
     variable's ``product_id``/``dataset_id`` carry it.
+
+    Args:
+        ds: Dataset to strip, modified in place and returned.
+        drop_grib: Whether to drop the ``GRIB_*`` family as well as the packing
+            bounds. True for the compiled product, whose regrid is what makes
+            those attributes lie. False on the native path: a CDS store is
+            written at ERA5's own grid and cadence, so ``GRIB_Nx``/``GRIB_Ny``
+            still describe it, and :func:`~h2mare.processing.core.cds.hourly_radiation`
+            deliberately *rewrites* ``GRIB_units`` and ``GRIB_stepType`` there to
+            stop the accumulation being differenced twice. Dropping them would
+            throw that correction away along with the ``GRIB_paramId``
+            provenance. The packing bounds go either way — they are wrong on a
+            native store too, where the values have been unpacked to float.
     """
+    prefixes = _SOURCE_ENCODING_PREFIXES if drop_grib else ()
     for var in ds.data_vars:
         attrs = ds[var].attrs
         for name in list(attrs):
             if (
-                name.startswith(_SOURCE_ENCODING_PREFIXES)
-                or name in _SOURCE_ENCODING_ATTRS
-            ):
+                prefixes and name.startswith(prefixes)
+            ) or name in _SOURCE_ENCODING_ATTRS:
                 del attrs[name]
+    return ds
+
+
+#: CF attributes for the axes every store in the pipeline shares.
+#:
+#: ``time`` deliberately carries no ``units``: xarray owns the time encoding and
+#: writes ``units``/``calendar`` into ``.encoding`` at ``to_zarr``. Setting them
+#: in ``.attrs`` as well makes the write raise rather than merely disagree.
+_CF_COORD_ATTRS: dict[str, dict[str, str]] = {
+    "lon": {
+        "standard_name": "longitude",
+        "long_name": "longitude",
+        "units": "degrees_east",
+        "axis": "X",
+    },
+    "lat": {
+        "standard_name": "latitude",
+        "long_name": "latitude",
+        "units": "degrees_north",
+        "axis": "Y",
+    },
+    "depth": {
+        "standard_name": "depth",
+        "long_name": "depth",
+        "units": "m",
+        "positive": "down",
+        "axis": "Z",
+    },
+    "time": {"standard_name": "time", "long_name": "time", "axis": "T"},
+}
+
+
+def apply_cf_attrs(ds: xr.Dataset, native_var_key: str | None = None) -> xr.Dataset:
+    """
+    Put config's metadata onto a dataset's variables and axes.
+
+    The single place both write paths get their attributes from, so a native
+    store and h2ds cannot drift into describing the same quantity differently.
+
+    Coordinates get :data:`_CF_COORD_ATTRS`. Without them a store is not merely
+    under-documented: ``rio.clip`` resolves spatial dims by name and only falls
+    back to lon/lat when they carry CF attributes, which is why geometry
+    extraction against the CDS stores and h2ds used to clip to nothing but NaN.
+
+    Args:
+        ds: Dataset to annotate, modified in place and returned.
+        native_var_key: The var_key whose *native* store is being written, or
+            None for the compiled product. Two things follow from it: the
+            ``GRIB_*`` attributes are kept (see
+            :func:`drop_source_encoding_attrs`), and that key's entry in
+            ``native_attr_overrides`` is layered over the shared table. The
+            overrides exist because a native store is not always in the units it
+            publishes downstream — ``msl`` is Pa here and hPa in h2ds, ``tp`` is
+            m here and mm there — and because an hourly field is not the daily
+            reduction its ``cell_methods`` describes. An override of ``null``
+            removes the attribute rather than setting it, which is how those
+            ``cell_methods`` come off.
+    """
+    from h2mare.config import get_settings
+
+    settings = get_settings()
+    ds = drop_source_encoding_attrs(ds, drop_grib=native_var_key is None)
+
+    overrides: dict = {}
+    if native_var_key is not None:
+        overrides = settings.native_attr_overrides.get(native_var_key, {})
+
+    for var in ds.data_vars:
+        merged = {**settings.get_var_info(str(var)), **overrides.get(str(var), {})}
+        attrs = ds[var].attrs
+        for key, value in merged.items():
+            if value is None:
+                attrs.pop(key, None)
+            else:
+                attrs[key] = value
+
+    for name, coord_attrs in _CF_COORD_ATTRS.items():
+        if name in ds.coords:
+            ds[name].attrs.update(coord_attrs)
+
     return ds

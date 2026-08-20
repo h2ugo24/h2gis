@@ -108,7 +108,7 @@ Reasonable candidates are the bounded, already-packed fields: `sst`, `thetao`,
 
 ### Validation
 
-h2mare warns at load time if `config.yaml` contains top-level keys other than `variables`, `global_attrs`, and `variable_attrs`. Unknown keys are ignored, but the warning helps catch typos like `varibles:` before they cause a silent misconfiguration.
+h2mare warns at load time if `config.yaml` contains top-level keys other than `variables`, `global_attrs`, `variable_attrs`, and `native_attr_overrides`. Unknown keys are ignored, but the warning helps catch typos like `varibles:` before they cause a silent misconfiguration.
 
 ### The `h2ds` key
 
@@ -145,6 +145,40 @@ output is readable by CF-aware tooling (xarray, rioxarray, THREDDS, `cfchecks`).
 Two entries — `thetao` and `o2` — describe the depth-resolved parent field held
 in the native store, which never reaches `h2ds`; the `thetao_*` / `o2_*` entries
 describe the depth slices cut from it at compile time.
+
+### Where the attributes are applied
+
+`apply_cf_attrs` (`storage/xarray_helpers.py`) is the single place both write
+paths take this metadata from — the convert step for the per-variable native
+stores, and the compile step for `h2ds` — so the two cannot drift into
+describing the same quantity differently. It also stamps the CF attributes on
+`lon`, `lat`, `time` and `depth`. That half is not cosmetic: `rio.clip` resolves
+spatial dims by name and only falls back to CF attributes when they are not
+called `x`/`y`, so on a store whose coordinates carry nothing it cannot find
+them at all, and geometry extraction clips to NaN.
+
+### `native_attr_overrides`
+
+A native store does not always hold what `h2ds` publishes, so where the two
+differ the delta lives under `native_attr_overrides`, keyed by var_key and then
+by variable name. A `null` value **removes** the attribute instead of setting it.
+
+```yaml
+native_attr_overrides:
+  atm-instante:
+    msl:
+      units: Pa           # hPa only after the compile converts
+      cell_methods: null  # hourly instantaneous, not a daily mean
+```
+
+Only the hourly CDS stores need entries, on two counts: they keep ERA5's own
+units, because the conversion happens on the way into `h2ds`, and they keep
+ERA5's hourly cadence, so a `cell_methods` naming a daily reduction does not
+describe them. `radiation` is deliberately absent — `hourly_radiation` converts
+J m⁻² to W m⁻² at both cadences, and each hourly value is a mean over its own
+interval, so both the units and `time: mean` still hold.
+
+### Sign conventions
 
 `bathy` keeps the ETOPO sign convention — `positive: up`, so sea-floor values are
 negative — and takes `standard_name: altitude` ("geometric height above the

@@ -29,7 +29,7 @@ from h2mare.storage.provenance import (
 )
 from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
-from h2mare.storage.xarray_helpers import chunk_dataset, drop_source_encoding_attrs
+from h2mare.storage.xarray_helpers import apply_cf_attrs, chunk_dataset
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import BBox, DateLike, DateRange, FilePeriod
 from h2mare.utils.datetime_utils import normalize_date
@@ -498,15 +498,17 @@ class Compiler:
     # =========== DATASET ATTRIBUTES ===========
     def _set_attrs(self, ds: xr.Dataset) -> xr.Dataset:
         """Set global and variables attributes from yaml file.
+
+        Variable and coordinate metadata comes from ``apply_cf_attrs``, shared
+        with the convert path so a native store and h2ds cannot describe the
+        same quantity differently. No ``native_var_key`` here: this is the
+        compiled product, which takes the table as written.
+
         Args:
             ds: Dataset for atts assignment
         """
         ds.attrs = get_settings().global_attrs
-        ds = drop_source_encoding_attrs(ds)
-        for var in ds.data_vars:
-            var_info = get_settings().get_var_info(str(var))
-            ds[var].attrs.update({key: val for key, val in var_info.items()})
-        return ds
+        return apply_cf_attrs(ds)
 
     #  ============ PROCESSING ==================
     def _process_variable(

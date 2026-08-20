@@ -29,6 +29,7 @@ from h2mare.storage.provenance import (
 from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import (
+    apply_cf_attrs,
     chunk_dataset,
     int16_encoding,
     rename_dims,
@@ -836,6 +837,11 @@ class Netcdf2Zarr(BaseConverter):
         # Snap lon/lat to a canonical grid so float-noise drift between a source's
         # reprocessed periods can't union into a doubled axis on read/append.
         ds = snap_grid_coords(ds)
+
+        # After the processor, so a derived variable gets the same treatment as
+        # a pass-through one: arithmetic and rolling reductions drop attrs, so
+        # sst, gke and the _std layers arrived here carrying none at all.
+        ds = apply_cf_attrs(ds, native_var_key=self.var_key)
 
         return chunk_dataset(ds)
 
