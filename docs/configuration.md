@@ -126,6 +126,34 @@ The `bbox` here sets the spatial extent of the compiled dataset.
 
 ---
 
+## Global attributes
+
+`global_attrs` becomes the root attributes of `h2ds`, following
+[ACDD](https://wiki.esipfed.org/Attribute_Convention_for_Data_Discovery_1-3).
+Everything in it is a *choice* — the title, the summary, who to contact, what
+may be done with the data.
+
+The facts about a given file are **not** in config and cannot be. `Conventions`,
+`product_version`, `history` and the geospatial/time extents are computed by
+`provenance.refresh_root_attrs` at compile and read off the store itself; a
+per-period store holds a different span in every file, so a value in config
+could only ever describe one of them correctly. `time_coverage_resolution` is
+inferred from the axis, so a daily store reports `P1DT0H0M0S` and an hourly one
+`P0DT1H0M0S` without either being told which it is.
+
+The native per-variable stores get `Conventions`, `product_version`, `history`
+and their own extents via `provenance.write_cf_root_attrs`, but **not** the
+fixed globals: those describe `h2ds` ("Integrated Geospatial Dataset
+Collection"), and a native store is one source's own data at its own cadence.
+That call updates rather than replaces, so the `source_datasets` provenance
+survives it.
+
+`license` deliberately does not claim the MIT terms the h2mare source carries —
+the data is not h2mare's to license, and each source product's terms travel with
+the values.
+
+---
+
 ## Variable metadata
 
 `variable_attrs` entries become the attributes written onto each variable in the

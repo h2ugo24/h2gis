@@ -28,6 +28,7 @@ from h2mare.storage.provenance import (
     records_for_window,
     refresh_provenance,
     refresh_root_attrs,
+    write_cf_root_attrs,
     write_compiled_provenance,
     write_provenance_for_window,
 )
@@ -786,4 +787,107 @@ class TestRefreshRootAttrs:
 
     def test_returns_what_it_wrote(self, tmp_path):
         path = _write_zarr(tmp_path)
-        assert refresh_root_attrs(path, {"title": "h2ds"}) == {"title": "h2ds"}
+        got = refresh_root_attrs(path, {"title": "h2ds"})
+        assert got == dict(zarr.open_group(str(path), mode="r").attrs)
+        assert got["title"] == "h2ds"
+
+    def test_config_is_layered_under_the_facts_about_the_file(self, tmp_path):
+        """
+        Conventions and the extents are not config's to state — the first is a
+        claim about the writer, the rest about what the file turned out to hold.
+        A per-period store holds a different span in every file, so a value in
+        config could only ever describe one of them.
+        """
+        path = _write_zarr(tmp_path, start="2020-03-01", n_days=5)
+
+        got = refresh_root_attrs(path, {"title": "h2ds"})
+
+        assert got["Conventions"] == "CF-1.11, ACDD-1.3"
+        assert got["time_coverage_start"].startswith("2020-03-01")
+        assert got["time_coverage_end"].startswith("2020-03-05")
+        assert got["geospatial_lat_min"] == 0.0
+        assert got["geospatial_lat_max"] == 1.0
+
+    def test_a_stale_extent_is_corrected_rather_than_kept(self, tmp_path):
+        """The whole point of computing it: an append moves the end date."""
+        path = _write_zarr(tmp_path, start="2020-01-01", n_days=5)
+        refresh_root_attrs(path, {"title": "h2ds"})
+
+        extra = xr.Dataset(
+            {"amp": (["time", "lat", "lon"], np.ones((2, 2, 2)))},
+            coords={
+                "time": pd.date_range("2020-01-06", periods=2, freq="D"),
+                "lat": [0.0, 1.0],
+                "lon": [0.0, 1.0],
+            },
+        )
+        extra.to_zarr(path, append_dim="time")
+
+        got = refresh_root_attrs(path, {"title": "h2ds"})
+        assert got["time_coverage_end"].startswith("2020-01-07")
+
+
+class TestCfRootAttrs:
+    """
+    A store nobody can identify is a store nobody will check: a validator has no
+    reason to look at a file that does not say what convention it follows.
+    """
+
+    def test_a_native_store_keeps_its_provenance(self, tmp_path):
+        """
+        Unlike h2ds, whose root is rebuilt from config every compile, nothing
+        else would put source_datasets back — so this one updates, not replaces.
+        """
+        path = _write_zarr(tmp_path)
+        write_provenance_for_window(
+            path, _MANIFEST, _window("2020-01-01", "2020-01-05")
+        )
+
+        write_cf_root_attrs(path)
+
+        got = dict(zarr.open_group(str(path), mode="r").attrs)
+        assert got["Conventions"] == "CF-1.11, ACDD-1.3"
+        assert _read_records(path), "the conventions stamp erased the provenance"
+
+    def test_the_extent_comes_from_the_axis(self, tmp_path):
+        path = _write_zarr(tmp_path, start="2021-06-01", n_days=3)
+        got = write_cf_root_attrs(path)
+        assert got["time_coverage_start"].startswith("2021-06-01")
+        assert got["time_coverage_end"].startswith("2021-06-03")
+        assert got["geospatial_lon_min"] == 0.0
+        assert got["geospatial_lon_max"] == 1.0
+
+    def test_resolution_is_read_off_the_axis_not_declared(self, tmp_path):
+        """
+        Config used to carry a flat time_coverage_resolution: P1D, which is
+        wrong for the four hourly stores. Inferring it means neither cadence has
+        to be told what it is.
+        """
+        hourly = xr.Dataset(
+            {"msl": (["time", "lat", "lon"], np.ones((6, 2, 2)))},
+            coords={
+                "time": pd.date_range("2021-01-01", periods=6, freq="h"),
+                "lat": [0.0, 1.0],
+                "lon": [0.0, 1.0],
+            },
+        )
+        path = tmp_path / "hourly.zarr"
+        hourly.to_zarr(path)
+
+        assert write_cf_root_attrs(path)["time_coverage_resolution"] == "P0DT1H0M0S"
+        daily = _write_zarr(tmp_path)
+        assert write_cf_root_attrs(daily)["time_coverage_resolution"] == "P1DT0H0M0S"
+
+    def test_a_store_with_no_time_axis_is_still_stamped(self, tmp_path):
+        """bathy is time-less; it should not be an error to describe it."""
+        static = xr.Dataset(
+            {"bathy": (["lat", "lon"], np.ones((2, 2)))},
+            coords={"lat": [0.0, 1.0], "lon": [0.0, 1.0]},
+        )
+        path = tmp_path / "bathy.zarr"
+        static.to_zarr(path)
+
+        got = write_cf_root_attrs(path)
+        assert got["Conventions"] == "CF-1.11, ACDD-1.3"
+        assert "time_coverage_start" not in got
+        assert got["geospatial_lat_max"] == 1.0

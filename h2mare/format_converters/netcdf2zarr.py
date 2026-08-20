@@ -25,6 +25,7 @@ from h2mare.storage.provenance import (
     annotate_covered,
     merge_records,
     read_store_dates,
+    write_cf_root_attrs,
 )
 from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
@@ -664,6 +665,15 @@ class Netcdf2Zarr(BaseConverter):
                 self._write_provenance(path, paths, self._stored_dates(path))
             except Exception as e:
                 logger.warning(f"Could not write provenance for {path.name}: {e}")
+
+            # After the write, so the extent describes what the file ended up
+            # holding rather than what this run contributed to it. Warned about
+            # rather than raised for the same reason provenance is: metadata is
+            # not worth failing a conversion whose data landed correctly.
+            try:
+                write_cf_root_attrs(path)
+            except Exception as e:
+                logger.warning(f"Could not write CF root attrs for {path.name}: {e}")
 
             # Release every handle on the raw files before anything moves or
             # deletes them. Both closes are needed and neither is redundant.

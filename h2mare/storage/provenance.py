@@ -548,6 +548,95 @@ def write_compiled_provenance(
 #: they are written by the pipeline itself and have no counterpart in config.
 _DERIVED_ROOT_ATTRS = (COMPILED_PROVENANCE_ATTR, MODIFIED_ATTR)
 
+#: The conventions every store in the pipeline claims to follow.
+#:
+#: Stated rather than implied: a checker has no reason to validate a file that
+#: does not say what it is, so an unlabelled store is one nobody can verify.
+#: CF 1.11 rather than the newest — nothing here uses a feature added since, and
+#: claiming a version is a claim about what a reader must understand.
+_CONVENTIONS = "CF-1.11, ACDD-1.3"
+
+
+def pipeline_root_attrs() -> dict:
+    """
+    What the pipeline can state about any store it writes, whatever is in it.
+
+    ``history`` names the last write rather than accumulating a line per run.
+    A true audit trail on a store compiled daily for years is unbounded, and
+    the fact it would be recording — when this file was last touched — is
+    already the one ``date_modified`` carries.
+    """
+    from h2mare import __version__
+
+    return {
+        "Conventions": _CONVENTIONS,
+        "product_version": __version__,
+        "history": (
+            f"{pd.Timestamp.today().strftime('%Y-%m-%d')}: written by h2mare "
+            f"{__version__}"
+        ),
+    }
+
+
+def extent_root_attrs(zarr_path: Path) -> dict:
+    """
+    ACDD extent attributes, read off the written store rather than config.
+
+    They describe one file's own coverage, so config is the wrong place for
+    them twice over: a per-period store holds a different span in every file,
+    and an append changes the span of the file it lands in. Read after the
+    write for the same reason the provenance records are — what the store holds
+    is the only account that survives a partial run.
+
+    ``time_coverage_resolution`` is inferred from the axis rather than declared,
+    so an hourly store says PT1H and a daily one P1D without either being told.
+    """
+    import numpy as np
+
+    attrs: dict = {}
+    ds = xr.open_zarr(zarr_path, consolidated=False)
+    try:
+        if "time" in ds.coords and ds.sizes.get("time", 0):
+            axis = pd.DatetimeIndex(ds["time"].values)
+            attrs["time_coverage_start"] = axis.min().isoformat()
+            attrs["time_coverage_end"] = axis.max().isoformat()
+            attrs["time_coverage_duration"] = pd.Timedelta(
+                axis.max() - axis.min()
+            ).isoformat()
+            if axis.size > 1:
+                step = pd.Timedelta(np.median(np.diff(axis.values)))
+                attrs["time_coverage_resolution"] = step.isoformat()
+
+        for coord, prefix in (("lat", "geospatial_lat"), ("lon", "geospatial_lon")):
+            if coord in ds.coords and ds.sizes.get(coord, 0):
+                values = ds[coord].values
+                attrs[f"{prefix}_min"] = float(np.min(values))
+                attrs[f"{prefix}_max"] = float(np.max(values))
+    finally:
+        ds.close()
+    return attrs
+
+
+def write_cf_root_attrs(zarr_path: Path) -> dict:
+    """
+    Stamp conventions and extent onto a native per-variable store.
+
+    Updates rather than replaces: unlike h2ds, whose root is rebuilt from config
+    on every compile, a native store's root carries ``source_datasets`` that
+    nothing else would put back.
+
+    The fixed globals in config are deliberately not written here — they
+    describe h2ds ("Integrated Geospatial Dataset Collection"), and a native
+    store is one source's own data at its own cadence, so claiming them would
+    mislabel it.
+    """
+    import zarr
+
+    attrs = {**pipeline_root_attrs(), **extent_root_attrs(zarr_path)}
+    root = zarr.open_group(str(zarr_path), mode="r+")
+    root.attrs.update(attrs)
+    return attrs
+
 
 def refresh_root_attrs(zarr_path: Path, global_attrs: dict) -> dict:
     """
@@ -564,11 +653,21 @@ def refresh_root_attrs(zarr_path: Path, global_attrs: dict) -> dict:
     too; updating alone would have left ``products ID`` in place forever.
     Attributes the pipeline derives rather than reads from config are carried
     across.
+
+    The conventions and extent attributes are layered over config rather than
+    stored in it, because they are facts about the file: which version wrote
+    it, and what it turned out to contain. Config still supplies everything
+    that is a *choice* — the title, the licence, who to contact.
     """
     import zarr
 
     root = zarr.open_group(str(zarr_path), mode="r+")
     preserved = {k: root.attrs[k] for k in _DERIVED_ROOT_ATTRS if k in root.attrs}
-    merged = {**global_attrs, **preserved}
+    merged = {
+        **global_attrs,
+        **pipeline_root_attrs(),
+        **extent_root_attrs(zarr_path),
+        **preserved,
+    }
     root.attrs.put(merged)
     return merged

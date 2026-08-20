@@ -252,10 +252,36 @@ variables:
     bbox: [-80, 0, 10, 70]
 
 
+# Fixed root attributes for h2ds. Everything here is a choice - what the
+# dataset is called, who to contact, what may be done with it.
+#
+# The facts about a given file are not here and cannot be: Conventions,
+# product_version, history and the geospatial/time extents are written by
+# provenance.refresh_root_attrs at compile, read off the store itself. A
+# per-period store holds a different span in every file, so config could only
+# ever state one of them wrongly.
 global_attrs:
   title: h2ds - Integrated Geospatial Dataset Collection for the North Atlantic
+  summary: >-
+    Daily ocean and atmosphere variables for the North Atlantic on a common 0.25 degree grid,
+    compiled from CMEMS, AVISO, ERA5 and ETOPO products. Sea surface temperature and fronts,
+    sea surface height and geostrophic currents, mixed layer depth, chlorophyll, dissolved
+    oxygen and potential temperature at depth, micronekton and productivity, eddy and
+    Lyapunov diagnostics, wind, pressure, precipitation, radiation, waves, bathymetry and
+    moon phase.
+  keywords: >-
+    oceanography, sea surface temperature, sea surface height, ocean colour, chlorophyll,
+    mixed layer depth, dissolved oxygen, mesoscale eddies, Ekman pumping, upwelling, waves,
+    reanalysis, North Atlantic
   source: Various reanalysis and observational datasets from CMEMS/AVISO/NCEI-ETOPO/CDS-ERA5
   project: h2mare - Geospatial Processing for Climate and Ocean Data
+  references: https://github.com/h2ugoparra/h2mare
+  # The h2mare source is MIT; the data is not h2mare's to license. Each source
+  # product carries its own terms and they travel with these values.
+  license: >-
+    Derived product. Redistribution and use are subject to the terms of each source product
+    (CMEMS, AVISO, Copernicus/ECMWF ERA5, NOAA NCEI ETOPO); see the per-variable product_id
+    and dataset_id attributes for provenance.
   creator_name: Hugo Parra
   creator_email: h2ugo.parra@pm.me
   date_created: '2024-06-12'
@@ -263,8 +289,7 @@ global_attrs:
   geospatial_lat_units: degrees_north
   geospatial_lon_resolution: 0.25
   geospatial_lon_units: degrees_east
-  time_coverage_resolution: P1D
-  comments: For variables with less than 0.25 spatial resolution (all except o2), upscalling was done using xarray interp function with linear method
+  comment: For variables with less than 0.25 spatial resolution (all except o2), upscalling was done using xarray interp function with linear method
 
 variable_attrs:
 # SST
