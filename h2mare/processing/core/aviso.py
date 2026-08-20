@@ -26,6 +26,7 @@ from h2mare.storage.coverage import resolve_date_range
 from h2mare.storage.provenance import write_provenance_for_window
 from h2mare.storage.storage import write_append_zarr
 from h2mare.storage.xarray_helpers import (
+    apply_cf_attrs,
     chunk_dataset,
     convert360_180,
     ds_float64_to_float32,
@@ -654,14 +655,10 @@ class EDDIESProcessor:
 
         # Explicit join: xarray's concat default changes from "outer" to "exact".
         ds_year = xr.concat(daily, dim="time", join="outer")
-        return self._set_attrs(ds_year)
-
-    def _set_attrs(self, ds: xr.Dataset) -> xr.Dataset:
-        """Set dataset variables attributes from yaml variable_attrs."""
-        for var in ds.data_vars:
-            var_info = get_settings().get_var_info(str(var))
-            ds[var].attrs.update({key: val for key, val in var_info.items()})
-        return ds
+        # The trajectory path bypasses NetcdfToZarr.process_dataset, so this is
+        # where the eddies store gets its metadata. Same helper, so it also
+        # picks up the coordinate attributes the old local _set_attrs never set.
+        return apply_cf_attrs(ds_year, native_var_key="eddies")
 
 
 def _process_daily_static(

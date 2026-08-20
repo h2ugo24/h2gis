@@ -990,6 +990,46 @@ variable_attrs:
     comment: Height of the combined wind sea and swell, defined as the mean height of the highest third of waves. Daily mean of the hourly ERA5 field.
     product_id: ERA5 reanalysis
     dataset_id: reanalysis-era5-single-levels
+
+# ----------------------------------------------------------------------
+# Native-store attribute overrides
+# ----------------------------------------------------------------------
+# variable_attrs above describes what h2ds publishes. Where a native
+# per-variable store holds the same quantity differently, the delta goes here,
+# keyed by var_key and then by variable name. A null value removes the
+# attribute instead of setting it.
+#
+# Only the hourly CDS stores need entries. They keep ERA5's own units, because
+# the conversion happens on the way into h2ds (see cds.hourly_atm_instante and
+# store_hourly_atm_accum), and they keep ERA5's own hourly cadence, so the
+# cell_methods naming a daily reduction does not apply to them.
+#
+# Radiation is deliberately absent: hourly_radiation converts J.m-2 to W.m-2 at
+# both cadences, so the native store already publishes h2ds's units, and each
+# hourly value is a mean over its own interval, so 'time: mean' still holds.
+native_attr_overrides:
+  atm-instante:
+    msl:
+      units: Pa           # hPa only after daily_sea_level_pressure runs
+      cell_methods: null  # hourly instantaneous, not a daily mean
+    u10:
+      cell_methods: null
+    v10:
+      cell_methods: null
+    tcc:
+      cell_methods: null
+
+  atm-accum-avg:
+    tp:
+      units: m            # mm only after daily_total_rain multiplies by 1000
+      # cell_methods stays 'time: sum': an hourly ERA5 accumulation is already
+      # a sum over its own interval.
+
+  waves:
+    swh:
+      cell_methods: null  # hourly instantaneous
+    mdts:
+      cell_methods: null
  
  
 

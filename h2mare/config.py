@@ -58,6 +58,7 @@ class Settings:
         self._app_config: Optional[AppConfig] = None
         self._global_attrs = None
         self._variable_attrs = None
+        self._native_attr_overrides = None
 
     def _find_project_root(self) -> tuple[Path, bool]:
         """Find the h2mare project root and whether we are in project mode.
@@ -143,7 +144,12 @@ class Settings:
             config_dict = yaml.safe_load(f) or {}
 
         # Warn on unrecognised top-level keys — catches typos like "varibles:"
-        _KNOWN_KEYS = {"variables", "global_attrs", "variable_attrs"}
+        _KNOWN_KEYS = {
+            "variables",
+            "global_attrs",
+            "variable_attrs",
+            "native_attr_overrides",
+        }
         unknown = set(config_dict) - _KNOWN_KEYS
         if unknown:
             logger.warning(
@@ -155,6 +161,7 @@ class Settings:
         # Extract global and variable metadata (not part of AppConfig)
         self._global_attrs = config_dict.get("global_attrs", {})
         self._variable_attrs = config_dict.get("variable_attrs", {})
+        self._native_attr_overrides = config_dict.get("native_attr_overrides", {})
 
         # Add secrets from environment
         secrets_dict = {
@@ -223,6 +230,19 @@ class Settings:
         if self._variable_attrs is None:
             self.load_app_config()
         return self._variable_attrs or {}
+
+    @property
+    def native_attr_overrides(self) -> dict:
+        """
+        Per-var_key attribute deltas for the native stores, ``{var_key: {var: attrs}}``.
+
+        Empty for most variables: a native store usually publishes exactly what
+        h2ds does. It is the hourly CDS stores that differ, holding ERA5's own
+        units and cadence while h2ds holds the converted daily reduction.
+        """
+        if self._native_attr_overrides is None:
+            self.load_app_config()
+        return self._native_attr_overrides or {}
 
     @property
     def app_config(self) -> AppConfig:

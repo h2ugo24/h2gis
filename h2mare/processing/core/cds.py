@@ -487,17 +487,6 @@ def compute_curl_and_ekman(
     out = xr.Dataset({tx_name: tx, ty_name: ty, "ekman_pumping": ekman})
 
     out = resample_daily_mean(out)
-
-    out["ekman_pumping"].attrs.update(
-        {
-            "long_name": "Daily Ekman vertical velocity",
-            "units": "m/s",
-            "comment": "Daily Ekman pumping mean velocity derived from hourly data "
-            "of surface wind stress curl/turbulence components. Pumping is defined as vertical velocity at the base of the Ekman layer. "
-            "positive = upwelling (suction), negative = downwelling (pumping).",
-        }
-    )
-
     out = out.transpose("time", "lat", "lon")
     return out
 
@@ -613,31 +602,9 @@ def add_engineered_ekman(
 
     ds_ekman = xr.Dataset({"ekman_7d": ekman_7d, "ekman_anom": anom["ekman_pumping"]})
 
-    ds_ekman["ekman_7d"].attrs.update(
-        {
-            "long_name": "Ekman 7day-mean vertical velocity",
-            "units": "m/s",
-            "comment": "Ekman pumping mean velocity within a rolling 7-day window.",
-        }
-    )
-    ds_ekman["ekman_anom"].attrs.update(
-        {
-            "long_name": "Ekman anomaly",
-            "units": "m/s",
-            "comment": "Ekman anomaly calculated by the difference between 7day rolling mean Ekman pumping and 1998-2017 climatology, per day-of-year (DOY) and grid cell.",
-        }
-    )
-
     # Create lag anomalies
     for lag in _EKMAN_LAGS:
         ds_ekman[f"ekman_anom_lag{lag}"] = ds_ekman["ekman_anom"].shift(time=lag)
-        ds_ekman[f"ekman_anom_lag{lag}"].attrs.update(
-            {
-                "long_name": f"Ekman anomaly with a {lag} day lag",
-                "units": "m/s",
-                "comment": f"{lag}-days lagged Ekman anomaly calculated as the difference between 7day mean Ekman pumping and 1998-2017 climatology, per day-of-year (DOY) and grid cell.",
-            }
-        )
 
     # Align 90th percentile climatology with the time axis
     p90_aligned = p90.sel(month=ds_ekman["time"].dt.month)
@@ -656,16 +623,6 @@ def add_engineered_ekman(
     # genuinely no prior data, i.e. the first days of the archive.
     for w in _EKMAN_EVENT_WINDOWS:
         ds_ekman[f"n_upwell_events_{w}d"] = exceed.rolling(time=w, min_periods=w).sum()
-        ds_ekman[f"n_upwell_events_{w}d"].attrs.update(
-            {
-                "long_name": f"Number of Ekman pumping upwelling events within {w}-days",
-                "units": "count",
-                "comment": f"Daily count of events where Ekman pumping anomaly exceeded the 90th percentile "
-                f"threshold from the 1998 to 2017 monthly climatology computed for each grid cell and accumulated within a rolling {w}-day window. "
-                f"Values range from 0 (no events) to {w} (all days in the window exceed threshold), and are NaN until {w} days of history exist. "
-                f"Note: values dont represent days but frequency of events.",
-            }
-        )
 
     # Remove previous days added before
     ds_ekman = ds_ekman.sel(time=slice(da_dt_ini, da_dt_fin))

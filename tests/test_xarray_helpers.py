@@ -6,6 +6,7 @@ import pytest
 import xarray as xr
 
 from h2mare.storage.xarray_helpers import (
+    apply_cf_attrs,
     chunk_dataset,
     convert360_180,
     drop_source_encoding_attrs,
@@ -409,3 +410,184 @@ class TestDropSourceEncodingAttrs:
     def test_a_dataset_with_nothing_to_drop_is_unchanged(self):
         ds = xr.Dataset({"sst": xr.DataArray([1.0], dims="x", attrs={"units": "degC"})})
         assert drop_source_encoding_attrs(ds)["sst"].attrs == {"units": "degC"}
+
+    def test_grib_attrs_survive_when_drop_grib_is_off(self):
+        """
+        The native path keeps them: a CDS store is written at ERA5's own grid,
+        so GRIB_Nx/Ny still describe it, and hourly_radiation deliberately
+        rewrites GRIB_units/GRIB_stepType there to stop the accumulation being
+        differenced twice. The packing bounds go either way.
+        """
+        attrs = drop_source_encoding_attrs(self._ds(), drop_grib=False)[
+            "thetao_100"
+        ].attrs
+        assert attrs["GRIB_Nx"] == 181
+        assert attrs["GRIB_units"] == "N m**-2"
+        assert "valid_min" not in attrs
+        assert "valid_max" not in attrs
+
+
+class TestApplyCfAttrs:
+    """
+    The single place both write paths take their metadata from.
+
+    Without the coordinate half, ``rio.clip`` cannot resolve lon/lat — it falls
+    back to CF attributes when the dims are not named x/y, and finding none it
+    clipped geometry extraction to nothing but NaN.
+
+    Run against a stub table rather than the repo's config.yaml: settings
+    resolve through ``H2MARE_ROOT``, so what ``get_settings`` returns depends on
+    the machine, and on CI there is no deployed config at all. That the real
+    table is CF-valid is a question about the table, and belongs to
+    ``test_cf_compliance.py``; these are about the mechanics.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stub_settings(self, monkeypatch):
+        table = {
+            "sst": {
+                "long_name": "Analysed sea surface temperature",
+                "standard_name": "sea_surface_foundation_temperature",
+                "units": "degree_C",
+            },
+            "gke": {"long_name": "Geostrophic Kinetic Energy", "units": "m2.s-2"},
+            "msl": {"units": "hPa", "cell_methods": "time: mean"},
+            "swh": {"units": "m"},
+            "thetao": {"units": "degree_C"},
+        }
+        overrides = {"atm-instante": {"msl": {"units": "Pa", "cell_methods": None}}}
+
+        class _Stub:
+            @staticmethod
+            def get_var_info(name):
+                return table.get(name, {})
+
+            native_attr_overrides = overrides
+
+        monkeypatch.setattr("h2mare.config.get_settings", lambda: _Stub())
+
+    @staticmethod
+    def _ds(var: str = "sst", **attrs) -> xr.Dataset:
+        times = pd.date_range("2020-01-01", periods=2, freq="D")
+        return xr.Dataset(
+            {
+                var: (
+                    ["time", "lat", "lon"],
+                    np.ones((2, 2, 2), dtype=np.float32),
+                    attrs,
+                )
+            },
+            coords={"time": times, "lat": [0.0, 0.25], "lon": [0.0, 0.25]},
+        )
+
+    def test_spatial_coords_get_cf_attributes(self):
+        ds = apply_cf_attrs(self._ds())
+        assert ds["lon"].attrs["standard_name"] == "longitude"
+        assert ds["lon"].attrs["units"] == "degrees_east"
+        assert ds["lon"].attrs["axis"] == "X"
+        assert ds["lat"].attrs["standard_name"] == "latitude"
+        assert ds["lat"].attrs["units"] == "degrees_north"
+        assert ds["lat"].attrs["axis"] == "Y"
+
+    def test_time_is_labelled_but_gets_no_units(self):
+        """
+        Regression: xarray writes time units/calendar into .encoding at to_zarr,
+        and a units in .attrs as well makes that write raise rather than merely
+        disagree. The axis label is still worth setting.
+        """
+        ds = apply_cf_attrs(self._ds())
+        assert ds["time"].attrs["standard_name"] == "time"
+        assert ds["time"].attrs["axis"] == "T"
+        assert "units" not in ds["time"].attrs
+        assert "calendar" not in ds["time"].attrs
+
+    def test_depth_is_positive_down_when_present(self):
+        ds = self._ds("thetao").expand_dims(depth=[0.0, 100.0])
+        out = apply_cf_attrs(ds)
+        assert out["depth"].attrs["positive"] == "down"
+        assert out["depth"].attrs["axis"] == "Z"
+
+    def test_variable_attrs_come_from_config(self):
+        ds = apply_cf_attrs(self._ds("sst"))
+        assert ds["sst"].attrs["units"] == "degree_C"
+        assert ds["sst"].attrs["standard_name"] == "sea_surface_foundation_temperature"
+
+    def test_a_derived_variable_that_lost_its_attrs_gets_them_back(self):
+        """
+        gke is (ugos**2 + vgos**2)/2 and sst is a subtraction; xarray drops attrs
+        on arithmetic, so both reached the native store carrying none at all.
+        """
+        ds = apply_cf_attrs(self._ds("gke"), native_var_key="ssh")
+        assert ds["gke"].attrs["units"] == "m2.s-2"
+        assert ds["gke"].attrs["long_name"] == "Geostrophic Kinetic Energy"
+
+    def test_native_override_replaces_the_published_units(self):
+        """msl is Pa in its own store and hPa only after the compile converts."""
+        compiled = apply_cf_attrs(self._ds("msl"))
+        native = apply_cf_attrs(self._ds("msl"), native_var_key="atm-instante")
+        assert compiled["msl"].attrs["units"] == "hPa"
+        assert native["msl"].attrs["units"] == "Pa"
+
+    def test_a_null_override_removes_the_attribute(self):
+        """
+        An hourly store holds instantaneous values, so the cell_methods naming a
+        daily mean does not describe it and has to come off rather than change.
+        """
+        compiled = apply_cf_attrs(self._ds("msl"))
+        native = apply_cf_attrs(self._ds("msl"), native_var_key="atm-instante")
+        assert compiled["msl"].attrs["cell_methods"] == "time: mean"
+        assert "cell_methods" not in native["msl"].attrs
+
+    def test_overrides_apply_only_to_their_own_var_key(self):
+        """msl's Pa must not leak into a store that is not atm-instante."""
+        ds = apply_cf_attrs(self._ds("msl"), native_var_key="waves")
+        assert ds["msl"].attrs["units"] == "hPa"
+
+    def test_compiled_path_drops_grib_attrs(self):
+        ds = apply_cf_attrs(self._ds("swh", GRIB_Nx=181, GRIB_units="m"))
+        assert not [k for k in ds["swh"].attrs if k.startswith("GRIB_")]
+
+    def test_native_path_keeps_grib_attrs(self):
+        ds = apply_cf_attrs(
+            self._ds("swh", GRIB_paramId=140229), native_var_key="waves"
+        )
+        assert ds["swh"].attrs["GRIB_paramId"] == 140229
+
+    def test_an_unconfigured_variable_is_left_alone(self):
+        ds = apply_cf_attrs(self._ds("not_in_config", units="widgets"))
+        assert ds["not_in_config"].attrs["units"] == "widgets"
+
+    def test_rioxarray_can_resolve_lon_lat_once_they_are_labelled(self):
+        """
+        The reason the coordinate half exists. rio resolves spatial dims by name
+        and falls back to CF attributes when they are not x/y — so on a store
+        whose lon/lat carry nothing, it cannot find them at all, which is what
+        made geometry extraction clip to NaN against h2ds and the CDS stores.
+        """
+        import rioxarray  # noqa: F401  (registers the .rio accessor)
+        from rioxarray.exceptions import MissingSpatialDimensionError
+
+        with pytest.raises(MissingSpatialDimensionError):
+            _ = self._ds().rio.x_dim
+
+        labelled = apply_cf_attrs(self._ds())
+        assert (labelled.rio.x_dim, labelled.rio.y_dim) == ("lon", "lat")
+
+    def test_a_written_store_keeps_time_units_in_encoding_only(self, tmp_path):
+        """
+        End-to-end guard on the .attrs/.encoding split: xarray raises on write if
+        both carry time units, and the append path is where that would surface
+        rather than the create.
+        """
+        ds = apply_cf_attrs(self._ds())
+        path = tmp_path / "t.zarr"
+        ds.to_zarr(path)
+        ds.assign_coords(time=pd.date_range("2020-01-03", periods=2, freq="D")).to_zarr(
+            path, append_dim="time"
+        )
+
+        back = xr.open_zarr(path, consolidated=False)
+        assert back.sizes["time"] == 4
+        assert "units" not in back["time"].attrs
+        assert back["time"].encoding["calendar"] == "proleptic_gregorian"
+        assert back["lat"].attrs["units"] == "degrees_north"
