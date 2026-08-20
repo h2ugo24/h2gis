@@ -232,6 +232,47 @@ Columns are the **input columns carried through**, plus one column per extracted
 | CSV / points | `time`, `lon`, `lat` | one column per variable (e.g. `sst`, `tisr`); depth-sliced variables expand to `var_<depth>` |
 | SHP / geometries | `time`, `geometry` | one column per variable; `bathy` additionally yields a `bathy_std` column (mean / std over each geometry) |
 
+### Standard-deviation columns
+
+`_std` does **not** mean the same thing in every column of a geometry extraction.
+
+For `sst`, `adt` and `sla` the geometry engine only ever computes a mean — `_extract_geometry`
+reduces each clip with `.mean()` and nothing else. Their `_std` columns are therefore the
+**polygon-mean of a std layer computed upstream**, not a spread measured across the polygon:
+
+| Layer | Computed at | Window | Relative to the 0.25° cell |
+|---|---|---|---|
+| `sst_std` | convert time, 0.05° native | 3×3 ≈ 0.15° | sub-cell texture |
+| `adt_std`, `sla_std` | convert time, 0.125° native | 3×3 ≈ 0.375° | **wider** than the cell |
+
+Both are then placed on the base grid with `interp_like(..., method="linear")` at compile time,
+so the stored 0.25° value is a point sample of the native std field rather than an aggregate over
+the cell. Because the windows differ in physical size, `sst_std` and `adt_std` magnitudes are not
+comparable with each other.
+
+`bathy_std` is the exception: `_extract_geometry_bathy` computes mean *and* std of the clipped
+values inside each geometry, on the 15″ hi-res layer. It is a genuine within-polygon spread, and
+the only column in the table that is.
+
+Averaging a stored std layer is the deliberate choice for the others. A within-polygon std is
+polygon-size dependent — a haul touching one 0.25° cell yields `0` or `NaN`, a large one is
+dominated by the regional gradient — so it is not comparable across rows of differing geometry
+size, whereas the layer mean is defined even for a single-cell polygon and stays on a fixed
+physical scale.
+
+Two related traps. `analysis_error` (shipped with the SST product) is retrieval uncertainty, not
+spatial variability, and substitutes for neither quantity. And if you ever do want variability at
+both scales at once, the law of total variance gives it from layers already stored — no new
+extraction path needed:
+
+```
+Var_total(polygon) ≈ mean_i(σ_i²) + var_i(μ_i)
+```
+
+with `σ_i` the stored `*_std` and `μ_i` the stored mean field over the clipped cells. Note that
+averaging `σ` rather than `σ²` understates variability (Jensen), so pool the variances and take
+the square root at the end.
+
 The in-memory `run()` return keeps the SHP `geometry` column as a `GeoDataFrame` with live
 shapely geometries (restored from the input on a checkpoint resume, since feather cannot
 round-trip them). It is dropped only when writing to CSV, where shapely geometries would

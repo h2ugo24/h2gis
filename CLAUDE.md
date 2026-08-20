@@ -22,11 +22,6 @@ h2mare/
   └── utils/                # spatial (grids/masks), labels, logging, paths, datetime_utils
 ```
 
-The pipeline flows left-to-right through these packages: downloader/ fetches raw files → format_converters/ +
-processing/ regrid and preprocess into per-variable Zarr → processing/compiler.py merges into the unified h2ds →
-storage/ indexes it and exposes Parquet for analysis/visualization, all orchestrated by pipeline_manager.py and
-driven from cli/.
-
 ### Registry pattern
 
 Per-variable behavior is selected by `var_key` through three registries; the right way to add a new variable
@@ -63,6 +58,7 @@ uv run h2mare run -v sst --start-date 2021-01-01 --end-date 2021-12-31   # expli
 uv run h2mare convert -v sst                                             # convert downloaded raw data to zarr (-v required)
 uv run h2mare compile                                                    # merge Zarr stores; dates inferred
 uv run h2mare parquet                                                    # Zarr → Parquet; dates inferred
+uv run h2mare parquet2zarr                                               # rebuild per-period Zarr from Parquet
 uv run h2mare catalog sst                                                # inspect ZarrCatalog metadata
 
 # Audit the stores for silently-missing days (exits non-zero on findings)
@@ -85,6 +81,7 @@ uv run ruff format h2mare/
 - Write-path merge semantics are deliberate and pinned by regression tests (`tests/test_storage.py`, `tests/test_parquet_store.py`): incoming data wins where it has rows (even when null); stored values survive outside its window; time-less statics (bathy) come from the fresh side; tails and absent variables are preserved. Read those tests before changing `storage.py::_append_data` or `parquet_store.py::resolve_dims_overlap`.
 - Extraction cadence: `Extractor` takes two independent args — `time_cadence` (`auto`/`daily`/`hourly`) reads `time_col`; `read_from` (`auto`/`native`/`compiled`) picks the store. Under `auto`: a daily store answers for itself, an **hourly** one answers only sub-daily input and a date-only query goes to **h2ds** — so extracting those at daily cadence needs a current `compile`. Compile-derived vars absent from an hourly store (ekman chain, `wind_*`) are always read from h2ds and broadcast per day, even under `read_from="native"`, because converting the same var_key daily writes them natively. A *daily* store missing what it publishes raises instead — routing is for what the design puts elsewhere, not for holes. Units differ between the two sources (`msl` is Pa native, hPa in h2ds). See `docs/api/extractor.md#cadence`.
 - Extraction checkpoint: `INTERIM_DIR/extraction_checkpoint.feather` survives only a *failed* run, and lives at one fixed path. It carries a fingerprint of the input, and a checkpoint written for a different one is discarded rather than resumed — otherwise a same-shape frame had the previous run's rows replayed onto it (`ensure_row_id` keys positionally, so equal-length frames align perfectly). A fingerprint match still cannot tell "resume" from "re-run after a fix", so delete `extraction_checkpoint.*` when the *code or config* changed rather than the input.
+- Geometry `_std` columns: the shp engine reduces a clip with `.mean()` only (`extractor.py::_extract_geometry`), so `sst_std`/`adt_std`/`sla_std` are the **polygon-mean of a stored layer**, not a std computed within the polygon — deliberate, since a within-polygon std is size-dependent (a haul touching one cell gives 0 or NaN) and would not compare across rows. `bathy_std` is the exception: `_extract_geometry_bathy` computes mean *and* std inside the geometry on 15″ data, so that one column is a different estimator. The layers are not on a common scale either (`sst_std` is a 3×3 window at 0.05°, sub-cell; `adt_std`/`sla_std` 3×3 at 0.125°, *wider* than the 0.25° cell), so don't compare their magnitudes across variables. See `docs/api/extractor.md#standard-deviation-columns`.
 - Axis drift: the same grid written on different occasions can disagree in the last float bits. Each file stays monotonic alone, so it only shows up when `open_mfdataset(combine="by_coords")` compares the arrays exactly — as *"does not have monotonic global indexes along dimension lon"*, or as a silently doubled axis, depending on xarray version. `ZarrReader` snaps axes agreeing to within `1e-9°` onto the earliest file's and warns; anything coarser still raises. Repair the store with `uv run python scripts/repair_axis_drift.py <var_key> --apply` (dry run by default, rewrites coordinate arrays only). `--all` surveys every var_key.
 - Data quirks: `chl` has legitimate all-null days (~1999/2000 — the raw product never published them; the zarr is null too, so they are not backfillable). `seapodym` covers 2025 only.
 
@@ -125,34 +122,11 @@ extraction-chunked. See `docs/api/map_export.md`.
 
 ## Git workflow
 
-Follows the global Git Workflow (see `~/.claude/CLAUDE.md`).
+Follows the global Git Workflow verbatim (see `~/.claude/CLAUDE.md`) — branches, PR-only merges,
+conventional commits, branch protection. Only these two are additional here:
 
-**Branches**
-- `main` — production; stable, deployable, never commit directly.
-- `dev` — integration/staging; features land here first.
-- `feature/<name>` — one per feature, branched from `dev`, merged back to `dev`.
-
-**Per feature/fix**
-- Branch fresh: `git checkout dev && git pull origin dev && git checkout -b feature/<name>`.
-- Work, then `git add <file>` → `git commit -m "feat: ..."` → `git push -u origin feature/<name>`.
-- Resuming or dev moved? `git pull origin dev` *before* coding more — avoids most conflicts.
-
-**Merge via PR on GitHub (never local merge)**
-- Open PR (base `dev`), review the diff, approve, merge.
-- Clean up: `git checkout dev && git pull origin dev && git branch -d feature/<name>` and delete the remote branch.
-
-**Release**
-- PR `dev` → `main`, review, merge; then `git checkout main && git pull origin main`.
-- Optional tag: `git tag -a v1.0.0 -m "..." && git push origin v1.0.0`.
-- Bump `pyproject.toml` version + `uv lock` via a `chore/` PR into `dev` *before* the release PR.
-
-**Rules**
-- Always branch from the latest `dev` — *pull before you branch*.
-- Even small fixes get a branch (`fix/<name>`) — never merge directly.
-- Commit with a type: `feat:` / `fix:` / `docs:` / `chore:` / `perf:` / `refactor:`; say what changed and why.
-- Branch with a matching prefix: `feature/` / `fix/` / `docs/` / `chore/` / `perf/` / `refactor/`.
-- Protect `main` and `dev` (require PR review).
 - Merging requires 3 green checks (`branch-name`, `commit-lint`, `quality`) **and** an up-to-date branch: `gh pr update-branch <#> --rebase`, wait for checks, then `gh pr merge <#> --merge --delete-branch`.
+- Bump `pyproject.toml` version + `uv lock` via a `chore/` PR into `dev` *before* the release PR.
 
 ## Coding Rules
 
