@@ -1,8 +1,9 @@
 # Extractor
 
 `Extractor` extracts environmental values at point locations (CSV / `DataFrame`) or
-spatial geometries (SHP / `GeoDataFrame`). By default it reads from the h2ds Zarr stores
-via `ZarrCatalog`, but it can also extract against an arbitrary in-memory `xarray` dataset
+spatial geometries (SHP / `GeoDataFrame`). By default it reads the per-variable Zarr stores
+via `ZarrCatalog`, falling back to the compiled h2ds for variables stored hourly (see
+[Cadence](#cadence)); it can also extract against an arbitrary in-memory `xarray` dataset
 that is not yet in the store (see [`extract_from_dataset()`](#extract_from_dataset)).
 
 ```python
@@ -32,6 +33,8 @@ Extractor(
     app_config=None,      # default: settings.app_config
     store_root=None,      # default: STORE_ROOT
     crs=4326,             # EPSG code for geometry extraction (SHP only)
+    time_cadence="auto",  # "auto" | "daily" | "hourly"    — see Cadence
+    read_from="auto",     # "auto" | "native" | "compiled" — see Cadence
     log_file=None,        # default: LOGS_DIR/extractor.log
 )
 ```
@@ -46,44 +49,87 @@ Extractor(
 | `app_config` | `settings.app_config` | Override the application configuration (variable registry, depth slices, etc.). |
 | `store_root` | `STORE_ROOT` | Root directory of the Zarr stores. |
 | `crs` | `4326` | EPSG code that geometries are reprojected to (SHP/geometry input only). |
+| `time_cadence` | `"auto"` | How `time_col` is read: `"daily"` truncates to midnight, `"hourly"` keeps the precision, `"auto"` infers. See [Cadence](#cadence). |
+| `read_from` | `"auto"` | Which store each `var_key` is read from: its own Zarr (`"native"`), the compiled h2ds (`"compiled"`), or per-`var_key` (`"auto"`). See [Cadence](#cadence). |
 | `log_file` | `LOGS_DIR/extractor.log` | Extraction log file. The first `Extractor` in the process fixes this; later values are ignored. |
 
 ---
 
-## Establishing the merge key (`ensure_row_id`)
+## Cadence
 
-The Extractor keeps only the columns it needs (`time`/`lon`/`lat` for points,
-`time`/`geometry` for geometries) and returns one column per extracted variable. To stitch
-those results back onto your *original* dataframe, you need a key that exists on **both**
-sides. Because the Extractor never sees your other columns, that key must be established
-**before** extraction, on the frame you keep — not invented inside the Extractor.
+Some variables are stored at their source's native **hourly** cadence
+(`time_step: hourly` in `config.yaml`). For those, the daily reduction and every
+feature derived from it are produced at compile time and written only to h2ds.
+The per-variable Zarr is therefore the raw *source*; **h2ds is the daily
+*product***. In the shipped config the hourly variables are the four ERA5 ones —
+`atm-instante`, `atm-accum-avg`, `radiation`, `waves` — but nothing is hardcoded:
+the same variables converted with `time_step: daily` compute their reductions up
+front and hold everything in their own store.
 
-`ensure_row_id` is the helper for that step:
+Two independent arguments control this. `time_cadence` decides **how your input
+is read**; `read_from` decides **which store answers**.
 
-```python
-from h2mare.processing.extractor import ensure_row_id
+### `time_cadence` — reading `time_col`
 
-df = ensure_row_id(df)        # adds a unique "row_id" column (or validates an existing one)
-```
-
-| `col` state in `data` | Behaviour |
+| value | behaviour |
 |---|---|
-| present, unique | returned unchanged |
-| present, duplicated | raises `ValueError` — a duplicated key collapses rows on merge-back |
-| absent | adds a positional `0..n-1` key (on a copy) — safe to merge back only against this exact frame, in this order |
+| `"auto"` | infer: a time component that **varies** across rows means hours; a date-only input, or one stamped identically on every row, means days |
+| `"daily"` | truncate to midnight regardless |
+| `"hourly"` | keep whatever precision is there |
 
-### Merging results back
+The uniform-stamp case is the one to watch. `14:00:00` on *every* row reads as an
+export default rather than a deliberate hour, so `"auto"` truncates it. Pass
+`"hourly"` when your rows really do mean 14:00.
 
 ```python
-df = ensure_row_id(df)                              # key now lives on your frame
-out = Extractor(df, index_col="row_id").run("sst")  # result indexed by row_id
-enriched = df.merge(out, left_on="row_id", right_index=True)
+Extractor(pts, index_col="row_id", time_cadence="hourly")
 ```
 
-Passing a `.csv`/`.shp` **path** instead of a frame is still supported, but with
-`index_col` required the file must already contain that key column — there is no
-auto-provisioning fallback. For files, read them in, call `ensure_row_id`, and pass the
-frame.
+### `read_from` — choosing the store
+
+| value | behaviour |
+|---|---|
+| `"auto"` | per `var_key`: a daily store answers for itself; an hourly one answers a sub-daily request and otherwise defers to the compiled store |
+| `"native"` | the per-variable Zarr |
+| `"compiled"` | h2ds |
+
+`"compiled"` works for **any** `var_key`, including daily ones — useful when you
+want every column on the same grid and units as your Parquet-based analysis:
+
+```python
+Extractor(pts, index_col="row_id", read_from="compiled").run("sst")
+```
+
+### What `auto` resolves to
+
+| store cadence | input cadence | reads |
+|---|---|---|
+| daily | any | its own Zarr |
+| hourly | daily | h2ds |
+| hourly | hourly | its own Zarr, plus h2ds for anything derived at compile time |
+
+### Things worth knowing
+
+- **The two stores are not interchangeable.** h2ds is on the 0.25° base grid and
+  carries the pipeline's units; an hourly native store holds the raw source as
+  published. ERA5 `msl` is **hPa** in h2ds and **Pa** natively; `tp` is a daily
+  total versus a per-hour accumulation. Column names are the same either way, so
+  a native hourly read logs a warning naming the stored units.
+- **Reading a var_key from h2ds needs a current compile.** If h2ds is missing a
+  column the `var_key` publishes, extraction raises and names
+  `uv run h2mare compile` rather than returning a thinner frame.
+- **Some features have no hourly value at all.** `ekman_anom` is a 7-day rolling
+  mean against a day-of-year climatology; `wind_max` is a maximum over a day.
+  When they are absent from the native store — which happens only when that
+  `var_key` converts hourly — they are read from h2ds and each sample takes the
+  value for the day it falls in. This holds even under `read_from="native"`,
+  with a warning, because the alternative is returning nothing for a column that
+  the same variable converted daily would have had natively.
+- **A daily store missing what it publishes is an error, not a route.** The rule
+  is uniform: absent where the design puts it elsewhere is routed; absent where
+  the design says it should be present is a hole in the store, and says so.
+- The store your input never reaches is never opened, and h2ds is opened **once**
+  per `Extractor` however many `var_keys` a `run()` walks.
 
 ---
 
@@ -138,7 +184,7 @@ extractor.extract_from_dataset(
 | `clip_to_coverage` | When `True`, input rows whose location (and time, if `ds` has a time coord) fall outside the `ds` extent are dropped and surface as `NaN` in the result. Default `False`, since nearest-neighbour (CSV) and clip-or-NaN (SHP) already handle out-of-extent inputs. |
 
 Only config-free preparation is applied. Config-driven steps that the store path performs
-— depth-slice expansion, `rename_lonlat`, and store date/bbox coverage resolution — are
+— depth-slice expansion, store selection (`read_from`), and store date/bbox coverage resolution — are
 the **caller's** responsibility: prepare `ds` beforehand.
 
 ```python

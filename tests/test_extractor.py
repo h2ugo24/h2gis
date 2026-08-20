@@ -17,8 +17,12 @@ from h2mare.processing.extractor import (
     Extractor,
     _keys_path,
     _save_completed_keys,
+    _warn_if_wholly_failed,
     ensure_row_id,
-    resolve_extraction_vars,
+    null_summary_lines,
+    resolve_compiled_vars,
+    resolve_read_from,
+    split_vars_by_source,
     warn_on_subdaily_store,
 )
 from h2mare.types import BBox, DateRange
@@ -241,6 +245,25 @@ class TestNearestTimeIndices:
         q = np.array(pd.to_datetime(["2020-01-01 18:00:00"]))
         idx = Extractor._nearest_time_indices(ds, q)
         assert idx[0] == 1  # 18 h from Jan 1, 6 h from Jan 2
+
+    def test_mismatched_datetime_resolutions_still_match(self):
+        """
+        Regression: a Zarr time axis decodes to datetime64[ns] while pandas
+        parses input strings to [us], and both sides were cast to int64 raw.
+        The microsecond query read as 1/1000th of its true instant, sorted
+        before every stored step, and every row landed on index 0 — one
+        arbitrary time returned for the whole input, varying only by location.
+        Invisible in-process, because a fixture builds both sides alike.
+        """
+        ds = _make_spatiotemporal_ds()
+        ds = ds.assign_coords(time=ds["time"].values.astype("datetime64[ns]"))
+        q = pd.to_datetime(["2020-01-01", "2020-01-03", "2020-01-05"]).values.astype(
+            "datetime64[us]"
+        )
+
+        idx = Extractor._nearest_time_indices(ds, q)
+
+        np.testing.assert_array_equal(idx, [0, 2, 4])
 
     def test_before_first_step_clips_to_zero(self):
         """Query before the first time step is clipped to index 0."""
@@ -489,62 +512,181 @@ def _atm_config(*, hourly: bool = True) -> SimpleNamespace:
         ],
         time_step=TimeStep.HOURLY if hourly else TimeStep.DAILY,
         extract_depth_slices=None,
+        rename_lonlat=False,
+        source="cds",
+    )
+
+
+def _h2ds_config() -> SimpleNamespace:
+    """Compiled-store config entry: daily, publishing nothing of its own.
+
+    ``source="h2mare"`` is the marker the compiled var_key is found by — it is
+    not located by the name "h2ds".
+    """
+    return SimpleNamespace(
+        compiled_vars=[],
+        time_step=TimeStep.DAILY,
+        extract_depth_slices=None,
+        rename_lonlat=False,
+        source="h2mare",
     )
 
 
 _STORED = ["avg_iews", "avg_inss", "tp"]
 
 
-class TestResolveExtractionVars:
+class TestSplitVarsBySource:
     """
-    Once features are derived at compile time the store holds less than the
-    var_key publishes. Both ways of hitting that gap used to be quiet.
+    An hourly store holds strictly less than its var_key publishes. The split
+    says which side each requested variable comes from, so both can be read and
+    joined instead of returning a quietly thinner frame.
     """
 
-    def test_implicit_all_vars_refuses_a_thinner_store(self):
-        """vars=None used to return 3 columns where 5 were published, silently."""
-        with pytest.raises(ValueError) as err:
-            resolve_extraction_vars(_STORED, None, "atm-accum-avg", _atm_config())
+    def test_implicit_all_vars_routes_the_derived_ones_to_h2ds(self):
+        from_store, from_h2ds = split_vars_by_source(
+            None, _STORED, "atm-accum-avg", _atm_config()
+        )
+        assert from_store == _STORED
+        assert from_h2ds == ["ekman_anom", "n_upwell_events_3d"]
 
-        msg = str(err.value)
-        assert "ekman_anom" in msg and "n_upwell_events_3d" in msg
-        assert "compile" in msg.lower()
-
-    def test_implicit_all_vars_passes_when_store_is_complete(self):
+    def test_daily_store_asks_nothing_of_h2ds(self):
         """A daily store holds everything it publishes — behaviour unchanged."""
         cfg = SimpleNamespace(compiled_vars=_STORED, time_step=TimeStep.DAILY)
-        assert resolve_extraction_vars(_STORED, None, "atm-accum-avg", cfg) is None
+        assert split_vars_by_source(None, _STORED, "atm-accum-avg", cfg) == (
+            _STORED,
+            [],
+        )
 
-    def test_named_compile_derived_var_says_where_it_went(self):
-        """Previously a bare KeyError from ds[vars], naming no destination."""
+    def test_named_compile_derived_var_routes_to_h2ds(self):
+        from_store, from_h2ds = split_vars_by_source(
+            ["ekman_anom"], _STORED, "atm-accum-avg", _atm_config()
+        )
+        assert from_store == []
+        assert from_h2ds == ["ekman_anom"]
+
+    def test_unrecognised_var_still_raises(self):
         with pytest.raises(ValueError) as err:
-            resolve_extraction_vars(
-                _STORED, ["ekman_anom"], "atm-accum-avg", _atm_config()
-            )
-
-        msg = str(err.value)
-        assert "ekman_anom" in msg
-        assert "h2ds" in msg or "Parquet" in msg
-
-    def test_unrecognised_var_is_distinguished_from_a_moved_one(self):
-        with pytest.raises(ValueError) as err:
-            resolve_extraction_vars(
-                _STORED, ["not_a_var"], "atm-accum-avg", _atm_config()
-            )
+            split_vars_by_source(["not_a_var"], _STORED, "atm-accum-avg", _atm_config())
 
         assert "not variables of" in str(err.value)
 
-    def test_satisfiable_request_is_returned_unchanged(self):
-        got = resolve_extraction_vars(_STORED, ["tp"], "atm-accum-avg", _atm_config())
-        assert got == ["tp"]
+    def test_satisfiable_request_comes_wholly_from_the_store(self):
+        assert split_vars_by_source(
+            ["tp"], _STORED, "atm-accum-avg", _atm_config()
+        ) == (
+            ["tp"],
+            [],
+        )
 
     def test_var_key_without_compiled_vars_is_unaffected(self):
         """Most var_keys do not declare compiled_vars; they must not start failing."""
         cfg = SimpleNamespace(compiled_vars=None, time_step=TimeStep.DAILY)
-        assert resolve_extraction_vars(_STORED, None, "sst", cfg) is None
+        assert split_vars_by_source(None, _STORED, "sst", cfg) == (_STORED, [])
+
+    def test_incomplete_daily_store_is_a_defect_not_a_route(self):
+        """
+        h2ds is the fallback only for hourly var_keys. A daily store missing
+        what it publishes is a hole in the store, and must still say so.
+        """
+        cfg = SimpleNamespace(
+            compiled_vars=[*_STORED, "sst_std"], time_step=TimeStep.DAILY
+        )
+        with pytest.raises(ValueError) as err:
+            split_vars_by_source(None, _STORED, "sst", cfg)
+
+        assert "sst_std" in str(err.value)
+        assert "convert" in str(err.value)
+
+
+class TestResolveReadFrom:
+    """Which store answers, per (store cadence x input cadence x read_from)."""
+
+    @staticmethod
+    def _daily_cfg() -> SimpleNamespace:
+        return SimpleNamespace(compiled_vars=_STORED, time_step=TimeStep.DAILY)
+
+    # --- read_from="auto": inferred per var_key -----------------------------
+
+    @pytest.mark.parametrize("subdaily", [False, True])
+    def test_auto_daily_store_always_answers_for_itself(self, subdaily):
+        assert (
+            resolve_read_from(
+                self._daily_cfg(), read_from="auto", subdaily_input=subdaily
+            )
+            == "native"
+        )
+
+    def test_auto_hourly_store_with_date_only_input_routes_to_compiled(self):
+        assert (
+            resolve_read_from(_atm_config(), read_from="auto", subdaily_input=False)
+            == "compiled"
+        )
+
+    def test_auto_hourly_store_with_subdaily_input_serves_itself(self):
+        assert (
+            resolve_read_from(_atm_config(), read_from="auto", subdaily_input=True)
+            == "native"
+        )
+
+    def test_auto_config_without_time_step_defaults_to_daily(self):
+        """Stand-in configs predating the field must stay on the old path."""
+        cfg = SimpleNamespace(compiled_vars=_STORED)
+        assert (
+            resolve_read_from(cfg, read_from="auto", subdaily_input=False) == "native"
+        )
+
+    # --- pinned: honoured whatever the cadences say -------------------------
+
+    @pytest.mark.parametrize("subdaily", [False, True])
+    @pytest.mark.parametrize("pinned", ["native", "compiled"])
+    def test_pinned_is_honoured_for_an_hourly_store(self, pinned, subdaily):
+        assert (
+            resolve_read_from(_atm_config(), read_from=pinned, subdaily_input=subdaily)
+            == pinned
+        )
+
+    @pytest.mark.parametrize("subdaily", [False, True])
+    @pytest.mark.parametrize("pinned", ["native", "compiled"])
+    def test_pinned_is_honoured_for_a_daily_store(self, pinned, subdaily):
+        """read_from='compiled' on a daily var_key is the new capability: it
+        was previously impossible to extract e.g. sst from the compiled store."""
+        assert (
+            resolve_read_from(
+                self._daily_cfg(), read_from=pinned, subdaily_input=subdaily
+            )
+            == pinned
+        )
+
+
+class TestResolveH2dsVars:
+    def test_declared_vars_present_in_h2ds_pass_through(self):
+        available = [*_STORED, "ekman_anom", "n_upwell_events_3d", "sst"]
+        got = resolve_compiled_vars(available, None, "atm-accum-avg", _atm_config())
+        assert got == _atm_config().compiled_vars
+
+    def test_missing_column_blames_a_stale_compile(self):
+        """The ekman chain absent from h2ds means compile trails convert."""
+        with pytest.raises(ValueError) as err:
+            resolve_compiled_vars(_STORED, None, "atm-accum-avg", _atm_config())
+
+        msg = str(err.value)
+        assert "ekman_anom" in msg
+        assert "h2mare compile" in msg
+
+    def test_var_key_publishing_nothing_is_rejected(self):
+        cfg = SimpleNamespace(compiled_vars=[], time_step=TimeStep.HOURLY)
+        with pytest.raises(ValueError, match="compiled_vars"):
+            resolve_compiled_vars(_STORED, None, "waves", cfg)
 
 
 class TestWarnOnSubdailyStore:
+    """
+    Fires only where native hourly values are actually served. The h2ds route
+    returns the daily semantics and units the caller already expects, so a
+    warning there would be noise — that silence comes from the routing, which
+    never calls this on the h2ds path (see TestProcessSingleVarkeyRouting).
+    """
+
     @staticmethod
     def _capture(monkeypatch) -> list[str]:
         seen: list[str] = []
@@ -563,7 +705,7 @@ class TestWarnOnSubdailyStore:
         warn_on_subdaily_store("atm-accum-avg", _atm_config(), self._ds())
 
         assert len(seen) == 1
-        assert "00:00" in seen[0]
+        assert "nearest hour" in seen[0]
 
     def test_hourly_warning_reports_stored_units(self, monkeypatch):
         """The m-vs-mm trap is invisible in the numbers, so surface the units."""
@@ -579,35 +721,705 @@ class TestWarnOnSubdailyStore:
         assert seen == []
 
 
-class TestProcessSingleVarkeyGuards:
-    """The guards must sit on the real extraction path, not just be importable."""
+class TestProcessSingleVarkeyRouting:
+    """The routing must sit on the real extraction path, not just be importable."""
 
-    def _patched_catalog(self, monkeypatch, ds: xr.Dataset) -> MagicMock:
+    @staticmethod
+    def _hourly_ds() -> xr.Dataset:
+        """5 days x 24 h of the three fields the hourly store actually holds.
+
+        Values rise monotonically with the hour, so a nearest-hour hit is
+        distinguishable from a daily aggregate.
+        """
+        times = pd.date_range("2020-01-01", periods=5 * 24, freq="h")
+        lats, lons = [30.0, 35.0, 40.0], [-10.0, -5.0, 0.0]
+        hourly = np.arange(len(times), dtype=float)[:, None, None] * np.ones(
+            (1, len(lats), len(lons))
+        )
+        return xr.Dataset(
+            {
+                "tp": (["time", "lat", "lon"], hourly),
+                "avg_iews": (["time", "lat", "lon"], hourly * 2),
+                "avg_inss": (["time", "lat", "lon"], hourly * 3),
+            },
+            coords={"time": times, "lat": lats, "lon": lons},
+        )
+
+    @staticmethod
+    def _h2ds(n_days: int = 5) -> xr.Dataset:
+        """Daily compiled store: the stored fields reduced, plus the derived ones."""
+        times = pd.date_range("2020-01-01", periods=n_days, freq="D")
+        lats, lons = [30.0, 35.0, 40.0], [-10.0, -5.0, 0.0]
+        daily = np.arange(len(times), dtype=float)[:, None, None] * np.ones(
+            (1, len(lats), len(lons))
+        )
+        return xr.Dataset(
+            {
+                "tp": (["time", "lat", "lon"], daily + 100),
+                "avg_iews": (["time", "lat", "lon"], daily + 200),
+                "avg_inss": (["time", "lat", "lon"], daily + 300),
+                "ekman_anom": (["time", "lat", "lon"], daily + 400),
+                "n_upwell_events_3d": (["time", "lat", "lon"], daily + 500),
+            },
+            coords={"time": times, "lat": lats, "lon": lons},
+        )
+
+    def _patch_catalogs(self, monkeypatch, store_ds, h2ds) -> list[str]:
+        """Route ZarrCatalog(var_key) to the right stand-in, recording the calls."""
+        seen: list[str] = []
+
+        def _factory(var_key, **_kw):
+            seen.append(var_key)
+            catalog = MagicMock()
+            catalog.var_key = var_key
+            catalog.get_time_coverage.return_value = DateRange(
+                pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05")
+            )
+            catalog.get_bbox.return_value = BBox(-20.0, 30.0, 20.0, 50.0)
+            catalog.open_dataset.return_value = h2ds if var_key == "h2ds" else store_ds
+            return catalog
+
+        monkeypatch.setattr(extractor_module, "ZarrCatalog", _factory)
+        return seen
+
+    def _extractor_for(self, cfg, times, **kwargs) -> Extractor:
+        # Distinct lon/lat: a single repeated point yields a degenerate bbox.
+        df = pd.DataFrame({"time": times, "lon": [-9.0, -1.0], "lat": [31.0, 39.0]})
+        ext = _extractor(df, time_col="time", **kwargs)
+        ext.app_config = SimpleNamespace(
+            variables={"atm-accum-avg": cfg, "h2ds": _h2ds_config()}
+        )
+        return ext
+
+    def test_date_only_input_reads_h2ds_not_the_hourly_store(self, monkeypatch):
+        """
+        Regression: the hourly flip left a date-only extraction either raising
+        (compile-derived vars absent from the store) or silently returning the
+        00:00 hour. It must return the compiled daily value instead.
+        """
+        seen = self._patch_catalogs(monkeypatch, self._hourly_ds(), self._h2ds())
+        ext = self._extractor_for(_atm_config(), ["2020-01-01", "2020-01-02"])
+
+        out = ext.process_single_varkey("atm-accum-avg")
+
+        assert seen == ["h2ds"]
+        assert set(_atm_config().compiled_vars) <= set(out.columns)
+        # day 0 / day 1 of the h2ds fixture, not hour 0 / hour 24 of the store
+        assert out["tp"].tolist() == [100.0, 101.0]
+        assert out["ekman_anom"].tolist() == [400.0, 401.0]
+
+    def test_subdaily_input_serves_hours_and_broadcasts_daily_features(
+        self, monkeypatch
+    ):
+        """Stored fields vary by hour; daily-by-construction ones repeat per day."""
+        self._patch_catalogs(monkeypatch, self._hourly_ds(), self._h2ds())
+        ext = self._extractor_for(
+            _atm_config(), ["2020-01-01 03:00:00", "2020-01-01 15:00:00"]
+        )
+
+        out = ext.process_single_varkey("atm-accum-avg")
+
+        assert out["tp"].tolist() == [3.0, 15.0]  # the hours themselves
+        assert out["ekman_anom"].tolist() == [400.0, 400.0]  # same day, broadcast
+        assert set(_atm_config().compiled_vars) <= set(out.columns)
+
+    def test_daily_store_never_touches_h2ds(self, monkeypatch):
+        cfg = SimpleNamespace(
+            compiled_vars=["tp"],
+            time_step=TimeStep.DAILY,
+            extract_depth_slices=None,
+            rename_lonlat=False,
+        )
+        seen = self._patch_catalogs(monkeypatch, self._h2ds()[["tp"]], self._h2ds())
+        ext = self._extractor_for(cfg, ["2020-01-01", "2020-01-02"])
+
+        ext.process_single_varkey("atm-accum-avg")
+
+        assert seen == ["atm-accum-avg"]
+
+    def test_stale_h2ds_names_the_compile_step(self, monkeypatch):
+        """Compile behind convert must be reported as such, not as a bad request."""
+        thin = self._h2ds().drop_vars(["ekman_anom", "n_upwell_events_3d"])
+        self._patch_catalogs(monkeypatch, self._hourly_ds(), thin)
+        ext = self._extractor_for(_atm_config(), ["2020-01-01", "2020-01-02"])
+
+        with pytest.raises(ValueError) as err:
+            ext.process_single_varkey("atm-accum-avg")
+
+        assert "h2mare compile" in str(err.value)
+
+    def test_h2ds_catalog_is_opened_once_per_extractor(self, monkeypatch):
+        """run() walks several hourly var_keys; each must not rescan the index."""
+        seen = self._patch_catalogs(monkeypatch, self._hourly_ds(), self._h2ds())
+        ext = self._extractor_for(_atm_config(), ["2020-01-01", "2020-01-02"])
+
+        ext.process_single_varkey("atm-accum-avg")
+        ext.process_single_varkey("atm-accum-avg")
+
+        assert seen.count("h2ds") == 1
+
+    def test_compiled_store_is_found_by_source_not_by_name(self, monkeypatch):
+        """
+        Another deployment may name its compiled store something else. It is
+        identified by source: h2mare — the same marker _normalize_var_dict
+        already excludes from default runs — not by the literal name "h2ds".
+        """
+        seen: list[str] = []
+
+        def _factory(var_key, **_kw):
+            seen.append(var_key)
+            catalog = MagicMock()
+            catalog.var_key = var_key
+            catalog.get_time_coverage.return_value = DateRange(
+                pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05")
+            )
+            catalog.get_bbox.return_value = BBox(-20.0, 30.0, 20.0, 50.0)
+            catalog.open_dataset.return_value = self._h2ds()
+            return catalog
+
+        monkeypatch.setattr(extractor_module, "ZarrCatalog", _factory)
+        ext = self._extractor_for(_atm_config(), ["2020-01-01", "2020-01-02"])
+        ext.app_config = SimpleNamespace(
+            variables={"atm-accum-avg": _atm_config(), "my_compiled": _h2ds_config()}
+        )
+
+        out = ext.process_single_varkey("atm-accum-avg")
+
+        assert seen == ["my_compiled"]
+        assert out["ekman_anom"].tolist() == [400.0, 401.0]
+
+    def test_config_without_a_compiled_var_key_says_so(self, monkeypatch):
+        self._patch_catalogs(monkeypatch, self._hourly_ds(), self._h2ds())
+        ext = self._extractor_for(_atm_config(), ["2020-01-01", "2020-01-02"])
+        ext.app_config = SimpleNamespace(variables={"atm-accum-avg": _atm_config()})
+
+        with pytest.raises(ValueError, match="No compiled var_key"):
+            ext.process_single_varkey("atm-accum-avg")
+
+
+class TestPinnedReadFrom:
+    """read_from overrides the inference, in both directions."""
+
+    _R = TestProcessSingleVarkeyRouting
+
+    def _extractor(self, times, **kwargs) -> Extractor:
+        df = pd.DataFrame({"time": times, "lon": [-9.0, -1.0], "lat": [31.0, 39.0]})
+        ext = _extractor(df, time_col="time", **kwargs)
+        ext.app_config = SimpleNamespace(
+            variables={"atm-accum-avg": _atm_config(), "h2ds": _h2ds_config()}
+        )
+        return ext
+
+    def test_native_with_date_only_input_reads_the_hourly_store(self, monkeypatch):
+        """Pinning native overrides the date-only default of going compiled."""
+        seen = self._R()._patch_catalogs(
+            monkeypatch, self._R._hourly_ds(), self._R._h2ds()
+        )
+        ext = self._extractor(["2020-01-01", "2020-01-02"], read_from="native")
+
+        out = ext.process_single_varkey("atm-accum-avg", vars=["tp"])
+
+        assert seen == ["atm-accum-avg"]
+        assert out["tp"].tolist() == [0.0, 24.0]  # hour 00:00 of each day
+
+    def test_native_still_sources_compile_derived_vars_from_compiled(self, monkeypatch):
+        """
+        An hourly store never held the derived chain, so honouring native to the
+        letter would mean returning nothing. Route and warn instead — the same
+        var_key converted daily holds them natively and never reaches here.
+        """
+        seen = self._R()._patch_catalogs(
+            monkeypatch, self._R._hourly_ds(), self._R._h2ds()
+        )
+        warned: list[str] = []
+        monkeypatch.setattr(
+            extractor_module.logger, "warning", lambda m, *a, **k: warned.append(str(m))
+        )
+        ext = self._extractor(["2020-01-01", "2020-01-02"], read_from="native")
+
+        out = ext.process_single_varkey("atm-accum-avg")
+
+        assert seen == ["atm-accum-avg", "h2ds"]
+        assert out["ekman_anom"].tolist() == [400.0, 401.0]
+        assert any("compile time" in m for m in warned)
+
+    def test_compiled_on_a_daily_var_key(self, monkeypatch):
+        """Previously impossible: reading a daily var_key from the compiled store."""
+        cfg = SimpleNamespace(
+            compiled_vars=["tp"],
+            time_step=TimeStep.DAILY,
+            extract_depth_slices=None,
+            rename_lonlat=False,
+            source="cmems",
+        )
+        seen = self._R()._patch_catalogs(
+            monkeypatch, self._R._hourly_ds(), self._R._h2ds()
+        )
+        ext = self._extractor(["2020-01-01", "2020-01-02"], read_from="compiled")
+        ext.app_config = SimpleNamespace(
+            variables={"atm-accum-avg": cfg, "h2ds": _h2ds_config()}
+        )
+
+        out = ext.process_single_varkey("atm-accum-avg")
+
+        assert seen == ["h2ds"]
+        assert out["tp"].tolist() == [100.0, 101.0]  # compiled values, not native
+
+    def test_compiled_with_subdaily_input_warns_it_can_only_give_days(
+        self, monkeypatch
+    ):
+        self._R()._patch_catalogs(monkeypatch, self._R._hourly_ds(), self._R._h2ds())
+        warned: list[str] = []
+        monkeypatch.setattr(
+            extractor_module.logger, "warning", lambda m, *a, **k: warned.append(str(m))
+        )
+        ext = self._extractor(
+            ["2020-01-01 03:00:00", "2020-01-01 18:00:00"], read_from="compiled"
+        )
+
+        out = ext.process_single_varkey("atm-accum-avg")
+
+        assert any("daily" in m and "read_from='compiled'" in m for m in warned)
+        assert out["tp"].tolist() == [100.0, 100.0]  # same day, same value
+
+
+class TestTimeCadenceOverride:
+    @staticmethod
+    def _df(times: list[str]) -> pd.DataFrame:
+        return pd.DataFrame({"time": times, "lon": [10.0, 11.0], "lat": [40.0, 41.0]})
+
+    def test_auto_reads_a_uniform_stamp_as_nominal(self):
+        """A stamp identical on every row is someone's export default, not an hour."""
+        ext = _extractor(self._df(["2020-01-01 14:00:00", "2020-01-02 14:00:00"]))
+
+        assert ext.input_is_subdaily is False
+        assert ext.data["time"].dt.hour.eq(0).all()
+
+    def test_native_honours_a_uniform_stamp_as_a_real_hour(self):
+        ext = _extractor(
+            self._df(["2020-01-01 14:00:00", "2020-01-02 14:00:00"]),
+            time_cadence="hourly",
+        )
+
+        assert ext.input_is_subdaily is True
+        assert ext.data["time"].dt.hour.eq(14).all()
+
+    def test_daily_truncates_even_varying_stamps(self):
+        ext = _extractor(
+            self._df(["2020-01-01 06:00:00", "2020-01-01 18:00:00"]),
+            time_cadence="daily",
+        )
+
+        assert ext.input_is_subdaily is False
+        assert ext.data["time"].dt.hour.eq(0).all()
+
+    def test_auto_infers_subdaily_from_varying_stamps(self):
+        ext = _extractor(self._df(["2020-01-01 06:00:00", "2020-01-01 18:00:00"]))
+
+        assert ext.input_is_subdaily is True
+
+    def test_date_only_input_is_daily(self):
+        ext = _extractor(self._df(["2020-01-01", "2020-01-02"]))
+
+        assert ext.input_is_subdaily is False
+
+
+class TestResolveCoverageEndOfDay:
+    """
+    Store coverage names calendar days; input rows carry instants. Compared
+    bare, every sample after midnight on the final covered day was clipped —
+    23 hours' worth against an hourly store.
+    """
+
+    @staticmethod
+    def _extractor(times: list[str]) -> Extractor:
+        # Distinct lon/lat: a single repeated point yields a degenerate bbox.
+        return _extractor(
+            pd.DataFrame({"time": times, "lon": [-9.0, -1.0], "lat": [31.0, 39.0]})
+        )
+
+    @staticmethod
+    def _catalog() -> MagicMock:
         catalog = MagicMock()
         catalog.var_key = "atm-accum-avg"
-        catalog.get_time_coverage.return_value = DateRange("2020-01-01", "2020-01-05")
+        catalog.get_time_coverage.return_value = DateRange(
+            pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05")
+        )
         catalog.get_bbox.return_value = BBox(-20.0, 30.0, 20.0, 50.0)
-        catalog.open_dataset.return_value = ds
-        monkeypatch.setattr(extractor_module, "ZarrCatalog", lambda _vk: catalog)
         return catalog
 
-    def _extractor_for(self, cfg) -> Extractor:
-        # Distinct lon/lat: a single repeated point yields a degenerate bbox.
+    def test_last_day_after_midnight_survives(self):
+        ext = self._extractor(["2020-01-05 06:00:00", "2020-01-05 23:00:00"])
+
+        dates = ext._resolve_coverage(self._catalog())
+
+        assert len(dates) == 2
+        assert max(dates) == pd.Timestamp("2020-01-05 23:00:00")
+
+    def test_beyond_the_last_day_is_still_clipped(self):
+        ext = self._extractor(["2020-01-05 23:00:00", "2020-01-06 01:00:00"])
+
+        dates = ext._resolve_coverage(self._catalog())
+
+        assert dates == [pd.Timestamp("2020-01-05 23:00:00")]
+
+
+def _depth_config(
+    *, extract: list[int] | None = None, compile_: list[int] | None = None
+) -> SimpleNamespace:
+    """thetao/o2-shaped config: one stored var on a depth axis, sliced names published."""
+    return SimpleNamespace(
+        compiled_vars=[f"thetao_{d}" for d in (compile_ or [])],
+        compile_depth_slices=compile_,
+        extract_depth_slices=extract,
+        time_step=TimeStep.DAILY,
+        rename_lonlat=False,
+        source="cmems",
+    )
+
+
+def _depth_ds(levels: list[float] = [0.0, 100.0, 500.0, 1000.0]) -> xr.Dataset:
+    """One variable on a depth axis, valued so each level is identifiable."""
+    times = pd.date_range("2020-01-01", periods=5, freq="D")
+    lats, lons = [30.0, 35.0, 40.0], [-10.0, -5.0, 0.0]
+    data = np.zeros((len(times), len(levels), len(lats), len(lons)))
+    for i, lvl in enumerate(levels):
+        data[:, i, :, :] = lvl
+    return xr.Dataset(
+        {"thetao": (["time", "depth", "lat", "lon"], data)},
+        coords={"time": times, "depth": levels, "lat": lats, "lon": lons},
+    )
+
+
+class TestDepthVariables:
+    """
+    A 3-D variable's compiled_vars name post-slicing columns (thetao_100, …)
+    while its store holds one variable on a depth axis. Comparing the two — as
+    the publish/store reconciliation did — reported every level as a gap in the
+    store and refused to extract at all.
+    """
+
+    def _extractor(self, cfg, monkeypatch, ds) -> Extractor:
+        catalog = MagicMock()
+        catalog.var_key = "thetao"
+        catalog.get_time_coverage.return_value = DateRange(
+            pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05")
+        )
+        catalog.get_bbox.return_value = BBox(-20.0, 30.0, 20.0, 50.0)
+        catalog.open_dataset.return_value = ds
+        monkeypatch.setattr(extractor_module, "ZarrCatalog", lambda _vk, **_kw: catalog)
+
         df = pd.DataFrame(
             {
                 "time": ["2020-01-01", "2020-01-02"],
-                "lon": [9.0, 11.0],
-                "lat": [39.0, 41.0],
+                "lon": [-9.0, -1.0],
+                "lat": [31.0, 39.0],
             }
         )
         ext = _extractor(df, time_col="time")
-        ext.app_config = SimpleNamespace(variables={"atm-accum-avg": cfg})
+        ext.app_config = SimpleNamespace(
+            variables={"thetao": cfg, "h2ds": _h2ds_config()}
+        )
         return ext
 
-    def test_raises_before_returning_a_thinner_frame(self, monkeypatch):
-        ds = _make_spatiotemporal_ds().rename({"sst": "tp"})
-        self._patched_catalog(monkeypatch, ds)
-        ext = self._extractor_for(_atm_config())
+    def test_depth_levels_are_not_reported_as_a_gap_in_the_store(self, monkeypatch):
+        """Regression: raised 'this is a gap in the store — re-run convert'."""
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100, 500, 1000])
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
 
-        with pytest.raises(ValueError, match="ekman_anom"):
-            ext.process_single_varkey("atm-accum-avg")
+        out = ext.process_single_varkey("thetao")
+
+        assert set(out.columns) >= {"thetao_0", "thetao_100"}
+        assert out["thetao_0"].tolist() == [0.0, 0.0]
+        assert out["thetao_100"].tolist() == [100.0, 100.0]
+
+    def test_extract_slices_may_differ_from_compile_slices(self, monkeypatch):
+        """o2 extracts 3 levels and compiles 4; the two lists are independent."""
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100, 500, 1000])
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
+
+        out = ext.process_single_varkey("thetao")
+
+        sliced = {c for c in out.columns if c.startswith("thetao_")}
+        assert sliced == {"thetao_0", "thetao_100"}  # not the four compiled ones
+
+    def test_missing_extract_slices_falls_back_to_compile_slices(self, monkeypatch):
+        """
+        thetao declares only compile_depth_slices. Without a fallback the depth
+        axis survives into extraction and the geometry engine's dimensionless
+        .mean() averages it away into one value spanning the whole range.
+        """
+        cfg = _depth_config(extract=None, compile_=[0, 500])
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
+
+        out = ext.process_single_varkey("thetao")
+
+        assert {"thetao_0", "thetao_500"} <= set(out.columns)
+        assert out["thetao_500"].tolist() == [500.0, 500.0]
+
+    def test_no_declared_levels_at_all_is_refused(self, monkeypatch):
+        cfg = _depth_config(extract=None, compile_=None)
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
+
+        with pytest.raises(ValueError, match="declares no depth levels"):
+            ext.process_single_varkey("thetao")
+
+    def test_a_single_level_can_be_named(self, monkeypatch):
+        """vars= on a depth variable names the post-expansion columns."""
+        cfg = _depth_config(extract=[0, 100, 500], compile_=[0, 100, 500])
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
+
+        out = ext.process_single_varkey("thetao", vars=["thetao_100"])
+
+        sliced = {c for c in out.columns if c.startswith("thetao_")}
+        assert sliced == {"thetao_100"}
+        assert out["thetao_100"].tolist() == [100.0, 100.0]
+
+    def test_the_bare_var_key_means_every_level(self, monkeypatch):
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100])
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
+
+        out = ext.process_single_varkey("thetao", vars=["thetao"])
+
+        assert {"thetao_0", "thetao_100"} <= set(out.columns)
+
+    def test_an_unavailable_level_names_the_ones_that_exist(self, monkeypatch):
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100, 500, 1000])
+        ext = self._extractor(cfg, monkeypatch, _depth_ds())
+
+        with pytest.raises(ValueError) as err:
+            ext.process_single_varkey("thetao", vars=["thetao_1000"])
+
+        msg = str(err.value)
+        assert "thetao_1000" in msg
+        assert "thetao_100" in msg  # what it does yield
+        assert "extract_depth_slices" in msg
+
+
+class TestSplitVarsBySourceDepth:
+    def test_depth_disables_the_reconciliation(self):
+        """The two sides are not comparable, so nothing is reported missing."""
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100, 500, 1000])
+        assert split_vars_by_source(
+            None, ["thetao"], "thetao", cfg, has_depth=True
+        ) == (
+            [],
+            [],
+        )
+
+    def test_depth_passes_a_request_through_untouched(self):
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100])
+        assert split_vars_by_source(
+            ["thetao_100"], ["thetao"], "thetao", cfg, has_depth=True
+        ) == (["thetao_100"], [])
+
+    def test_without_depth_the_reconciliation_still_runs(self):
+        """The flag must not weaken the check for flat variables."""
+        cfg = _depth_config(extract=[0, 100], compile_=[0, 100])
+        with pytest.raises(ValueError, match="gap in"):
+            split_vars_by_source(None, ["thetao"], "thetao", cfg, has_depth=False)
+
+
+class TestGeometryPathSpatialDims:
+    """
+    rio.clip resolves spatial dims by name, falling back to lon/lat only when
+    they carry CF attributes. CMEMS and AVISO stores inherit those from source,
+    so every var_key but fsle/eddies passed the precondition by luck; CDS
+    stores and the compiled h2ds carry no coordinate attributes at all and
+    clipped to nothing but NaN — reported only as a per-geometry DEBUG line.
+    """
+
+    @staticmethod
+    def _bare_ds() -> xr.Dataset:
+        """A store-shaped dataset whose lon/lat carry no CF attributes."""
+        ds = _make_spatial_ds()
+        ds.lon.attrs.clear()
+        ds.lat.attrs.clear()
+        return ds
+
+    def _run(self, cfg) -> pd.DataFrame:
+        geoms = [box(-12, 28, -3, 36), box(-1, 38, 1, 42)]
+        gdf = _make_geodf(geoms, ["2020-01-01", "2020-01-01"])
+        ext = _extractor(gdf)
+        ext.app_config = SimpleNamespace(variables={"x": cfg, "h2ds": _h2ds_config()})
+        return ext._extract(ext.data, self._bare_ds(), n_workers=2).sort_index()
+
+    def test_attribute_less_lon_lat_still_clip(self):
+        """Regression: returned all-NaN because rioxarray could not find x/y."""
+        out = self._run(SimpleNamespace(rename_lonlat=False))
+
+        assert out["sst"].notna().all()
+        assert out.loc[0, "sst"] == pytest.approx(2.0)  # mean(0,1,3,4)
+        assert out.loc[1, "sst"] == pytest.approx(8.0)
+
+    def test_rename_lonlat_true_is_not_applied_twice(self):
+        """The config flag is now redundant, and must not double-rename."""
+        out = self._run(SimpleNamespace(rename_lonlat=True))
+
+        assert out["sst"].notna().all()
+
+    def test_a_dataset_already_on_x_y_is_untouched(self):
+        geoms = [box(-12, 28, -3, 36)]
+        gdf = _make_geodf(geoms, ["2020-01-01"])
+        ext = _extractor(gdf)
+        ds = self._bare_ds().rename({"lon": "x", "lat": "y"})
+
+        out = ext._extract(ext.data, ds, n_workers=1)
+
+        assert out["sst"].notna().all()
+
+
+class TestWarnIfWhollyFailed:
+    @staticmethod
+    def _capture(monkeypatch) -> list[str]:
+        seen: list[str] = []
+        monkeypatch.setattr(
+            extractor_module.logger, "warning", lambda m, *a, **k: seen.append(str(m))
+        )
+        return seen
+
+    def test_all_nan_with_errors_warns(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+        df = pd.DataFrame({"sst": [float("nan"), float("nan")]})
+
+        _warn_if_wholly_failed(df, [ValueError("x dimension not found")])
+
+        assert len(seen) == 1
+        assert "x dimension not found" in seen[0]
+
+    def test_a_partial_failure_is_ordinary(self, monkeypatch):
+        """Geometries outside the grid are data, not a broken precondition."""
+        seen = self._capture(monkeypatch)
+        df = pd.DataFrame({"sst": [1.0, float("nan")]})
+
+        _warn_if_wholly_failed(df, [ValueError("boom")])
+
+        assert seen == []
+
+    def test_all_nan_without_errors_is_silent(self, monkeypatch):
+        """Genuinely empty data raised nothing, so there is nothing to report."""
+        seen = self._capture(monkeypatch)
+        df = pd.DataFrame({"sst": [float("nan")]})
+
+        _warn_if_wholly_failed(df, [])
+
+        assert seen == []
+
+    def test_an_empty_frame_is_silent(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+
+        _warn_if_wholly_failed(pd.DataFrame(), [ValueError("boom")])
+
+        assert seen == []
+
+
+class TestEmptyVarsMeansEverything:
+    """
+    `run({"waves": []})` is the documented way to ask for everything a var_key
+    publishes. Read as an explicit selection of nothing it reached the compiled
+    reader with an empty request, which blamed the config — "declares no
+    compiled_vars" — for something the caller had said perfectly well.
+    """
+
+    _R = TestProcessSingleVarkeyRouting
+
+    def _extractor(self, times, **kwargs) -> Extractor:
+        df = pd.DataFrame({"time": times, "lon": [-9.0, -1.0], "lat": [31.0, 39.0]})
+        ext = _extractor(df, time_col="time", **kwargs)
+        ext.app_config = SimpleNamespace(
+            variables={"atm-accum-avg": _atm_config(), "h2ds": _h2ds_config()}
+        )
+        return ext
+
+    def test_empty_list_reads_everything_from_the_compiled_store(self, monkeypatch):
+        """Regression: raised 'declares no compiled_vars' for a populated config."""
+        self._R()._patch_catalogs(monkeypatch, self._R._hourly_ds(), self._R._h2ds())
+        ext = self._extractor(["2020-01-01", "2020-01-02"])
+
+        out = ext.process_single_varkey("atm-accum-avg", vars=[])
+
+        assert set(_atm_config().compiled_vars) <= set(out.columns)
+
+    def test_empty_list_matches_none(self, monkeypatch):
+        self._R()._patch_catalogs(monkeypatch, self._R._hourly_ds(), self._R._h2ds())
+        ext = self._extractor(["2020-01-01", "2020-01-02"])
+
+        by_empty = ext.process_single_varkey("atm-accum-avg", vars=[])
+        by_none = ext.process_single_varkey("atm-accum-avg", vars=None)
+
+        assert list(by_empty.columns) == list(by_none.columns)
+
+    def test_empty_list_on_the_native_path_too(self, monkeypatch):
+        self._R()._patch_catalogs(monkeypatch, self._R._hourly_ds(), self._R._h2ds())
+        ext = self._extractor(
+            ["2020-01-01 03:00:00", "2020-01-01 15:00:00"], read_from="native"
+        )
+
+        out = ext.process_single_varkey("atm-accum-avg", vars=[])
+
+        assert set(_atm_config().compiled_vars) <= set(out.columns)
+
+    def test_a_real_selection_is_still_honoured(self, monkeypatch):
+        """The collapse must not swallow an actual one-variable request."""
+        self._R()._patch_catalogs(monkeypatch, self._R._hourly_ds(), self._R._h2ds())
+        ext = self._extractor(["2020-01-01", "2020-01-02"])
+
+        out = ext.process_single_varkey("atm-accum-avg", vars=["ekman_anom"])
+
+        assert "ekman_anom" in out.columns
+        assert "tp" not in out.columns
+
+    def test_a_var_key_publishing_nothing_still_says_so(self):
+        """The original message stays reachable for the case it describes."""
+        cfg = SimpleNamespace(compiled_vars=[], time_step=TimeStep.HOURLY)
+        with pytest.raises(ValueError, match="compiled_vars"):
+            resolve_compiled_vars(_STORED, None, "waves", cfg)
+
+
+class TestNullSummaryLines:
+    """The end-of-run tally: a count always, a share only where it means something."""
+
+    @staticmethod
+    def _df(**cols) -> pd.DataFrame:
+        return pd.DataFrame(cols)
+
+    def test_a_clean_variable_shows_no_share(self):
+        df = self._df(sst=[1.0, 2.0, 3.0])
+
+        assert null_summary_lines(df, ["sst"]) == ["  sst: 0"]
+
+    def test_a_partial_null_shows_its_share(self):
+        df = self._df(sst=[1.0, float("nan"), 3.0])
+
+        assert null_summary_lines(df, ["sst"]) == ["  sst: 1 (33.3%)"]
+
+    def test_an_all_null_variable_reads_100_percent(self):
+        df = self._df(sst=[float("nan")] * 4)
+
+        assert null_summary_lines(df, ["sst"]) == ["  sst: 4 (100.0%)"]
+
+    def test_one_decimal_place(self):
+        df = self._df(sst=[float("nan")] + [1.0] * 6)
+
+        assert null_summary_lines(df, ["sst"]) == ["  sst: 1 (14.3%)"]
+
+    def test_columns_are_reported_in_order(self):
+        df = self._df(
+            a=[1.0, 2.0], b=[float("nan"), float("nan")], c=[1.0, float("nan")]
+        )
+
+        assert null_summary_lines(df, ["a", "b", "c"]) == [
+            "  a: 0",
+            "  b: 2 (100.0%)",
+            "  c: 1 (50.0%)",
+        ]
+
+    def test_an_empty_frame_does_not_divide_by_zero(self):
+        df = pd.DataFrame({"sst": pd.Series(dtype=float)})
+
+        assert null_summary_lines(df, ["sst"]) == ["  sst: 0"]
+
+    def test_only_the_requested_columns_are_tallied(self):
+        df = self._df(sst=[float("nan")], lon=[float("nan")])
+
+        assert null_summary_lines(df, ["sst"]) == ["  sst: 1 (100.0%)"]
