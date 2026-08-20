@@ -4,6 +4,7 @@ Extract data based on csv or shapefile format files from datasets in zarr format
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -60,20 +61,84 @@ def _keys_path(tmp_path: Path) -> Path:
     return tmp_path.with_suffix(".keys.json")
 
 
-def _save_completed_keys(tmp_path: Path, keys: set[str]) -> None:
+def input_fingerprint(data: pd.DataFrame, index_col: str) -> str:
+    """
+    Stable digest of the frame an extraction consumes.
+
+    The checkpoint lives at one fixed path, so the next run finds whatever the
+    last one left there. Without a fingerprint it is resumed on faith: a
+    different input of the same shape has its rows replayed from the previous
+    run, silently and with the right index. ``ensure_row_id`` makes that easy
+    to hit — its key is positional ``0..n-1``, so any two frames of the same
+    length collide perfectly.
+
+    Covers the key column's name and values plus every prepared column, since
+    those are exactly what extraction reads. Geometries go in as WKB, which
+    pandas can hash and shapely objects cannot.
+    """
+    parts: list[bytes] = [index_col.encode(), str(len(data)).encode()]
+
+    def digest(values) -> bytes:
+        return pd.util.hash_pandas_object(
+            pd.Series(list(values)), index=False
+        ).values.tobytes()
+
+    parts.append(digest(data.index))
+    for col in sorted(map(str, data.columns)):
+        parts.append(col.encode())
+        series = data[col]
+        if col == "geometry" and hasattr(series, "to_wkb"):
+            parts.append(digest(series.to_wkb()))
+        else:
+            parts.append(digest(series.astype(str)))
+
+    return hashlib.sha256(b"".join(parts)).hexdigest()
+
+
+def _save_completed_keys(tmp_path: Path, keys: set[str], fingerprint: str) -> None:
     dest = _keys_path(tmp_path)
     staging = dest.with_suffix(".tmp")
     with open(staging, "w") as f:
-        json.dump(list(keys), f)
+        json.dump({"fingerprint": fingerprint, "completed": sorted(keys)}, f)
     staging.replace(dest)
 
 
-def _load_completed_keys(tmp_path: Path) -> set[str]:
+def _load_completed_keys(tmp_path: Path, fingerprint: str) -> set[str] | None:
+    """
+    The var_keys already done for *fingerprint*, or None if the checkpoint is
+    not this input's.
+
+    None means "discard and start over": a sidecar that is missing, unreadable,
+    written by an older version without a fingerprint, or written for a
+    different input. Resuming across any of those replays another run's values.
+    """
     path = _keys_path(tmp_path)
     if not path.exists():
-        return set()
-    with open(path) as f:
-        return set(json.load(f))
+        return None
+
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(f"Checkpoint sidecar unreadable ({e}); starting over.")
+        return None
+
+    if not isinstance(payload, dict) or "fingerprint" not in payload:
+        logger.warning(
+            "Checkpoint predates input fingerprinting, so it cannot be matched "
+            "to this input; starting over."
+        )
+        return None
+
+    if payload["fingerprint"] != fingerprint:
+        logger.warning(
+            "Checkpoint was written for a different input — same path, "
+            "different data. Discarding it and starting over rather than "
+            "replaying that run's rows onto yours."
+        )
+        return None
+
+    return set(payload.get("completed", []))
 
 
 def null_summary_lines(result: pd.DataFrame, columns: list[str]) -> list[str]:
@@ -1226,8 +1291,17 @@ class Extractor:
         tmp_path = get_settings().INTERIM_DIR / "extraction_checkpoint.feather"
         tmp_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if tmp_path.exists():
-            logger.warning(f"Found checkpoint file: {tmp_path}, resuming.")
+        fingerprint = input_fingerprint(self.data, self.index_col)
+        completed_keys = (
+            _load_completed_keys(tmp_path, fingerprint) if tmp_path.exists() else None
+        )
+
+        if completed_keys is not None:
+            logger.warning(
+                f"Found checkpoint for this input: {tmp_path}, resuming. "
+                f"Already done, and replayed rather than re-extracted: "
+                f"{sorted(completed_keys) or 'nothing yet'}."
+            )
             df_processed = pd.read_feather(tmp_path).set_index(self.index_col)
             if df_processed.index.duplicated().any():
                 logger.warning(
@@ -1246,7 +1320,6 @@ class Extractor:
                     geometry=self.data.geometry.reindex(df_processed.index),
                     crs=self.data.crs,
                 )
-            completed_keys = _load_completed_keys(tmp_path)
         else:
             df_processed = self.data.copy()
             completed_keys = set()
@@ -1282,7 +1355,7 @@ class Extractor:
                     staging = tmp_path.with_suffix(".tmp")
                     df_processed.reset_index().to_feather(staging)
                     staging.replace(tmp_path)
-                    _save_completed_keys(tmp_path, completed_keys)
+                    _save_completed_keys(tmp_path, completed_keys, fingerprint)
                     logger.debug(f"Checkpoint saved to {tmp_path}")
 
                     logger.success(

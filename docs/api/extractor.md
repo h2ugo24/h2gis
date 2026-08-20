@@ -156,7 +156,20 @@ results = extractor.run(var_dict, output_path="out.csv", n_workers=12)
 ```
 
 Extraction is checkpointed per `var_key` (`INTERIM_DIR/extraction_checkpoint.feather`), so
-an interrupted run resumes where it stopped.
+an interrupted run resumes where it stopped. The checkpoint is deleted once a run finishes
+cleanly, so it only ever survives a failure.
+
+It lives at one fixed path, which means the next run finds whatever the last one left there.
+A fingerprint of the input — the key column's name and values, plus every prepared column —
+is stored alongside it, and a checkpoint written for anything else is **discarded rather
+than resumed**, with a warning. Without that, a different input of the same shape had the
+previous run's rows replayed onto it silently: `ensure_row_id` keys positionally (`0..n-1`),
+so any two frames of the same length line up perfectly.
+
+A resume logs which `var_keys` it is replaying rather than re-extracting. That matters when
+you have changed something *other* than the input — config, or the pipeline itself — since
+a fingerprint match cannot tell "carry on where you stopped" from "re-run this with the
+fix". Delete `INTERIM_DIR/extraction_checkpoint.*` when you want a genuinely clean run.
 
 ---
 
