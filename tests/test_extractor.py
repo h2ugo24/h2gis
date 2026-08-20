@@ -1272,6 +1272,31 @@ class TestGeometryPathSpatialDims:
 
         assert out["sst"].notna().all()
 
+    def test_dangling_grid_mapping_attribute_still_clips(self):
+        """Regression: an all-NaN column for CMEMS/AVISO vars read from h2ds.
+
+        Those variables inherit ``grid_mapping: "crs"`` from source, but the
+        compiled store carries no ``crs`` coordinate to match it. ensure_crs
+        must run *after* the x/y rename, or write_crs cannot walk the variables
+        to find that attribute, parks the CRS on ``spatial_ref`` instead, and
+        leaves every variable pointing at a coordinate that does not exist —
+        a dataset with a CRS whose variables have none, and rio.clip raises
+        MissingCRS per geometry.
+        """
+        ds = self._bare_ds()
+        ds["sst"].attrs["grid_mapping"] = "crs"
+        assert "crs" not in ds.coords  # precondition: the pointer is dangling
+
+        geoms = [box(-12, 28, -3, 36), box(-1, 38, 1, 42)]
+        gdf = _make_geodf(geoms, ["2020-01-01", "2020-01-01"])
+        ext = _extractor(gdf)
+
+        out = ext._extract(ext.data, ds, n_workers=2).sort_index()
+
+        assert out["sst"].notna().all()
+        assert out.loc[0, "sst"] == pytest.approx(2.0)  # mean(0,1,3,4)
+        assert out.loc[1, "sst"] == pytest.approx(8.0)
+
 
 class TestWarnIfWhollyFailed:
     @staticmethod
