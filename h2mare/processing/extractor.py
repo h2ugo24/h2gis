@@ -960,8 +960,6 @@ class Extractor:
             if not isinstance(data_resolved, gpd.GeoDataFrame):
                 raise TypeError("Data must be a GeoDataFrame for shapefile extraction")
 
-            ds = self.ensure_crs(data_resolved, ds)
-
             # Unconditional, as extract_from_dataset already does and as
             # extract_from_shp documents it needs: rio.clip resolves dims by
             # name, and only falls back to lon/lat when they carry CF
@@ -974,6 +972,22 @@ class Extractor:
             }
             if rename:
                 ds = ds.rename(rename)
+
+            # Strictly before ensure_crs, as _extract_bathy and
+            # extract_from_dataset already are. write_crs names the grid-mapping
+            # coordinate after the one the variables' `grid_mapping` attribute
+            # already points at — but it can only find that attribute by walking
+            # variables that have resolvable spatial dims. On a store whose
+            # lon/lat carry no CF attributes (the compiled h2ds), that walk finds
+            # nothing before the rename, so the CRS lands on the default
+            # `spatial_ref` while CMEMS/AVISO variables keep pointing at the
+            # `crs` coordinate they inherited from source and that h2ds never
+            # carried. The dataset then reports a CRS while every variable in it
+            # reports none, and rio.clip raises MissingCRS per geometry — an
+            # all-NaN column for adt/sla/ugos/vgos/fsle_max under
+            # read_from="compiled", while variables without the attribute
+            # extracted fine.
+            ds = self.ensure_crs(data_resolved, ds)
 
             return self.extract_from_shp(
                 data_resolved, ds, self.index_col, n_workers=n_workers
