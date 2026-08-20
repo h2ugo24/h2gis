@@ -888,7 +888,7 @@ class Extractor:
         data_resolved = self._subset_to_coverage(dates_resolved)
         bounds = self._define_bbox(data_resolved)
 
-        logger.info(f"Extracting {var_key} data")
+        logger.info(f"Extracting {var_key} data from {vr_catalog.store_root}")
         logger.info(
             f"{data_resolved.shape[0]} samples | "
             f"{min(dates_resolved).date()} -> {max(dates_resolved).date()} | "
@@ -1076,7 +1076,8 @@ class Extractor:
         bounds = self._define_bbox(data_resolved)
 
         logger.info(
-            f"Extracting {var_key} data from the compiled {self._compiled_var_key}"
+            f"Extracting {var_key} data from the compiled "
+            f"{self._compiled_var_key} at {catalog.store_root}"
         )
         logger.info(
             f"{data_resolved.shape[0]} samples | "
@@ -1614,9 +1615,15 @@ class Extractor:
             raise ValueError(f"Unsupported input_type: {self.input_type!r}")
 
         bounds = self._define_bbox(data)
-        logger.info(
-            f"Extracting {vkey.upper()} data | {self.data.shape[0]} rows | {bounds}"
-        )
+
+        # Same two lines the store-backed paths log, so a run reads the same
+        # whichever var_key produced it. The path carries the file name rather
+        # than stopping at the root: bathy is a single file picked by input type
+        # — the hi-res tiled zarr for geometries, the 0.25 deg netCDF for points
+        # — so the root alone would not say which of the two was read. There is
+        # no date range to report in its place; the layer is static.
+        logger.info(f"Extracting {vkey} data from {data_path}")
+        logger.info(f"{data.shape[0]} samples | static, no time axis | {bounds}")
 
         # The hi-res layer (shp path) is a spatially-tiled Zarr store; the 0.25°
         # layer (csv path) stays netCDF. Open by suffix so the bbox .sel() below
