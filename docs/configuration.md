@@ -126,6 +126,36 @@ The `bbox` here sets the spatial extent of the compiled dataset.
 
 ---
 
+## Variable metadata
+
+`variable_attrs` entries become the attributes written onto each variable in the
+Zarr stores, and they follow [CF conventions](https://cfconventions.org) so the
+output is readable by CF-aware tooling (xarray, rioxarray, THREDDS, `cfchecks`).
+
+| Key | Required | Meaning |
+|---|---|---|
+| `long_name` | yes | Free-text label. Used by the plotting helpers. |
+| `units` | yes, unless the variable is a label | Must parse under **udunits2**. `m.s-1`, `W.m-2` and `mmol.m-3` are valid; a space means multiplication, so `degrees Celsius` parses as *angle × temperature* and is wrong — write `degree_C`. |
+| `standard_name` | when one fits | Must be a current entry in the [CF standard name table](https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html), not a deprecated alias, and its canonical units must be convertible to `units`. Omit it rather than approximate: CF has no name for the front-distance, eddy, FSLE or Ekman-anomaly fields, and a wrong one is worse than none. |
+| `cell_methods` | for temporal reductions | How the value was reduced over the cell, e.g. `'time: mean'`, `'time: sum'`, `'time: maximum'`. Quote it — the colon would otherwise start a YAML mapping. |
+| `comment` | recommended | Prose description. Named `comment` because that is the attribute CF and ACDD recognise. |
+| `short_name` | no | Compact label for plot legends. Not a CF attribute. |
+| `product_id*` / `dataset_id*` | no | Provenance, carried through to the store. |
+
+Two entries — `thetao` and `o2` — describe the depth-resolved parent field held
+in the native store, which never reaches `h2ds`; the `thetao_*` / `o2_*` entries
+describe the depth slices cut from it at compile time.
+
+`bathy` keeps the ETOPO sign convention — `positive: up`, so sea-floor values are
+negative — and takes `standard_name: altitude` ("geometric height above the
+geoid") to match it. CF's `sea_floor_depth_below_geoid` would be the obvious
+choice but is defined positive-*down*, and `bedrock_altitude` claims the surface
+is bedrock, which the ETOPO *surface* grid does not guarantee over ice. The
+source's own `standard_name: height` is looser still: CF defines height as the
+distance above *the surface*, not above the geoid.
+
+---
+
 ## .env
 
 | Variable | Required | Description |
@@ -145,7 +175,7 @@ CDS / ERA5 credentials are handled by the `cdsapi` package and stored in `~/.cds
 ## Adding a new variable
 
 1. Add an entry under `variables:` in `config.yaml` with the correct `source`, `dataset_id_rep`, and `local_folder`.
-2. Add `variable_attrs` entries for each output variable name (used to set metadata in compiled Zarr files).
+2. Add `variable_attrs` entries for each output variable name (used to set metadata in the Zarr stores). See [Variable metadata](#variable-metadata) for what each key must contain — `units` has to parse under udunits2 and any `standard_name` has to exist in the CF table.
 3. If the variable is a CDS/ERA5 accumulated or averaged product (GRIB files with a `time × step` structure), set `merge_time_step: true` in its config entry.
 4. If each downloaded file covers a date range encoded in its filename as two groups (e.g. `2021-01-01-2021-01-31.nc`), set `filename_date_range: true` and make the second group optional so a one-day download still parses. Leave it unset for variables whose filenames encode a single date (e.g. AVISO FSLE).
 5. If the variable is a trajectory dataset that requires spatial binning (observations indexed by `obs`, not a lat/lon/time grid), set `trajectory_format: true`.
