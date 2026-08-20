@@ -1,6 +1,7 @@
 """Tests for Extractor — focused on logic that doesn't need external data."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -16,9 +17,11 @@ from h2mare.processing import extractor as extractor_module
 from h2mare.processing.extractor import (
     Extractor,
     _keys_path,
+    _load_completed_keys,
     _save_completed_keys,
     _warn_if_wholly_failed,
     ensure_row_id,
+    input_fingerprint,
     null_summary_lines,
     resolve_compiled_vars,
     resolve_read_from,
@@ -296,16 +299,17 @@ class TestAtomicCheckpoint:
     def test_save_completed_keys_writes_correct_content(self, tmp_path):
         checkpoint = tmp_path / "data.feather"
         keys = {"sst", "chl", "mld"}
-        _save_completed_keys(checkpoint, keys)
+        _save_completed_keys(checkpoint, keys, "abc123")
         dest = _keys_path(checkpoint)
         with open(dest) as f:
-            loaded = set(json.load(f))
-        assert loaded == keys
+            payload = json.load(f)
+        assert set(payload["completed"]) == keys
+        assert payload["fingerprint"] == "abc123"
 
     def test_save_completed_keys_no_staging_file_remains(self, tmp_path):
         """The .tmp staging file must be cleaned up after a successful write."""
         checkpoint = tmp_path / "data.feather"
-        _save_completed_keys(checkpoint, {"sst"})
+        _save_completed_keys(checkpoint, {"sst"}, "abc123")
         dest = _keys_path(checkpoint)
         staging = dest.with_suffix(".tmp")
         assert dest.exists()
@@ -1423,3 +1427,110 @@ class TestNullSummaryLines:
         df = self._df(sst=[float("nan")], lon=[float("nan")])
 
         assert null_summary_lines(df, ["sst"]) == ["  sst: 1 (100.0%)"]
+
+
+class TestInputFingerprint:
+    """
+    The checkpoint lives at one fixed path, so the next run finds whatever the
+    last one left there. Resumed on faith, a different input of the same shape
+    has its rows replayed from the previous run — silently, and with the right
+    index, because ensure_row_id keys positionally.
+    """
+
+    @staticmethod
+    def _df(times, lons=(10.0, 11.0), lats=(40.0, 41.0)) -> pd.DataFrame:
+        return pd.DataFrame({"time": times, "lon": list(lons), "lat": list(lats)})
+
+    def _fp(self, df, index_col="row_id") -> str:
+        return input_fingerprint(ensure_row_id(df).set_index(index_col), index_col)
+
+    def test_the_same_frame_hashes_the_same(self):
+        a = self._df(["2020-01-01", "2020-01-02"])
+        b = self._df(["2020-01-01", "2020-01-02"])
+
+        assert self._fp(a) == self._fp(b)
+
+    def test_different_times_hash_differently(self):
+        a = self._df(["2020-01-01", "2020-01-02"])
+        b = self._df(["2021-06-01", "2021-06-02"])
+
+        assert self._fp(a) != self._fp(b)
+
+    def test_different_places_hash_differently(self):
+        """The trap: same length, same positional keys, different locations."""
+        a = self._df(["2020-01-01", "2020-01-02"])
+        b = self._df(["2020-01-01", "2020-01-02"], lons=(-30.0, -31.0))
+
+        assert self._fp(a) != self._fp(b)
+
+    def test_row_count_changes_the_hash(self):
+        a = self._df(["2020-01-01", "2020-01-02"])
+        b = self._df(
+            ["2020-01-01", "2020-01-02", "2020-01-03"], (1.0, 2.0, 3.0), (4.0, 5.0, 6.0)
+        )
+
+        assert self._fp(a) != self._fp(b)
+
+    def test_the_key_column_name_is_part_of_it(self):
+        """A checkpoint keyed on another column cannot be set_index()'d here."""
+        df = self._df(["2020-01-01", "2020-01-02"])
+        keyed = ensure_row_id(df).set_index("row_id")
+
+        assert input_fingerprint(keyed, "row_id") != input_fingerprint(
+            keyed, "event_id"
+        )
+
+    def test_geometries_are_hashed_not_rejected(self):
+        gdf = _make_geodf([box(0, 0, 1, 1), box(2, 2, 3, 3)], ["2020-01-01"] * 2)
+        other = _make_geodf([box(0, 0, 1, 1), box(9, 9, 10, 10)], ["2020-01-01"] * 2)
+
+        a = input_fingerprint(ensure_row_id(gdf).set_index("row_id"), "row_id")
+        b = input_fingerprint(ensure_row_id(other).set_index("row_id"), "row_id")
+
+        assert a != b
+
+
+class TestCheckpointValidation:
+    """_load_completed_keys returns None for anything that is not this input's."""
+
+    @staticmethod
+    def _write(tmp_path, payload) -> Path:
+        checkpoint = tmp_path / "data.feather"
+        with open(_keys_path(checkpoint), "w") as f:
+            json.dump(payload, f)
+        return checkpoint
+
+    def test_a_matching_fingerprint_resumes(self, tmp_path):
+        checkpoint = self._write(
+            tmp_path, {"fingerprint": "abc", "completed": ["sst", "chl"]}
+        )
+
+        assert _load_completed_keys(checkpoint, "abc") == {"sst", "chl"}
+
+    def test_a_different_input_is_discarded(self, tmp_path):
+        """Regression: these rows used to be replayed onto the new input."""
+        checkpoint = self._write(tmp_path, {"fingerprint": "abc", "completed": ["sst"]})
+
+        assert _load_completed_keys(checkpoint, "xyz") is None
+
+    def test_a_legacy_bare_list_is_discarded(self, tmp_path):
+        """Pre-fingerprint sidecars cannot be matched, so they are not trusted."""
+        checkpoint = self._write(tmp_path, ["sst", "chl"])
+
+        assert _load_completed_keys(checkpoint, "abc") is None
+
+    def test_an_unreadable_sidecar_is_discarded(self, tmp_path):
+        checkpoint = tmp_path / "data.feather"
+        _keys_path(checkpoint).write_text("{not json")
+
+        assert _load_completed_keys(checkpoint, "abc") is None
+
+    def test_an_absent_sidecar_is_discarded(self, tmp_path):
+        assert _load_completed_keys(tmp_path / "data.feather", "abc") is None
+
+    def test_a_round_trip_matches(self, tmp_path):
+        checkpoint = tmp_path / "data.feather"
+        _save_completed_keys(checkpoint, {"sst", "waves"}, "fp1")
+
+        assert _load_completed_keys(checkpoint, "fp1") == {"sst", "waves"}
+        assert _load_completed_keys(checkpoint, "fp2") is None
