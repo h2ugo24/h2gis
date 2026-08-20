@@ -492,7 +492,7 @@ def compute_curl_and_ekman(
         {
             "long_name": "Daily Ekman vertical velocity",
             "units": "m/s",
-            "description": "Daily Ekman pumping mean velocity derived from hourly data "
+            "comment": "Daily Ekman pumping mean velocity derived from hourly data "
             "of surface wind stress curl/turbulence components. Pumping is defined as vertical velocity at the base of the Ekman layer. "
             "positive = upwelling (suction), negative = downwelling (pumping).",
         }
@@ -617,14 +617,14 @@ def add_engineered_ekman(
         {
             "long_name": "Ekman 7day-mean vertical velocity",
             "units": "m/s",
-            "description": "Ekman pumping mean velocity within a rolling 7-day window.",
+            "comment": "Ekman pumping mean velocity within a rolling 7-day window.",
         }
     )
     ds_ekman["ekman_anom"].attrs.update(
         {
             "long_name": "Ekman anomaly",
             "units": "m/s",
-            "description": "Ekman anomaly calculated by the difference between 7day rolling mean Ekman pumping and 1998-2017 climatology, per day-of-year (DOY) and grid cell.",
+            "comment": "Ekman anomaly calculated by the difference between 7day rolling mean Ekman pumping and 1998-2017 climatology, per day-of-year (DOY) and grid cell.",
         }
     )
 
@@ -635,7 +635,7 @@ def add_engineered_ekman(
             {
                 "long_name": f"Ekman anomaly with a {lag} day lag",
                 "units": "m/s",
-                "description": f"{lag}-days lagged Ekman anomaly calculated as the difference between 7day mean Ekman pumping and 1998-2017 climatology, per day-of-year (DOY) and grid cell.",
+                "comment": f"{lag}-days lagged Ekman anomaly calculated as the difference between 7day mean Ekman pumping and 1998-2017 climatology, per day-of-year (DOY) and grid cell.",
             }
         )
 
@@ -660,7 +660,7 @@ def add_engineered_ekman(
             {
                 "long_name": f"Number of Ekman pumping upwelling events within {w}-days",
                 "units": "count",
-                "description": f"Daily count of events where Ekman pumping anomaly exceeded the 90th percentile "
+                "comment": f"Daily count of events where Ekman pumping anomaly exceeded the 90th percentile "
                 f"threshold from the 1998 to 2017 monthly climatology computed for each grid cell and accumulated within a rolling {w}-day window. "
                 f"Values range from 0 (no events) to {w} (all days in the window exceed threshold), and are NaN until {w} days of history exist. "
                 f"Note: values dont represent days but frequency of events.",
