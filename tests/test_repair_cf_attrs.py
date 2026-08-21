@@ -152,6 +152,46 @@ class TestSupersededDescription:
         )
 
 
+class TestUnitsConfigDeliberatelyOmits:
+    """
+    config naming no units for a variable it otherwise describes is a statement,
+    not a gap. The stores held 'ordinal' and 'unitless' on the eddy track ids
+    long after config dropped the key, because the repair writes only what
+    config names.
+    """
+
+    def test_a_units_config_no_longer_names_is_removed(self, monkeypatch):
+        monkeypatch.setattr(
+            repair_cf_attrs,
+            "resolve_cf_attrs",
+            lambda name, key: {"long_name": "Trajectory id"},
+        )
+        _, deletes = repair_cf_attrs.plan_variable(
+            {"units": "ordinal", "long_name": "Trajectory id"},
+            "ac_track",
+            native_var_key="eddies",
+        )
+        assert "units" in deletes
+
+    def test_a_variable_config_says_nothing_about_keeps_its_units(self, monkeypatch):
+        """Otherwise the repair would strip a source variable it has no opinion on."""
+        monkeypatch.setattr(repair_cf_attrs, "resolve_cf_attrs", lambda name, key: {})
+        _, deletes = repair_cf_attrs.plan_variable(
+            {"units": "K"}, "something_unconfigured", native_var_key="sst"
+        )
+        assert "units" not in deletes
+
+    def test_units_config_does_name_are_left_to_the_set_path(self, monkeypatch):
+        monkeypatch.setattr(
+            repair_cf_attrs, "resolve_cf_attrs", lambda name, key: {"units": "degree_C"}
+        )
+        sets, deletes = repair_cf_attrs.plan_variable(
+            {"units": "degrees Celsius"}, "sst", native_var_key=None
+        )
+        assert "units" not in deletes
+        assert sets["units"] == "degree_C"
+
+
 class TestRepair:
     @pytest.fixture(autouse=True)
     def _point_at_the_temp_store(self, tmp_path, monkeypatch):

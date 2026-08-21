@@ -150,6 +150,16 @@ def plan_variable(
         current, desired, any_wording=drop_legacy_description
     ):
         deletes.append("description")
+
+    # Config describing a variable but naming no units is a positive statement,
+    # not an omission: the eddy track ids are ordinal labels and CF lets a label
+    # variable carry none. Writing only what config names leaves the old value
+    # in place, so the stores still held 'ordinal' and 'unitless' — neither of
+    # which udunits parses, and the only unparseable units left anywhere.
+    # Guarded on `desired` so a variable config says nothing about keeps its own.
+    if desired and "units" not in desired and "units" in current:
+        deletes.append("units")
+
     return sets, sorted(set(deletes))
 
 
