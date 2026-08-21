@@ -10,6 +10,7 @@ Covers:
 - sync_data(): skips when STORE_ROOT is None; copies when remote_root is given
 """
 
+import re
 from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -710,10 +711,55 @@ class TestRunIncremental:
         # One line per window, each naming its regime — not two saying the same.
         assert sum(m.startswith("Appending new dates:") for m in messages) == 1
         assert sum(m.startswith("Backfilling ['sst']") for m in messages) == 1
-        assert not any(
-            m.startswith("Zarr → Parquet conversion for") and "complete" not in m
-            for m in messages
+        # The step header is logged once for the whole run, never once per
+        # window — announcing each window twice is the regression above. It has
+        # to be logged at all, or the first line of a conversion is a bare
+        # "Converting requested range: ..." naming neither the step nor where it
+        # writes. Checked for *not* being the completion line, which used to be
+        # the only place the phrase appeared and would otherwise satisfy a
+        # count on its own.
+        headers = [m for m in messages if m.startswith("Zarr → Parquet conversion for")]
+        assert len(headers) == 1
+        assert "complete" not in headers[0]
+
+    def test_the_run_is_bracketed_by_a_header_and_an_elapsed_time(self, tmp_path):
+        """
+        The step has to be identifiable from the log without reading the module
+        column, and it has to say how long it took — as the netcdf2zarr and
+        compile steps both already do. Neither the destination nor the duration
+        appears anywhere else in this path.
+        """
+        z = _make_converter(
+            tmp_path,
+            parquet_initialized=True,
+            parquet_end=pd.Timestamp("1998-06-30"),
         )
+
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="INFO", format="{message}")
+        try:
+            with (
+                patch.object(z, "_convert_window", return_value=True),
+                patch.object(z, "_resolve_backfill_groups", return_value=[]),
+            ):
+                assert z.run() is True
+        finally:
+            logger.remove(sink)
+
+        header = [m for m in messages if m.startswith("Zarr → Parquet conversion for")]
+        assert len(header) == 1
+        assert "'H2DS'" in header[0]
+        assert str(z.parquet_root) in header[0], (
+            "the destination is stated nowhere else"
+        )
+
+        closing = [m for m in messages if m.startswith("Conversion complete for")]
+        assert len(closing) == 1
+        assert re.search(r"in \d+\.\d+s\.$", closing[0]), (
+            f"no elapsed time in the closing line: {closing[0]!r}"
+        )
+        # The header phrase is not repeated by the closing line.
+        assert not closing[0].startswith("Zarr → Parquet")
 
     def test_backfill_runs_even_when_nothing_to_append(self, tmp_path):
         """An 'up to date' append still lets backfill proceed.

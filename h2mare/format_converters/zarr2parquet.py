@@ -7,6 +7,7 @@ from __future__ import annotations
 import gc
 import re
 import shutil
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
@@ -244,6 +245,17 @@ class Zarr2Parquet(BaseConverter):
         # Each window logs exactly one line, and _convert_window's *label* names
         # the regime that produced it — the windows of the incremental mode are
         # otherwise indistinguishable from one another in the log.
+        #
+        # This header names the step once, before any of them. Without it the
+        # first thing a run prints after the compile is a bare "Converting
+        # requested range: ...", which says nothing about which conversion is
+        # running or where it writes. Deliberately not repeated on the closing
+        # line, which reports the outcome instead.
+        t0 = time.perf_counter()
+        logger.info(
+            f"Zarr → Parquet conversion for '{self.var_key.upper()}' "
+            f"→ {self.parquet_root}"
+        )
 
         # Mode 1 — add-var: reprocess the full Zarr range so the overlap resolver
         # can JOIN the new columns into every partition.
@@ -318,14 +330,15 @@ class Zarr2Parquet(BaseConverter):
                     label=f"Backfilling {sorted(cols)} into existing partitions",
                 )
 
+        elapsed = time.perf_counter() - t0
         if ok:
             logger.success(
-                f"Zarr → Parquet conversion for '{self.var_key.upper()}' complete."
+                f"Conversion complete for '{self.var_key.upper()}' in {elapsed:.1f}s."
             )
         else:
             logger.warning(
-                f"Zarr → Parquet conversion for '{self.var_key.upper()}' finished "
-                "with errors — see messages above."
+                f"Conversion for '{self.var_key.upper()}' finished with errors in "
+                f"{elapsed:.1f}s — see messages above."
             )
         return ok
 
