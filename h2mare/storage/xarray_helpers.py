@@ -426,6 +426,24 @@ _CF_COORD_ATTRS: dict[str, dict[str, str]] = {
 }
 
 
+def resolve_cf_attrs(var_name: str, native_var_key: str | None = None) -> dict:
+    """
+    Config's attributes for one variable, with the native overrides layered on.
+
+    Split out of :func:`apply_cf_attrs` so the repair script can compute what a
+    stored variable *should* say without opening the data — and, more to the
+    point, so it cannot compute it differently. A ``None`` value survives into
+    the result and means remove, which is the caller's to act on.
+    """
+    from h2mare.config import get_settings
+
+    settings = get_settings()
+    overrides: dict = {}
+    if native_var_key is not None:
+        overrides = settings.native_attr_overrides.get(native_var_key, {})
+    return {**settings.get_var_info(var_name), **overrides.get(var_name, {})}
+
+
 def apply_cf_attrs(ds: xr.Dataset, native_var_key: str | None = None) -> xr.Dataset:
     """
     Put config's metadata onto a dataset's variables and axes.
@@ -452,17 +470,10 @@ def apply_cf_attrs(ds: xr.Dataset, native_var_key: str | None = None) -> xr.Data
             removes the attribute rather than setting it, which is how those
             ``cell_methods`` come off.
     """
-    from h2mare.config import get_settings
-
-    settings = get_settings()
     ds = drop_source_encoding_attrs(ds, drop_grib=native_var_key is None)
 
-    overrides: dict = {}
-    if native_var_key is not None:
-        overrides = settings.native_attr_overrides.get(native_var_key, {})
-
     for var in ds.data_vars:
-        merged = {**settings.get_var_info(str(var)), **overrides.get(str(var), {})}
+        merged = resolve_cf_attrs(str(var), native_var_key)
         attrs = ds[var].attrs
         for key, value in merged.items():
             if value is None:
