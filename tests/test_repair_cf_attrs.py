@@ -102,6 +102,56 @@ class TestCoordinatesAttrCleanup:
         )
 
 
+class TestSupersededDescription:
+    """
+    config renamed description -> comment. The repair writes only the attributes
+    config names, so without this the old key outlives the rename beside its own
+    replacement — 2108 h2ds variables carried both.
+    """
+
+    def test_an_exact_duplicate_of_the_new_comment_goes(self):
+        assert repair_cf_attrs._description_is_superseded(
+            {"description": "same words"}, {"comment": "same words"}
+        )
+
+    def test_an_empty_one_goes(self):
+        """What CMEMS ships: the key present, carrying nothing."""
+        assert repair_cf_attrs._description_is_superseded(
+            {"description": ""}, {"comment": "anything"}
+        )
+        assert repair_cf_attrs._description_is_superseded(
+            {"description": "   "}, {"comment": "anything"}
+        )
+
+    def test_a_source_description_with_its_own_content_is_kept(self):
+        """It is the source's, not ours to discard."""
+        assert not repair_cf_attrs._description_is_superseded(
+            {"description": "what the provider says"}, {"comment": "what we say"}
+        )
+
+    def test_nothing_is_dropped_when_config_supplies_no_comment(self):
+        assert not repair_cf_attrs._description_is_superseded(
+            {"description": "orphan"}, {"units": "m"}
+        )
+
+    def test_any_wording_widens_it_to_this_repo_s_older_prose(self):
+        """
+        The opt-in case: the native sst_std still carries the wording a deleted
+        version of the code wrote, which no equality check can match.
+        """
+        current = {"description": "Derived from a rolling mean (3*3 cells)"}
+        desired = {"comment": "Derived from a rolling mean (3*3 cells) from ..."}
+        assert not repair_cf_attrs._description_is_superseded(current, desired)
+        assert repair_cf_attrs._description_is_superseded(
+            current, desired, any_wording=True
+        )
+
+    def test_any_wording_still_needs_a_comment_to_supersede_it(self):
+        assert not repair_cf_attrs._description_is_superseded(
+            {"description": "orphan"}, {"units": "m"}, any_wording=True
+        )
+
+
 class TestRepair:
     @pytest.fixture(autouse=True)
     def _point_at_the_temp_store(self, tmp_path, monkeypatch):
