@@ -200,6 +200,23 @@ wheels = [
 ]
 
 [[package]]
+name = "cf-units"
+version = "3.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cftime" },
+    { name = "jinja2" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/22/30/27509046e69457605e6eefa4ad7866fcdb6182b1a4f9b9d8404a28e3eb50/cf_units-3.3.1.tar.gz", hash = "sha256:84339f582994ae32ca5c472075c1e603a89f6c6f5a96cc1031bb5da700a14f3a", size = 311647, upload-time = "2026-01-16T15:09:38.423Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2f/1d/b3147f81febf89ea14697f48cc75474fb0cd35b113f554a0805677654caa/cf_units-3.3.1-cp311-abi3-macosx_15_0_arm64.whl", hash = "sha256:6f35616ab44607294920d712eb5edb3ce1c123e56e7cf1b3686fceb300cd2ef6", size = 455275, upload-time = "2026-01-16T15:09:31.165Z" },
+    { url = "https://files.pythonhosted.org/packages/79/3a/03d6c413213d09dbc2fc6baca28595200130e669afbe616d34756bc8b7b7/cf_units-3.3.1-cp311-abi3-macosx_15_0_x86_64.whl", hash = "sha256:fd893c45df1a1ac327d67884d0442edbf4cd5eb74198846dfacbbb7662fa7d2b", size = 456231, upload-time = "2026-01-16T15:09:32.858Z" },
+    { url = "https://files.pythonhosted.org/packages/89/f5/3cc05872868800d66ad1b54659449839276c447650088d500b69049a6edf/cf_units-3.3.1-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:e10abcd4e3e8cb628bc315835cf3efec8a19d31b31bfcdfb820ce32daa0adf79", size = 737286, upload-time = "2026-01-16T15:09:34.489Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/85/80742e4607f2dcd55abbe63b7a251fea4322806d3263150572606537ff97/cf_units-3.3.1-cp311-abi3-win_amd64.whl", hash = "sha256:566b3de7de87967e5fcec8f06adec60bb814705ba8d61fe440a17c0ead7fec14", size = 537479, upload-time = "2026-01-16T15:09:36.857Z" },
+]
+
+[[package]]
 name = "cffi"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1111,6 +1128,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "cf-units" },
     { name = "ipykernel" },
     { name = "nbformat" },
     { name = "pyright" },
@@ -1155,6 +1173,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "cf-units", specifier = ">=3.3" },
     { name = "ipykernel", specifier = ">=7.2.0" },
     { name = "nbformat", specifier = ">=5.10.4" },
     { name = "pyright", specifier = ">=1.1.410" },
