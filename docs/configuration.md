@@ -206,6 +206,29 @@ describe them. `radiation` is deliberately absent — `hourly_radiation` convert
 J m⁻² to W m⁻² at both cadences, and each hourly value is a mean over its own
 interval, so both the units and `time: mean` still hold.
 
+### Repairing stores written before this existed
+
+`apply_cf_attrs` only reaches newly written data — an append never rewrites
+`lat`/`lon` and never revisits a variable's attributes — so stores already on
+disk keep whatever they were created with.
+
+```bash
+uv run python scripts/repair_cf_attrs.py waves        # dry run, reports per store
+uv run python scripts/repair_cf_attrs.py waves --apply
+uv run python scripts/repair_cf_attrs.py --all --apply
+```
+
+It rewrites **metadata only**; no data array is read or written, so a full pass
+is seconds rather than the hours a recompile would take. What it writes comes
+from the same `resolve_cf_attrs` and `_CF_COORD_ATTRS` the write path uses, so a
+repaired store and a fresh one cannot disagree.
+
+It also removes a stray `valid_time` — the hourly waves path used to leave a
+byte-for-byte duplicate of `time` behind. That deletion is guarded: a
+`valid_time` that differs from `time` is data, and is reported and left alone.
+Consolidated metadata is rewritten afterwards, or a reader trusting it would
+still be told the array is there.
+
 ### Sign conventions
 
 `bathy` keeps the ETOPO sign convention — `positive: up`, so sea-floor values are
