@@ -51,18 +51,26 @@ from h2mare.storage.xarray_helpers import (
     _SOURCE_ENCODING_PREFIXES,
     resolve_cf_attrs,
 )
-from h2mare.storage.zarr_catalog import ZarrCatalog
 
 #: The duplicate coordinate the hourly waves path used to leave behind.
 _STRAY_COORD = "valid_time"
 
 
 def store_paths(var_key: str) -> list[Path]:
-    catalog = ZarrCatalog(var_key)
-    df = catalog.df
-    if df.empty:
+    """
+    Every Zarr store for *var_key*, by name.
+
+    Globbed rather than taken from ``ZarrCatalog``, which cannot be constructed
+    for a time-less store at all: its scanner reads ``ds.time.min()`` to build
+    the coverage index, so ``ZarrCatalog("bathy")`` raises on the ETOPO store
+    before returning any paths. Repairing metadata needs no coverage index, and
+    bathy needs its coordinates labelled like everything else.
+    """
+    settings = get_settings()
+    config = settings.app_config.variables.get(var_key)
+    if config is None:
         return []
-    return [Path(p) for p in df.sort_values("start_date")["path"]]
+    return sorted((settings.STORE_ROOT / config.local_folder).glob("*.zarr"))
 
 
 def is_compiled(var_key: str) -> bool:
