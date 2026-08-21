@@ -27,6 +27,7 @@ Usage:
     uv run python scripts/repair_cf_attrs.py waves --apply
     uv run python scripts/repair_cf_attrs.py --all              # survey everything
     uv run python scripts/repair_cf_attrs.py --all --apply
+    uv run python scripts/repair_cf_attrs.py --all --apply --drop-legacy-description
 """
 
 from __future__ import annotations
@@ -95,8 +96,44 @@ def _stale_source_attrs(attrs: dict, *, drop_grib: bool) -> list[str]:
     ]
 
 
+def _description_is_superseded(
+    current: dict, desired: dict, *, any_wording: bool = False
+) -> bool:
+    """
+    Whether a leftover ``description`` can go now that ``comment`` is written.
+
+    Config renamed ``description`` to ``comment`` — the name CF and ACDD define
+    — but the repair only ever writes the attributes config *names*, so the old
+    key would sit beside its replacement forever holding the same text. On h2ds
+    it does exactly that; 2108 variables carried both.
+
+    By default dropped only where it says nothing the store loses: empty, which
+    is what CMEMS ships, or word for word what ``comment`` now carries. Anything
+    else might be the source's own, and that is not ours to discard.
+
+    ``any_wording`` widens it to every ``description`` config now has a
+    ``comment`` for. What that catches is h2mare's own earlier prose, kept
+    verbatim from a version of the code that has since been deleted — the native
+    ``sst_std`` still says "Derived from a rolling mean (3*3 cells) from sst
+    native resolution", against config's fuller sentence. Nothing in h2mare
+    writes ``description`` any more, so on these stores nothing else can be
+    producing it; it stays opt-in only because that reasoning is about this
+    repo's history rather than anything the attribute itself declares.
+    """
+    if "description" not in current or "comment" not in desired:
+        return False
+    existing = current["description"]
+    if any_wording:
+        return True
+    return not str(existing).strip() or existing == desired["comment"]
+
+
 def plan_variable(
-    current: dict, var_name: str, *, native_var_key: str | None
+    current: dict,
+    var_name: str,
+    *,
+    native_var_key: str | None,
+    drop_legacy_description: bool = False,
 ) -> tuple[dict, list[str]]:
     """(attributes to set, attribute names to delete) for one variable."""
     desired = resolve_cf_attrs(var_name, native_var_key)
@@ -109,6 +146,10 @@ def plan_variable(
         key for key, value in desired.items() if value is None and key in current
     ]
     deletes += _stale_source_attrs(current, drop_grib=native_var_key is None)
+    if _description_is_superseded(
+        current, desired, any_wording=drop_legacy_description
+    ):
+        deletes.append("description")
     return sets, sorted(set(deletes))
 
 
@@ -149,7 +190,7 @@ def _clean_coordinates_attr(root: zarr.Group, names: set[str]) -> dict[str, str 
     return changes
 
 
-def repair(var_key: str, *, apply: bool) -> int:
+def repair(var_key: str, *, apply: bool, drop_legacy_description: bool = False) -> int:
     """Report (and optionally write) the metadata repair for one var_key."""
     paths = store_paths(var_key)
     if not paths:
@@ -171,7 +212,10 @@ def repair(var_key: str, *, apply: bool) -> int:
         var_plans: dict[str, tuple[dict, list[str]]] = {}
         for name in sorted(data_vars):
             sets, deletes = plan_variable(
-                dict(root[name].attrs), name, native_var_key=native_var_key
+                dict(root[name].attrs),
+                name,
+                native_var_key=native_var_key,
+                drop_legacy_description=drop_legacy_description,
             )
             if sets or deletes:
                 var_plans[name] = (sets, deletes)
@@ -256,6 +300,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--apply", action="store_true", help="write the repair (default is a dry run)"
     )
+    parser.add_argument(
+        "--drop-legacy-description",
+        action="store_true",
+        help=(
+            "also remove a description whose wording differs from the comment "
+            "config now supplies. Nothing in h2mare writes description any "
+            "more, so what remains is this repo's own earlier prose"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.all:
@@ -268,7 +321,11 @@ def main(argv: list[str] | None = None) -> int:
     total = 0
     for var_key in var_keys:
         try:
-            total += repair(var_key, apply=args.apply)
+            total += repair(
+                var_key,
+                apply=args.apply,
+                drop_legacy_description=args.drop_legacy_description,
+            )
         except Exception as e:  # noqa: BLE001 - one bad store must not stop the survey
             print(f"[{var_key}] could not be repaired: {e}")
 
