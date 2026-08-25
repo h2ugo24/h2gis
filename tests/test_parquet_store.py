@@ -74,17 +74,6 @@ class TestPartitionHelpers:
         p = store._partition_path((2021, 6))
         assert p == store.parquet_root / "year=2021" / "month=6"
 
-    def test_partition_filter_sql_single(self, tmp_path):
-        store = _store(tmp_path)
-        sql = store._partition_filter_sql([(2021, 6)])
-        assert "year = 2021" in sql
-        assert "month = 6" in sql
-
-    def test_partition_filter_sql_multiple(self, tmp_path):
-        store = _store(tmp_path)
-        sql = store._partition_filter_sql([(2021, 6), (2021, 7)])
-        assert "OR" in sql
-
     def test_partition_filter_expr_matches_row(self, tmp_path):
         store = _store(tmp_path)
         expr = store._partition_filter_expr((2021, 6))

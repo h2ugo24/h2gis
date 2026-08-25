@@ -138,16 +138,6 @@ class ParquetStore:
             path = path / f"{col}={val}"
         return path
 
-    def _partition_filter_sql(self, pairs: list[tuple]) -> str:
-        clauses = []
-        for vals in pairs:
-            parts = [
-                f"{col} = '{v}'" if isinstance(v, str) else f"{col} = {v}"
-                for col, v in zip(self._partition_by, vals)
-            ]
-            clauses.append(f"({' AND '.join(parts)})")
-        return " OR ".join(clauses)
-
     def _partition_filter_expr(self, partition: tuple) -> pl.Expr:
         exprs = [pl.col(col) == val for col, val in zip(self._partition_by, partition)]
         return exprs[0] if len(exprs) == 1 else pl.all_horizontal(exprs)
