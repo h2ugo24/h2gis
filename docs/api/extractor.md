@@ -55,6 +55,31 @@ Extractor(
 
 ---
 
+## Establishing the merge key: `ensure_row_id`
+
+`index_col` is required and the `Extractor` never creates it — the key has to exist on the
+frame *you* keep, since that is the other side of the eventual join. `ensure_row_id` puts
+one there:
+
+```python
+from h2mare.processing.extractor import Extractor, ensure_row_id
+
+pts = ensure_row_id(pts)                       # adds "row_id" if absent
+results = Extractor(pts, index_col="row_id").run({"sst": None})
+```
+
+| Input | Result |
+|---|---|
+| Column present and unique | Returned unchanged |
+| Column present with duplicates | `ValueError` — a duplicated key collapses rows on merge-back |
+| Column absent | A positional `range(len(data))` key is added, on a copy |
+
+Use the returned frame for both the extraction and the merge. The key is positional when
+generated, which is why the checkpoint fingerprints the input as well: two different frames
+of the same length would otherwise line up perfectly.
+
+---
+
 ## Cadence
 
 Some variables are stored at their source's native **hourly** cadence
@@ -170,6 +195,12 @@ A resume logs which `var_keys` it is replaying rather than re-extracting. That m
 you have changed something *other* than the input — config, or the pipeline itself — since
 a fingerprint match cannot tell "carry on where you stopped" from "re-run this with the
 fix". Delete `INTERIM_DIR/extraction_checkpoint.*` when you want a genuinely clean run.
+
+The checkpoint is two files — the feather, then a sidecar naming what it holds — so a kill
+between them leaves a `var_key`'s columns stored but the key unrecorded. The resume detects
+that, discards the stale columns and re-extracts, warning as it goes. The write order is
+deliberate: reversed, the same interruption would mark the `var_key` done with its columns
+missing and the resume would skip it, dropping the variable silently.
 
 ---
 
