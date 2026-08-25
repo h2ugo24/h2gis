@@ -9,7 +9,7 @@ here rather than inferred from a combined dataset.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -245,44 +245,76 @@ class TestDriftedStoreIsReadable:
         a = _ds(["2021-01-01", "2021-01-02"], lons=lons)
         b = _ds(["2021-01-03", "2021-01-04"], lons=lons + np.linspace(0, drift, 3))
         pa, pb = tmp_path / "a.zarr", tmp_path / "b.zarr"
-        a.to_zarr(pa, consolidated=False)
-        b.to_zarr(pb, consolidated=False)
+        # Written the way the pipeline writes: to_zarr's default consolidates
+        # metadata. Passing consolidated=False here made the read below fall
+        # back to non-consolidated metadata and warn about it — a warning about
+        # the fixture, not about the drift these tests are pinning.
+        a.to_zarr(pa)
+        b.to_zarr(pb)
         return [str(pa), str(pb)]
 
-    def _open(self, paths, reference):
-        reader = _reader()
-        return xr.open_mfdataset(
-            paths,
-            engine="zarr",
-            combine="by_coords",
-            data_vars="minimal",
-            coords="minimal",
-            compat="override",
-            preprocess=lambda d: reader._preprocess_dataset(d, None, None, reference),
-        )
+    _DATES = ["2021-01-01", "2021-01-02", "2021-01-03", "2021-01-04"]
+
+    def _open(self, paths):
+        """
+        Open through ``ZarrReader.open_dataset`` — the real production call.
+
+        This used to re-implement the ``open_mfdataset`` invocation inline,
+        which meant it asserted against a copy of the reader's arguments rather
+        than the reader's. Reverting ``join`` in zarr_reader.py left every test
+        in this class green. Driving the reader keeps them honest; the index is
+        stubbed only to supply the paths, which is all this path needs.
+        """
+        index = MagicMock()
+        index.var_key = "sst"
+        index.map_dates_to_paths.return_value = {
+            p: [pd.Timestamp(d) for d in self._DATES] for p in paths
+        }
+        return ZarrReader(index).open_dataset(dates=self._DATES)
 
     def test_float_drifted_files_combine(self, tmp_path):
         paths = self._write_pair(tmp_path, drift=1e-12)
-        reference = ZarrReader._reference_axes(paths)
 
-        with self._open(paths, reference) as ds:
+        with self._open(paths) as ds:
             assert ds.sizes["time"] == 4
             assert ds.sizes["lon"] == 3  # not doubled by an outer join
 
-    def test_the_same_files_are_damaged_without_the_snap(self, tmp_path):
+    def test_the_same_files_are_refused_without_the_snap(self, tmp_path):
         """
-        Pins what the snap prevents. The damage is version-dependent: this
-        xarray still defaults to join='outer' and unions the two axes into a
-        doubled one full of near-duplicate points, warning that a future
-        release will raise instead. Across a real store of many files the same
-        mismatch surfaces as "Resulting object does not have monotonic global
-        indexes along dimension lon". Either way the axis is not the grid.
+        Pins what the snap buys. Without it the two axes are not equal, and
+        under join='exact' xarray refuses to align them rather than inventing a
+        combined axis. Across a real store of many files the same mismatch used
+        to surface as "Resulting object does not have monotonic global indexes
+        along dimension lon", which names neither the cause nor the file.
+
+        Was asserted the other way round while the reader relied on xarray's
+        old join='outer' default: the read succeeded and handed back a doubled
+        axis of near-duplicate points. Failing is the better half of that pair.
         """
         paths = self._write_pair(tmp_path, drift=1e-12)
 
-        with self._open(paths, reference={}) as ds:
-            assert ds.sizes["lon"] > 3  # 3 real points, unioned into more
-            assert np.diff(ds.lon.values).min() < 1e-11  # near-duplicate steps
+        # The reader always computes a reference, so the snap is disabled here
+        # rather than skipped — the point is what the *rest* of the read does
+        # when the axes are left as written.
+        with patch.object(ZarrReader, "_reference_axes", staticmethod(lambda _: {})):
+            with pytest.raises(RuntimeError, match="(?i)align|monotonic"):
+                self._open(paths).close()
+
+    def test_a_genuinely_different_grid_is_refused_even_with_the_snap(self, tmp_path):
+        """
+        The promise ``snap_axes_to_reference`` makes in its own docstring — "a
+        genuinely different grid ... still reaches xarray and still raises" —
+        and which nothing verified.
+
+        It was not true under join='outer': two grids 5 degrees apart (far
+        outside the snap tolerance, so the snap correctly declines) unioned
+        into a longer axis of interleaved points and the read *succeeded*,
+        handing back a coordinate axis that was not either file's grid.
+        """
+        paths = self._write_pair(tmp_path, drift=5.0)
+
+        with pytest.raises(RuntimeError, match="(?i)align|monotonic"):
+            self._open(paths).close()
 
     def test_reference_axes_needs_more_than_one_file(self, tmp_path):
         """A lone file is never combined against anything; it defines its axes."""
