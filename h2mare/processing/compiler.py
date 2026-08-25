@@ -129,7 +129,7 @@ class Compiler:
         self.file_period = validate_file_period(file_period)
         self.date_format: Literal["year", "date", "yearmonth"] = date_format
 
-        self.catalog = ZarrCatalog(self.var_key)
+        self.catalog = self._catalog_for(self.var_key)
         # Cache of per-variable non-null end dates in h2ds, filled lazily on the
         # first incremental range resolution (one store scan per run).
         self._nonnull_ends_cache: Optional[dict[str, pd.Timestamp]] = None
@@ -138,6 +138,24 @@ class Compiler:
         # compile (only the h2ds output is written), so re-scanning it per
         # chunk is wasted I/O.
         self._catalog_cache: dict[str, ZarrCatalog] = {}
+
+    def _catalog_for(self, var_key: str, **kwargs) -> ZarrCatalog:
+        """
+        Catalog for *var_key*, rooted under this compiler's ``remote_store_root``.
+
+        Built explicitly rather than left to resolve from settings so that a
+        relocated store root reaches the compiler's own reads. These catalogs
+        used to default to ``STORE_ROOT``, so a run pointed elsewhere wrote h2ds
+        to the override while reading its sources from the configured root.
+        Identical to the old behaviour whenever the two agree, which is every
+        run that does not relocate anything.
+        """
+        var_config = self.app_config.variables[var_key]
+        return ZarrCatalog(
+            var_key,
+            store_root=self.remote_store_root / var_config.local_folder,
+            **kwargs,
+        )
 
     def run(
         self,
@@ -391,7 +409,9 @@ class Compiler:
             if len(null_days) == 0:
                 return None
 
-            source_have = ZarrCatalog(vkey, auto_refresh=False).get_nonnull_days(window)
+            source_have = self._catalog_for(vkey, auto_refresh=False).get_nonnull_days(
+                window
+            )
             fillable = null_days.intersection(
                 source_have.get("__any__", pd.DatetimeIndex([]))
             )
@@ -528,7 +548,7 @@ class Compiler:
         catalog: Optional[ZarrCatalog] = None
         if var_key not in SYSTEM_VAR_KEYS:
             catalog = self._catalog_cache.setdefault(
-                var_key, ZarrCatalog(var_key, auto_refresh=False)
+                var_key, self._catalog_for(var_key, auto_refresh=False)
             )
             if not self._has_overlap(var_key, date_range, catalog):
                 return None

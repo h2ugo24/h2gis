@@ -45,6 +45,18 @@ class PipelineManager:
         self.zarr_backup_dir = zarr_backup_dir
         self.parquet_backup_dir = parquet_backup_dir
 
+    def _store_dir(self, var_config) -> Path:
+        """
+        This variable's own directory under the manager's store root.
+
+        ``store_root`` is a *root* holding one folder per variable, the shape
+        ``STORE_ROOT`` has in ``.env``. The ``store_root`` argument taken by
+        downloaders and converters means the opposite — one store's exact
+        directory — so the two are not interchangeable, and handing the root
+        straight to a downloader pointed every variable at the same place.
+        """
+        return self.store_root / var_config.local_folder
+
     def run(self, variables: Optional[List[str]] = None) -> bool:
         """Run the full pipeline. Returns True if all steps succeeded, False if any failed."""
         if variables is None:
@@ -93,7 +105,7 @@ class PipelineManager:
                 downloader = DownloaderClass(
                     var_key=var_key,
                     app_config=self.app_config,
-                    store_root=self.store_root,
+                    store_root=self._store_dir(var_config),
                 )
 
                 try:
@@ -113,7 +125,11 @@ class PipelineManager:
                     continue
 
                 try:
-                    Netcdf2Zarr(var_key).run()
+                    Netcdf2Zarr(
+                        var_key,
+                        app_config=self.app_config,
+                        store_root=self._store_dir(var_config),
+                    ).run()
                 except Exception as e:
                     logger.opt(exception=True).error(
                         f"Processing failed for '{var_key}': {e}"
@@ -143,12 +159,11 @@ class PipelineManager:
             from h2mare.format_converters.zarr2parquet import Zarr2Parquet
 
             try:
-                h2ds_local_folder = self.app_config.variables["h2ds"].local_folder
                 with logger.contextualize(var="h2ds"):
                     converter = Zarr2Parquet(
                         var_key="h2ds",
                         parquet_root=get_settings().PARQUET_DIR,
-                        store_root=self.store_root / h2ds_local_folder,
+                        store_root=self._store_dir(self.app_config.variables["h2ds"]),
                     )
                     converter.run(
                         start_date=self.start_date,

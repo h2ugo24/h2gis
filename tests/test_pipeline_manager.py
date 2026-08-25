@@ -98,6 +98,42 @@ class TestDownloadFailureIsolation:
         assert MockConverter.return_value.run.call_count == 2
 
 
+class TestStoreRootReachesEveryStep:
+    """
+    The manager's store_root is a *root* holding one folder per variable, the
+    shape STORE_ROOT has in .env. Regression: it was handed to the downloader
+    unchanged — pointing every variable at the root itself — and not handed to
+    Netcdf2Zarr at all, so `--store-path` relocated the download and Parquet
+    steps while convert stayed on the configured root.
+    """
+
+    def test_downloader_gets_the_variable_subfolder_not_the_bare_root(self, tmp_path):
+        cfg = _make_config("sst", "chl")
+        manager, downloader_cls = _make_manager(cfg, tmp_path)
+
+        with patch("h2mare.pipeline_manager.Netcdf2Zarr"):
+            manager.run()
+
+        roots = {
+            c.kwargs["var_key"]: c.kwargs["store_root"]
+            for c in downloader_cls.call_args_list
+        }
+        assert roots == {"sst": tmp_path / "sst", "chl": tmp_path / "chl"}
+
+    def test_converter_is_given_the_same_root_as_the_downloader(self, tmp_path):
+        cfg = _make_config("sst")
+        manager, downloader_cls = _make_manager(cfg, tmp_path)
+
+        with patch("h2mare.pipeline_manager.Netcdf2Zarr") as MockConverter:
+            manager.run()
+
+        assert MockConverter.call_args.kwargs["store_root"] == tmp_path / "sst"
+        assert (
+            MockConverter.call_args.kwargs["store_root"]
+            == downloader_cls.call_args.kwargs["store_root"]
+        )
+
+
 # ---------------------------------------------------------------------------
 # dry_run flag
 # ---------------------------------------------------------------------------

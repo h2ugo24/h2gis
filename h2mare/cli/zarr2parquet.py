@@ -138,6 +138,13 @@ def parquet(
         typer.echo("Error: --add-var and -v cannot be used together.", err=True)
         raise typer.Exit(code=1)
 
+    # See Settings.override_store_root. Applied here rather than handed to
+    # Zarr2Parquet, because an explicit store_root names *one* store's directory
+    # while this flag names the root above them all — passing it straight through
+    # sent every var_key looking in the root itself instead of its own folder.
+    if store_path is not None:
+        get_settings().override_store_root(store_path)
+
     available = set(get_settings().app_config.variables.keys())
 
     # ---- Resolve output root ----
@@ -175,7 +182,6 @@ def parquet(
                 converter = Zarr2Parquet(
                     var_key="h2ds",
                     parquet_root=parquet_base,
-                    store_root=store_path,
                 )
                 converter.run(
                     start_date=start_date,
@@ -205,7 +211,6 @@ def parquet(
                 converter = Zarr2Parquet(
                     var_key=key,
                     parquet_root=parquet_base,
-                    store_root=store_path,
                 )
                 converter.run(start_date=start_date, end_date=end_date, depth=depth)
                 if parquet_backup:
