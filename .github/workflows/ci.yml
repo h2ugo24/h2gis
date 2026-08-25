@@ -66,6 +66,36 @@ jobs:
       - run: uv run ruff format --check h2mare/ tests/ scripts/
       - run: uv run pytest tests/
 
+  # Informational only — pyright currently reports ~200 findings, most of them
+  # pandas/xarray stub noise rather than defects, so gating on it would block
+  # every PR. It runs to keep the count visible and stop it growing unnoticed;
+  # `continue-on-error` means a finding annotates the PR without failing it.
+  # Promote it to a required check in branch protection once the count is at
+  # zero — and see the note on `quality` before touching that job's name.
+  typecheck:
+    name: typecheck (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+      - run: uv sync --dev
+      - name: pyright
+        run: uv run pyright h2mare --outputjson > pyright.json || true
+      - name: Summarise findings
+        run: |
+          uv run python - <<'PY'
+          import collections, json, pathlib
+          d = json.loads(pathlib.Path("pyright.json").read_text())
+          diags = d.get("generalDiagnostics", [])
+          print(f"pyright findings: {len(diags)}")
+          by_rule = collections.Counter(x.get("rule", "(none)") for x in diags)
+          for rule, n in by_rule.most_common():
+              print(f"{n:5}  {rule}")
+          PY
+
   # The floor (3.11) is covered by `quality`; this covers the rest of the range
   # pyproject advertises. Not a required check — it exists so a break on a newer
   # interpreter is visible on the PR rather than at release time.
