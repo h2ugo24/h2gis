@@ -1274,3 +1274,73 @@ class TestRepr:
         assert "time_step=hourly" in text
         # The word this field used to carry, and the reason it was renamed.
         assert "resolution" not in text
+
+
+# ---------------------------------------------------------------------------
+# Relocating a variable to another store root
+# ---------------------------------------------------------------------------
+
+
+class TestCatalogBuiltForAnotherRoot:
+    """
+    Regression: the catalog sidecar is named for the var_key alone and lives
+    under the project's METADATA_DIR, so nothing ties it to the root it was
+    built from. Once a variable can name its own store_root in config.yaml,
+    repointing one is an ordinary edit — and the stale catalog left behind
+    holds the previous root's absolute paths.
+
+    The usual staleness check cannot catch it: has_changes() swallows the
+    scanner's FileNotFoundError and reports False, and the disk-vs-catalog
+    comparison is gated on store_root.exists(). So a root that is unmounted or
+    not yet created served the old location's files instead.
+    """
+
+    def _write_sidecar(self, metadata_root, records):
+        metadata_root.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(records).to_parquet(
+            metadata_root / "sst_zarr_catalog.parquet", index=False
+        )
+
+    def _catalog(self, store_root, metadata_root, scanner):
+        catalog = ZarrCatalog(
+            "sst",
+            app_config=_make_app_config(),
+            store_root=store_root,
+            metadata_root=metadata_root,
+            auto_refresh=False,
+            warn_if_missing=False,
+        )
+        catalog._index._scanner = scanner
+        return catalog
+
+    def test_old_roots_catalog_is_discarded_rather_than_served(self, tmp_path):
+        old_root = tmp_path / "old_drive"
+        new_root = tmp_path / "new_drive"  # deliberately absent, as if unmounted
+        metadata_root = tmp_path / "metadata"
+        self._write_sidecar(metadata_root, [_record(old_root / "a.zarr")])
+
+        scanner = _FakeScanner(changes=False)
+        catalog = self._catalog(new_root, metadata_root, scanner)
+
+        df = catalog.df
+
+        assert scanner.scan_calls == 1, "the foreign catalog should force a rescan"
+        assert df.empty, "no file from the old root may be reported under the new one"
+
+    def test_catalog_matching_the_root_is_still_served_without_rescanning(
+        self, tmp_path
+    ):
+        """The guard must not fire for the ordinary case, or every read rescans."""
+        store_root = tmp_path / "store"
+        store_root.mkdir()
+        (store_root / "a.zarr").mkdir()
+        metadata_root = tmp_path / "metadata"
+        self._write_sidecar(metadata_root, [_record(store_root / "a.zarr")])
+
+        scanner = _FakeScanner(changes=False)
+        catalog = self._catalog(store_root, metadata_root, scanner)
+
+        df = catalog.df
+
+        assert scanner.scan_calls == 0
+        assert len(df) == 1
