@@ -48,8 +48,11 @@ jobs:
             exit 1
           fi
 
-  # Informational quality job (not a required gate by default — promote it in
-  # branch protection once you confirm it is reliably green).
+  # Required gate. The job name is a required status check on dev and main, so
+  # it must stay a single job called exactly "quality" — turning it into a
+  # matrix would rename the contexts to "quality (3.11)" etc., the required
+  # "quality" check would never report, and every PR would block forever.
+  # Additional interpreters go in `tests-matrix` below instead.
   quality:
     name: quality
     runs-on: ubuntu-latest
@@ -59,5 +62,24 @@ jobs:
         with:
           python-version: "3.11"
       - run: uv sync --dev
-      - run: uv run ruff check h2mare/ tests/
+      - run: uv run ruff check h2mare/ tests/ scripts/
+      - run: uv run ruff format --check h2mare/ tests/ scripts/
       - run: uv run pytest tests/
+
+  # The floor (3.11) is covered by `quality`; this covers the rest of the range
+  # pyproject advertises. Not a required check — it exists so a break on a newer
+  # interpreter is visible on the PR rather than at release time.
+  tests-matrix:
+    name: tests (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --dev
+      - run: uv run pytest tests/ -q
