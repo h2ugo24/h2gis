@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
+from loguru import logger
 
 from h2mare.models import AppConfig
 from h2mare.processing.compiler import (
@@ -343,6 +344,29 @@ class TestSyncData:
 
         compiler.sync_data(remote_dir / "chunk.zarr", backup_dir=backup_dir)
         assert (backup_dir / "chunk.zarr").exists()
+
+    def test_failed_copy_is_not_reported_as_success(self, compiler, tmp_path):
+        # Regression: the "File copied!" success line sat outside the except
+        # block, so a backup that raised was logged as an error and then
+        # announced as copied on the very next line.
+        source = tmp_path / "remote" / "data.zarr"
+        source.mkdir(parents=True)
+        compiler.local_store_root = tmp_path / "local"
+
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="DEBUG", format="{message}")
+        try:
+            with patch(
+                "h2mare.processing.compiler.shutil.copytree",
+                side_effect=PermissionError("destination is read-only"),
+            ):
+                compiler.sync_data(source)
+        finally:
+            logger.remove(sink)
+
+        text = "".join(messages)
+        assert "Failed to copy" in text
+        assert "File copied!" not in text
 
 
 # ---------------------------------------------------------------------------
