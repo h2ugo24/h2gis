@@ -1559,3 +1559,109 @@ class TestCheckpointValidation:
 
         assert _load_completed_keys(checkpoint, "fp1") == {"sst", "waves"}
         assert _load_completed_keys(checkpoint, "fp2") is None
+
+
+class TestInterruptedMidCheckpoint:
+    """
+    The checkpoint is two files written in sequence: the feather, then the
+    sidecar naming what it holds. A kill between them leaves the feather
+    carrying a var_key's columns while the sidecar still omits the key.
+    """
+
+    @staticmethod
+    def _extractor(tmp_path, monkeypatch):
+        real = extractor_module.get_settings()
+
+        class _Settings:
+            INTERIM_DIR = tmp_path
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        monkeypatch.setattr(extractor_module, "get_settings", lambda: _Settings())
+
+        df = pd.DataFrame(
+            {
+                "time": ["2020-01-01", "2020-01-02"],
+                "lon": [10.0, 11.0],
+                "lat": [40.0, 41.0],
+            }
+        )
+        extractor = Extractor(ensure_row_id(df), index_col="row_id", time_col="time")
+        fresh = pd.DataFrame({"sst": [1.5, 2.5]}, index=extractor.data.index)
+        fresh.index.name = "row_id"
+        monkeypatch.setattr(
+            extractor,
+            "process_single_varkey",
+            lambda var_key, vars=None, n_workers=8: fresh.copy(),
+        )
+        return extractor, fresh
+
+    def _write_half_checkpoint(self, extractor, tmp_path, values=(99.0, 99.0)):
+        """
+        The post-crash state: data written, sidecar not yet updated.
+
+        The stored values differ from what the re-extraction returns, so the
+        tests can tell a recovered column from a replayed one.
+        """
+        stale = pd.DataFrame({"sst": list(values)}, index=extractor.data.index)
+        stale.index.name = extractor.index_col
+        checkpoint = tmp_path / "extraction_checkpoint.feather"
+        extractor.data.join(stale).reset_index().to_feather(checkpoint)
+        with open(_keys_path(checkpoint), "w") as f:
+            json.dump(
+                {
+                    "fingerprint": input_fingerprint(
+                        extractor.data, extractor.index_col
+                    ),
+                    "completed": [],
+                },
+                f,
+            )
+        return checkpoint
+
+    def test_the_var_key_recovers_instead_of_wedging(self, tmp_path, monkeypatch):
+        """
+        Regression: the resume re-extracted and joined onto columns already
+        there, which pandas rejects ("columns overlap but no suffix
+        specified"). The resulting failure also kept the checkpoint from being
+        cleared, so every later run reloaded the same state and failed the same
+        way — the var_key never recovered on its own.
+        """
+        extractor, _ = self._extractor(tmp_path, monkeypatch)
+        checkpoint = self._write_half_checkpoint(extractor, tmp_path)
+
+        result, all_succeeded = extractor._run_impl({"sst": None}, n_workers=1)
+
+        assert all_succeeded
+        # Cleared, so a later run starts clean rather than reloading the wedge.
+        assert not checkpoint.exists()
+        assert not _keys_path(checkpoint).exists()
+
+    def test_the_re_extracted_values_win_over_the_stale_ones(
+        self, tmp_path, monkeypatch
+    ):
+        """The column is re-extracted, not carried over from the checkpoint."""
+        extractor, _ = self._extractor(tmp_path, monkeypatch)
+        self._write_half_checkpoint(extractor, tmp_path, values=(99.0, 99.0))
+
+        result, _ = extractor._run_impl({"sst": None}, n_workers=1)
+
+        assert result["sst"].tolist() == [1.5, 2.5]
+        assert list(result.columns).count("sst") == 1
+        assert not [c for c in result.columns if c.endswith(("_x", "_y"))]
+
+    def test_an_input_column_of_the_same_name_still_collides(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Only checkpoint leftovers are dropped. A column the caller supplied that
+        happens to share a name with an extracted variable is a different
+        problem, and silently overwriting their data would be a worse answer.
+        """
+        extractor, fresh = self._extractor(tmp_path, monkeypatch)
+        extractor.data["sst"] = [9.0, 9.0]
+
+        _, all_succeeded = extractor._run_impl({"sst": None}, n_workers=1)
+
+        assert not all_succeeded
