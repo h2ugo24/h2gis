@@ -4,7 +4,6 @@ import json
 import os
 import re
 import time
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ftplib import FTP
 from pathlib import Path
@@ -18,8 +17,6 @@ from h2mare.config import AppConfig
 from h2mare.downloader.base import BaseDownloader
 from h2mare.storage.coverage import resolve_date_range
 from h2mare.types import DateLike, DateRange, FTPDownloadTask
-
-warnings.filterwarnings("ignore")
 
 
 def _download_to_part(

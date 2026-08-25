@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import shutil
 import time
-import warnings
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -35,8 +34,6 @@ from h2mare.types import BBox, DateLike, DateRange, FilePeriod
 from h2mare.utils.datetime_utils import normalize_date
 from h2mare.utils.spatial import GridBuilder
 from h2mare.validators import validate_file_period, validate_var_key
-
-warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # Output grid resolution in degrees — matches the standard CMEMS/Copernicus
 # 0.25° daily grid used across all compiled h2ds variables.
@@ -571,6 +568,10 @@ class Compiler:
         try:
             shutil.copytree(remote_path, local_path, dirs_exist_ok=True)
         except (PermissionError, OSError) as e:
+            # Return rather than fall through: the success line used to sit
+            # outside this handler, so a failed backup was logged as an error
+            # and then announced as "File copied!" on the very next line.
             logger.exception(f"Failed to copy {remote_path} to {local_path}: {e}")
+            return
 
         logger.success("File copied!")

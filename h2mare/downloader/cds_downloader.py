@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import sys
 import time
-import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -23,8 +22,6 @@ from h2mare.storage import get_store_coverage, split_time_range
 from h2mare.types import BBox, DateLike, DateRange, FilePeriod
 from h2mare.utils.datetime_utils import normalize_date
 from h2mare.utils.labels import create_filename_label
-
-warnings.filterwarnings("ignore")
 
 
 class CDSDownloader(BaseDownloader):

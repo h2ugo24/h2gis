@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import sys
 import time
-import warnings
 from datetime import timedelta
 from pathlib import Path
 from typing import Optional
@@ -24,8 +23,6 @@ from h2mare.storage import split_time_range
 from h2mare.storage.coverage import resolve_date_range
 from h2mare.types import DateLike, DateRange, DownloadTask, FilePeriod
 from h2mare.utils.datetime_utils import end_of_day
-
-warnings.filterwarnings("ignore")
 
 
 def download_subset(
