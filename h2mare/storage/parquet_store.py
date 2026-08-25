@@ -445,6 +445,14 @@ class ParquetStore:
                 self._extend_dataset_metadata(df)
                 return
             logger.debug("Appending non-overlapping data.")
+            # Register any brand-new column before aligning. resolve_dims_overlap
+            # only reaches _update_physical_schema when it actually merges; every
+            # path that returns None (no temporal overlap, no coverage yet) skips
+            # it, and _align_to_schema then rejects the column as "detected but
+            # physical schema was not updated". That made adding a new variable
+            # for dates outside the store's range — seapodym, which is 2025-only —
+            # a hard failure rather than an append.
+            self._update_physical_schema(df)
             df = self._align_to_schema(df)
         else:
             logger.debug("Creating new parquet dataset.")

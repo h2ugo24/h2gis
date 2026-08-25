@@ -284,6 +284,25 @@ class TestResolveDimsOverlap:
         assert "2021-01-01" in dates_present
         assert "2021-01-03" in dates_present
 
+    def test_new_column_on_non_overlapping_dates_is_appended(self, tmp_path):
+        # Regression: resolve_dims_overlap returns None before reaching
+        # _update_physical_schema whenever the windows don't overlap, so
+        # add_data fell through to _align_to_schema, which rejected the
+        # unregistered column with "New columns {...} detected but physical
+        # schema was not updated". Adding a variable whose coverage starts
+        # after the store's end (seapodym is 2025-only) was a hard failure.
+        store = self._setup(tmp_path, [date(2021, 1, 1)])
+        store.add_data(make_grid_df([date(2025, 6, 1)], variables={"seapodym": 1.0}))
+
+        schema = store.get_schema()
+        assert "seapodym" in schema
+        assert "sst" in schema
+
+        files = list(store.parquet_root.rglob("*.parquet"))
+        loaded = pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed")
+        dates_present = set(loaded["time"].cast(pl.Utf8).to_list())
+        assert {"2021-01-01", "2025-06-01"} <= dates_present
+
     def test_returns_true_when_new_column_added(self, tmp_path):
         store = self._setup(tmp_path, [date(2021, 1, 1)])
         df_chl = make_grid_df([date(2021, 1, 1)], variables={"chl": 0.5})
