@@ -120,6 +120,35 @@ class TestStoreRootReachesEveryStep:
         }
         assert roots == {"sst": tmp_path / "sst", "chl": tmp_path / "chl"}
 
+    def test_a_variable_with_its_own_root_lands_there_instead(self, tmp_path):
+        """
+        The manager's root is the default, not the answer: a variable naming a
+        store_root of its own is fetched and converted onto that drive, while
+        its neighbours stay under the manager's root.
+        """
+        elsewhere = tmp_path / "other_drive"
+        variables = {
+            "sst": {**_ENTRY, "local_folder": "sst"},
+            "chl": {**_ENTRY, "local_folder": "chl", "store_root": str(elsewhere)},
+        }
+        cfg = msgspec.convert({"variables": variables, "secrets": {}}, AppConfig)
+        manager, downloader_cls = _make_manager(cfg, tmp_path)
+
+        with patch("h2mare.pipeline_manager.Netcdf2Zarr") as MockConverter:
+            manager.run()
+
+        roots = {
+            c.kwargs["var_key"]: c.kwargs["store_root"]
+            for c in downloader_cls.call_args_list
+        }
+        assert roots == {"sst": tmp_path / "sst", "chl": elsewhere / "chl"}
+
+        # Netcdf2Zarr takes var_key positionally.
+        convert_roots = {
+            c.args[0]: c.kwargs["store_root"] for c in MockConverter.call_args_list
+        }
+        assert convert_roots == {"sst": tmp_path / "sst", "chl": elsewhere / "chl"}
+
     def test_converter_is_given_the_same_root_as_the_downloader(self, tmp_path):
         cfg = _make_config("sst")
         manager, downloader_cls = _make_manager(cfg, tmp_path)

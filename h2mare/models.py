@@ -3,6 +3,7 @@ Classes representing Data models for spatial and variable configurations.
 """
 
 from enum import Enum
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Optional
 
 import msgspec
@@ -162,6 +163,19 @@ class KeyVarConfigEntry(msgspec.Struct):
     # Only for gaps confirmed absent at the source. Anything else is a defect
     # and belongs fixed, not listed.
     known_gaps: Optional[list[str]] = None
+    # Root holding this variable's ``local_folder``, for stores that should not
+    # live under STORE_ROOT — one drive for the hourly ERA5 stores, another for
+    # the CMEMS dailies. None (the default, and what every shipped variable
+    # uses) falls back to STORE_ROOT, so a config that declares none resolves
+    # exactly as it always has.
+    #
+    # Must be absolute: ``resolve_store_path`` calls ``.resolve()`` on the
+    # joined path, so a relative value would silently resolve against whatever
+    # directory the process happened to start in.
+    #
+    # Outranked by ``--store-path``, which relocates a whole run on purpose.
+    # See ``h2mare.utils.paths.store_root_for`` for the full precedence.
+    store_root: Optional[str] = None
 
     def __post_init__(self):
         if self.bbox is not None:
@@ -196,6 +210,26 @@ class KeyVarConfigEntry(msgspec.Struct):
                     "filename_date_range=True requires `pattern` to have exactly 2 "
                     f"capture groups (start, end); got {ngroups} in {self.pattern!r}"
                 )
+
+        # A relative store_root would resolve against the process cwd, so the
+        # same config would point somewhere different depending on where the
+        # command was run from. Fail at config load rather than write a store
+        # somewhere nobody meant.
+        #
+        # Checked against both flavours rather than the running platform's:
+        # "/data/store" is not absolute to PureWindowsPath (no drive) and
+        # "D:\\data" is not absolute to PurePosixPath, so using plain Path here
+        # would reject a config merely for having been written on the other OS.
+        # What must be caught is a *relative* path, which neither accepts.
+        if self.store_root is not None and not (
+            PurePosixPath(self.store_root).is_absolute()
+            or PureWindowsPath(self.store_root).is_absolute()
+        ):
+            raise ValueError(
+                f"store_root must be an absolute path; got {self.store_root!r}. "
+                "It is the root *above* local_folder — the same shape STORE_ROOT "
+                "has in .env, not a single store's directory."
+            )
 
 
 class SecretsConfig(msgspec.Struct):

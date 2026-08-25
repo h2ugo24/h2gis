@@ -33,6 +33,30 @@ class TestKeyVarConfigEntry:
         assert entry.subset is True
         assert entry.bbox is None
         assert entry.depth_range is None
+        assert entry.store_root is None
+
+    @pytest.mark.parametrize(
+        "root",
+        ["/mnt/other_drive", r"D:\GlobalData", r"\\server\share"],
+        ids=["posix", "windows-drive", "unc"],
+    )
+    def test_store_root_accepts_an_absolute_path(self, root):
+        """
+        Both flavours are accepted on either platform: a config written on
+        Linux must not be rejected merely for being read on Windows.
+        """
+        entry = msgspec.convert({**VALID_ENTRY, "store_root": root}, KeyVarConfigEntry)
+        assert entry.store_root == root
+
+    def test_relative_store_root_rejected(self):
+        """
+        A relative root would resolve against the process cwd, so the same
+        config would name different drives depending on where it was run.
+        """
+        with pytest.raises(ValueError, match="store_root must be an absolute path"):
+            msgspec.convert(
+                {**VALID_ENTRY, "store_root": "some/relative/dir"}, KeyVarConfigEntry
+            )
 
     def test_valid_with_bbox(self):
         entry = msgspec.convert(

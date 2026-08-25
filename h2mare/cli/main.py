@@ -148,13 +148,26 @@ def run(
     if store_path is not None:
         get_settings().override_store_root(store_path)
 
+    # STORE_ROOT is the root for variables that do not name one themselves, so
+    # it is only required when at least one selected variable relies on it. A
+    # config where every variable declares its own store_root is complete
+    # without it, and refusing to run would be wrong.
     store_root = get_settings().STORE_ROOT
     if store_root is None:
-        typer.echo(
-            "Error: STORE_ROOT is not set. Define it in .env or pass --store-path.",
-            err=True,
-        )
-        raise typer.Exit(code=1)
+        variables = get_settings().app_config.variables
+        rootless = sorted(k for k in selected if variables[k].store_root is None)
+        if rootless:
+            typer.echo(
+                "Error: STORE_ROOT is not set and these variable(s) do not "
+                f"declare a store_root of their own: {', '.join(rootless)}. "
+                "Define STORE_ROOT in .env, pass --store-path, or give each "
+                "variable a store_root in config.yaml.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        # Never consulted — every selected variable resolves to its own root —
+        # but PipelineManager needs a default to hold.
+        store_root = get_settings().ZARR_DIR
 
     success = PipelineManager(
         app_config=get_settings().app_config,

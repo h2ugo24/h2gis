@@ -11,6 +11,7 @@ from loguru import logger
 from h2mare import SYSTEM_VAR_KEYS, AppConfig, get_settings
 from h2mare.format_converters.netcdf2zarr import Netcdf2Zarr
 from h2mare.utils.files_io import prune_empty_dirs
+from h2mare.utils.paths import store_root_for
 
 
 class PipelineManager:
@@ -47,15 +48,19 @@ class PipelineManager:
 
     def _store_dir(self, var_config) -> Path:
         """
-        This variable's own directory under the manager's store root.
+        This variable's own directory under the root that applies to it.
 
         ``store_root`` is a *root* holding one folder per variable, the shape
         ``STORE_ROOT`` has in ``.env``. The ``store_root`` argument taken by
         downloaders and converters means the opposite — one store's exact
         directory — so the two are not interchangeable, and handing the root
         straight to a downloader pointed every variable at the same place.
+
+        The manager's own root is the *default*, not the answer: a variable may
+        name its own root in config.yaml. Variables that name none resolve to
+        ``self.store_root`` exactly as before.
         """
-        return self.store_root / var_config.local_folder
+        return store_root_for(var_config, self.store_root) / var_config.local_folder
 
     def run(self, variables: Optional[List[str]] = None) -> bool:
         """Run the full pipeline. Returns True if all steps succeeded, False if any failed."""

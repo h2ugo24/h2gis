@@ -32,6 +32,7 @@ from h2mare.storage.xarray_helpers import apply_cf_attrs, chunk_dataset
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import BBox, DateLike, DateRange, FilePeriod
 from h2mare.utils.datetime_utils import normalize_date
+from h2mare.utils.paths import store_root_for
 from h2mare.utils.spatial import GridBuilder
 from h2mare.validators import validate_file_period, validate_var_key
 
@@ -149,11 +150,17 @@ class Compiler:
         to the override while reading its sources from the configured root.
         Identical to the old behaviour whenever the two agree, which is every
         run that does not relocate anything.
+
+        ``remote_store_root`` is the *default* root, not the final answer — a
+        source variable may name its own in config.yaml, and a compile has to
+        read each one where it actually lives. Variables naming none still
+        resolve under ``remote_store_root``, exactly as before.
         """
         var_config = self.app_config.variables[var_key]
+        root = store_root_for(var_config, self.remote_store_root)
         return ZarrCatalog(
             var_key,
-            store_root=self.remote_store_root / var_config.local_folder,
+            store_root=root / var_config.local_folder,
             **kwargs,
         )
 

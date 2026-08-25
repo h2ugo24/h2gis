@@ -161,6 +161,59 @@ class TestOverrideStoreRoot:
             tmp_path / "from_flag" / "sst"
         )
 
+    def test_override_beats_a_variables_own_store_root(self, tmp_path, monkeypatch):
+        """
+        --store-path relocates a whole run on purpose, so it outranks a root
+        the variable named for itself. Moving only the variables that had not
+        opted out would be a partial relocation nobody could reason about.
+        """
+        import msgspec
+
+        from h2mare.models import AppConfig
+        from h2mare.utils.paths import resolve_store_path
+
+        monkeypatch.setenv("H2MARE_ROOT", str(tmp_path))
+        monkeypatch.setenv("STORE_ROOT", str(tmp_path / "from_env"))
+        s = Settings()
+        entry = {
+            "local_folder": "sst",
+            "source_vars": ["analysed_sst"],
+            "dataset_id_rep": "cmems-rep-sst",
+            "source": "cmems",
+            "archive_raw": False,
+            "pattern": r".*\.nc",
+            "store_root": str(tmp_path / "own_drive"),
+        }
+        cfg = msgspec.convert({"variables": {"sst": entry}, "secrets": {}}, AppConfig)
+        var_config = cfg.variables["sst"]
+
+        monkeypatch.setattr("h2mare.utils.paths.get_settings", lambda: s)
+
+        # Before the flag, the variable's own root wins over STORE_ROOT.
+        assert resolve_store_path(var_config, warn_if_missing=False) == (
+            tmp_path / "own_drive" / "sst"
+        )
+
+        s.override_store_root(tmp_path / "from_flag")
+
+        assert resolve_store_path(var_config, warn_if_missing=False) == (
+            tmp_path / "from_flag" / "sst"
+        )
+
+    def test_store_root_overridden_flag_tracks_the_source(self, tmp_path, monkeypatch):
+        """
+        The resolver has to tell "configured root" from "root this run was told
+        to use" — reading STORE_ROOT alone cannot distinguish them.
+        """
+        monkeypatch.setenv("H2MARE_ROOT", str(tmp_path))
+        monkeypatch.setenv("STORE_ROOT", str(tmp_path / "from_env"))
+        s = Settings()
+        assert s.store_root_overridden is False
+
+        s.override_store_root(tmp_path / "from_flag")
+
+        assert s.store_root_overridden is True
+
     def test_climatology_dir_follows_the_override(self, tmp_path, monkeypatch):
         monkeypatch.setenv("H2MARE_ROOT", str(tmp_path))
         monkeypatch.setenv("STORE_ROOT", str(tmp_path / "from_env"))

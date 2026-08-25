@@ -18,6 +18,7 @@ from h2mare.models import step_freq
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import DateRange
 from h2mare.utils.datetime_utils import end_of_day
+from h2mare.utils.paths import store_root_for
 from h2mare.utils.spatial import clip_land_data
 
 if TYPE_CHECKING:
@@ -84,7 +85,10 @@ def _compile_bathy(
     var_cfg = compiler.app_config.variables["bathy"]
     if var_cfg.data_file is None:
         raise ValueError("bathy config entry is missing required 'data_file' field")
-    data_path = compiler.remote_store_root / var_cfg.local_folder / var_cfg.data_file
+    # bathy is a plain NetCDF file rather than a catalogued store, so it cannot
+    # go through _catalog_for and has to resolve its own root the same way.
+    bathy_root = store_root_for(var_cfg, compiler.remote_store_root)
+    data_path = bathy_root / var_cfg.local_folder / var_cfg.data_file
     ds = xr.open_dataset(data_path).sel(
         lon=slice(compiler.bbox.xmin, compiler.bbox.xmax),
         lat=slice(compiler.bbox.ymin, compiler.bbox.ymax),
