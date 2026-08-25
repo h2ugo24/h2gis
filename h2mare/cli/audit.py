@@ -162,29 +162,26 @@ def audit(
         help="Variable key to audit (e.g. sst, fsle). Omit with --all.",
     ),
     all_vars: bool = typer.Option(
-        False, "--all", "-a", is_flag=True, help="Audit every configured variable."
+        False, "--all", "-a", help="Audit every configured variable."
     ),
     check_values: bool = typer.Option(
         False,
         "--values",
-        is_flag=True,
         help="Also report present-but-unusable slices (empty or single-valued). "
         "Reads data, so this is much slower than the axis check.",
     ),
     check_parquet: bool = typer.Option(
         False,
         "--parquet",
-        is_flag=True,
         help="Check the Parquet store for wholly-null columns, from footer "
         "statistics. Reads no data.",
     ),
     show_ok: bool = typer.Option(
-        False, "--show-ok", is_flag=True, help="List variables that passed too."
+        False, "--show-ok", help="List variables that passed too."
     ),
     show_known: bool = typer.Option(
         False,
         "--known",
-        is_flag=True,
         help="List the days excluded via each variable's known_gaps config "
         "entry, rather than only counting them.",
     ),

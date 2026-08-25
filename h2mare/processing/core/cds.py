@@ -3,10 +3,6 @@ Process downloaded CDS-ERA5 hourly grib data to daily means.
 
 """
 
-# Warnings raised:
-# RunTimeWarning: data has 0 and nan, a warning is emitted by NumPy (via np.divide) while Dask is evaluating a task
-# UserWarning: Zarr possible incmpatilibility outside Python ecosystem
-import warnings
 from typing import Optional
 
 import numpy as np
@@ -19,8 +15,6 @@ from h2mare.models import KeyVarConfigEntry, step_freq
 from h2mare.storage.xarray_helpers import rename_dims, unified_time_chunk
 from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.utils.spatial import clip_land_data
-
-warnings.filterwarnings("ignore")
 
 _EKMAN_P90_FILE = "cds_ekman-monthly-90thquantile_80W-10E-0N-70N_1998-2017.nc"
 _EKMAN_DOY_FILE = "cds_ekman-doy-mean_80W-10E-0N-70N_1998-2017.nc"
@@ -480,9 +474,13 @@ def compute_curl_and_ekman(
     f_grid = f_da.broadcast_like(ds[tx_name])
 
     ## Ekman pumping: w_E = curl / (rho_w * f)
-    # mask near equator to avoid blow-ups
+    # Mask near the equator to avoid blow-ups. The mask goes on the *denominator*
+    # rather than the result: dividing first and discarding after still evaluates
+    # curl/0 at lat=0, and dask raises that as a RuntimeWarning at compute time —
+    # far from this line, which is what a blanket warnings filter used to hide.
+    # Dividing by NaN yields NaN silently, so the values are identical.
     equator_mask = np.abs(f_grid["lat"]) < 2.0
-    ekman = xr.where(~equator_mask, curl_tau / (rho_w * f_grid), np.nan)
+    ekman = curl_tau / (rho_w * f_grid.where(~equator_mask))
 
     out = xr.Dataset({tx_name: tx, ty_name: ty, "ekman_pumping": ekman})
 

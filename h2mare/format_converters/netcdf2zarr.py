@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import re
 import time
-import warnings
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Literal, Optional
@@ -42,8 +41,6 @@ from h2mare.utils.datetime_utils import normalize_date
 from h2mare.utils.files_io import filter_raw_files, safe_move_files, safe_rmtree
 from h2mare.utils.paths import resolve_download_path
 from h2mare.validators import validate_file_period, validate_var_key
-
-warnings.filterwarnings("ignore")
 
 
 def _close_all(*datasets: Optional[xr.Dataset]) -> None:
@@ -954,9 +951,14 @@ class Netcdf2Zarr(BaseConverter):
 
         Returns:
             str: with year or year/month
+
+        The separator is a forward slash, which ``Path`` resolves to a nested
+        directory on every platform. It used to be a literal backslash, so on
+        POSIX ``store_root / "2021\\3"`` named a *single* directory containing
+        a backslash instead of ``2021/3``.
         """
         if isinstance(period, int):
             return str(period)
         elif isinstance(period, tuple) and len(period) == 2:
-            return rf"{str(period[0])}\{str(period[1])}"
+            return f"{period[0]}/{period[1]}"
         raise ValueError("Input must be a int or a 2-tuple of ints")

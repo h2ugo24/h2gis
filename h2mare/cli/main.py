@@ -70,25 +70,21 @@ def run(
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        is_flag=True,
         help="Plan the download and log tasks without fetching any data.",
     ),
     no_convert: bool = typer.Option(
         False,
         "--no-convert",
-        is_flag=True,
         help="Download raw files but skip Zarr conversion and compile.",
     ),
     no_compile: bool = typer.Option(
         False,
         "--no-compile",
-        is_flag=True,
         help="Skip the compile step (h2ds dataset merge) after Zarr conversion.",
     ),
     no_parquet: bool = typer.Option(
         False,
         "--no-parquet",
-        is_flag=True,
         help=(
             "Skip the Zarr → Parquet conversion step after compilation. "
             "Implied automatically by --no-compile and --no-convert."
@@ -97,13 +93,11 @@ def run(
     h2ds_zarr_backup: bool = typer.Option(
         False,
         "--h2ds-zarr-backup",
-        is_flag=True,
         help="Copy the compiled h2ds zarr files to the local backup store.",
     ),
     h2ds_parquet_backup: bool = typer.Option(
         False,
         "--h2ds-parquet-backup",
-        is_flag=True,
         help="Copy the h2ds Parquet output to the remote store.",
     ),
     h2ds_zarr_backup_dir: Optional[Path] = typer.Option(
