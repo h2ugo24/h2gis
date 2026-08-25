@@ -301,6 +301,55 @@ class TestBBox:
             BBox.from_dataframe({"lon": [1.0]}, lon_col="lon", lat_col="lat")
 
 
+class TestMissingBoundsAreRejected:
+    """
+    Regression: NaT and NaN passed every check these types make.
+
+    NaT is a datetime subclass, so it survives coercion, and every comparison
+    against NaT or NaN is False — so ``start > end`` and ``xmin >= xmax`` both
+    waved them through. An empty frame therefore produced a ``DateRange`` of
+    ``NaT to NaT`` or a ``BBox`` of all-NaN that presented as valid and
+    travelled on. The polars constructors already guarded against this; the
+    pandas ones and the bare constructors did not.
+    """
+
+    def test_daterange_rejects_nat_bounds(self):
+        with pytest.raises(ValueError, match="must be real dates"):
+            DateRange(pd.NaT, pd.NaT)
+
+    def test_daterange_from_pandas_rejects_empty(self):
+        df = pd.DataFrame({"time": pd.to_datetime([])})
+        with pytest.raises(ValueError, match="empty or all null"):
+            DateRange.from_pandas(df)
+
+    def test_daterange_from_polars_lazy_rejects_empty(self):
+        """The lazy twin raised an opaque TypeError instead of this message."""
+        lf = pl.DataFrame({"time": []}, schema={"time": pl.Datetime}).lazy()
+        with pytest.raises(ValueError, match="empty or all null"):
+            DateRange.from_polars_lazy(lf)
+
+    def test_bbox_rejects_nan_bounds(self):
+        with pytest.raises(ValueError, match="must be real numbers"):
+            BBox(float("nan"), float("nan"), float("nan"), float("nan"))
+
+    def test_bbox_from_pandas_rejects_empty(self):
+        df = pd.DataFrame({"lon": [], "lat": []})
+        with pytest.raises(ValueError, match="empty or all null"):
+            BBox.from_pandas(df, "lon", "lat")
+
+    def test_bbox_from_polars_lazy_rejects_empty(self):
+        lf = pl.DataFrame(
+            {"lon": [], "lat": []}, schema={"lon": pl.Float64, "lat": pl.Float64}
+        ).lazy()
+        with pytest.raises(ValueError, match="empty or all null"):
+            BBox.from_polars_lazy(lf, "lon", "lat")
+
+    def test_a_real_range_and_box_still_build(self):
+        """The guards must not reject ordinary values."""
+        assert DateRange("2021-01-01", "2021-12-31").start.year == 2021
+        assert BBox(-10, 30, 20, 50).area() == 600
+
+
 class TestDownloadTask:
     def test_repr(self):
         dr = DateRange("2020-01-01", "2020-12-31")
