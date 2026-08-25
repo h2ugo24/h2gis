@@ -126,7 +126,8 @@ extraction-chunked. See `docs/api/map_export.md`.
 Follows the global Git Workflow verbatim (see `~/.claude/CLAUDE.md`) — branches, PR-only merges,
 conventional commits, branch protection. Only these two are additional here:
 
-- Merging requires 3 green checks (`branch-name`, `commit-lint`, `quality`) **and** an up-to-date branch: `gh pr update-branch <#> --rebase`, wait for checks, then `gh pr merge <#> --merge --delete-branch`.
+- Merging requires 5 green checks on `dev` (`branch-name`, `commit-lint`, `quality`, `tests (3.12)`, `tests (3.13)`) **and** an up-to-date branch: `gh pr update-branch <#> --rebase`, wait for checks, then `gh pr merge <#> --merge --delete-branch`. `main` requires the same minus `branch-name`, which only runs for PRs into `dev`.
+- `typecheck (informational)` runs pyright but is not required — it reports the finding count so it cannot grow unnoticed. Promote it once that count reaches zero.
 - Bump `pyproject.toml` version + `uv lock` via a `chore/` PR into `dev` *before* the release PR.
 
 ## Coding Rules
