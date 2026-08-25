@@ -1363,9 +1363,34 @@ class Extractor:
                             f"Duplicate index values in '{var_key}' result — keeping first occurrence."
                         )
                         result = result[~result.index.duplicated(keep="first")]
+
+                    # A kill between the two checkpoint writes below leaves the
+                    # feather holding these columns while the sidecar still omits
+                    # the key, so the resume re-extracts and joins onto columns
+                    # already there — which pandas rejects, and the failure keeps
+                    # the checkpoint from being cleared, so every later run fails
+                    # identically. Dropping the stale copy makes re-extraction
+                    # idempotent. The caller's own input columns are left to
+                    # collide: overwriting those silently would be worse.
+                    stale = [
+                        c
+                        for c in result.columns
+                        if c in df_processed.columns and c not in self.data.columns
+                    ]
+                    if stale:
+                        logger.warning(
+                            f"'{var_key}' is already in the checkpoint but was not "
+                            f"recorded as done — the previous run was interrupted "
+                            f"mid-checkpoint. Replacing {stale} with the fresh values."
+                        )
+                        df_processed = df_processed.drop(columns=stale)
+
                     df_processed = df_processed.join(result)
 
-                    # Mark var_key as completed and save checkpoint atomically
+                    # Data first, then the key claiming it is there. Reversed, a
+                    # kill here would mark the var_key done with its columns
+                    # missing and the resume would skip it. This way the worst
+                    # case is repeated work, which the drop above absorbs.
                     completed_keys.add(var_key)
                     staging = tmp_path.with_suffix(".tmp")
                     df_processed.reset_index().to_feather(staging)
