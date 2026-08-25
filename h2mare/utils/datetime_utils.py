@@ -17,8 +17,20 @@ _LAST_INSTANT_OF_DAY = pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
 
 
 def normalize_date(date: DateLike) -> pd.Timestamp:
-    """Normalize a single date to a Timestamp at midnight."""
-    return pd.Timestamp(date).normalize()
+    """
+    Normalize a single date to a Timestamp at midnight.
+
+    Raises:
+        ValueError: If *date* is None, NaT, or anything else pandas reads as
+            missing. ``pd.Timestamp`` returns NaT for those, and NaT has no
+            ``.normalize()`` — so this used to surface as ``AttributeError:
+            'NaTType' object has no attribute 'normalize'``, which names
+            neither the argument nor the caller's mistake.
+    """
+    ts = pd.Timestamp(date)
+    if ts is pd.NaT:
+        raise ValueError(f"Not a usable date: {date!r}")
+    return cast(pd.Timestamp, ts).normalize()
 
 
 def end_of_day(date: DateLike) -> pd.Timestamp:
@@ -45,8 +57,11 @@ def normalize_dates(dates: DateLike | Sequence[DateLike]) -> list[pd.Timestamp]:
     re-check what came back (the old scalar-or-list return forced isinstance
     guards at every such call site).
     """
+    # Each element goes through normalize_date rather than being normalized
+    # inline, so one unusable entry in a list is reported the same way as a
+    # lone one instead of raising AttributeError on NaT.
     if isinstance(dates, (list, tuple)):
-        return [pd.Timestamp(d).normalize() for d in dates]
+        return [normalize_date(d) for d in dates]
     return [normalize_date(cast("DateLike", dates))]
 
 
