@@ -147,14 +147,12 @@ def catalog(
         False,
         "--all",
         "-a",
-        is_flag=True,
         help="Show catalog summary for all variables configured in config.yaml.",
     ),
     show_rows: bool = typer.Option(
         False,
         "--rows",
         "-r",
-        is_flag=True,
         help="Print individual catalog rows (filename, dataset, dates, timesteps).",
     ),
 ) -> None:

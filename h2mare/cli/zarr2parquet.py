@@ -105,7 +105,6 @@ def parquet(
     parquet_backup: bool = typer.Option(
         False,
         "--parquet-backup",
-        is_flag=True,
         help="Copy the Parquet output to the remote store.",
     ),
     parquet_backup_dir: Optional[Path] = typer.Option(

@@ -56,7 +56,6 @@ def compile(
     zarr_backup: bool = typer.Option(
         False,
         "--zarr-backup",
-        is_flag=True,
         help="Copy compiled zarr files to the local backup store after writing.",
     ),
     zarr_backup_dir: Optional[Path] = typer.Option(
