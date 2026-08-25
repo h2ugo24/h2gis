@@ -142,7 +142,13 @@ def run(
         )
         raise typer.Exit(code=1)
 
-    store_root = store_path or get_settings().STORE_ROOT
+    # Applied to settings rather than passed down, so every step resolves the
+    # same root — including the ones nothing threads an argument to. See
+    # Settings.override_store_root.
+    if store_path is not None:
+        get_settings().override_store_root(store_path)
+
+    store_root = get_settings().STORE_ROOT
     if store_root is None:
         typer.echo(
             "Error: STORE_ROOT is not set. Define it in .env or pass --store-path.",

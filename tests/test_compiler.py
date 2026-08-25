@@ -286,6 +286,32 @@ class TestGetH2dsVarEnd:
 # ---------------------------------------------------------------------------
 
 
+class TestCatalogsFollowTheStoreRoot:
+    """
+    Regression: the compiler's own catalogs resolved from settings rather than
+    from remote_store_root, so a run pointed at another root wrote h2ds to the
+    override while reading its sources from the configured root.
+    """
+
+    def test_output_and_source_catalogs_are_rooted_under_remote_store_root(
+        self, tmp_path
+    ):
+        with patch("h2mare.processing.compiler.ZarrCatalog") as MockCatalog:
+            c = Compiler(
+                var_key="h2ds",
+                app_config=_make_config(),
+                remote_store_root=tmp_path / "elsewhere",
+                local_store_root=tmp_path / "local",
+            )
+            c._catalog_for("sst", auto_refresh=False)
+
+        roots = [call.kwargs["store_root"] for call in MockCatalog.call_args_list]
+        assert roots == [
+            tmp_path / "elsewhere" / "h2ds",  # the compiled output
+            tmp_path / "elsewhere" / "sst",  # a source read
+        ]
+
+
 class TestHasOverlap:
     def test_returns_true_when_ranges_overlap(self, compiler):
         catalog = MagicMock()

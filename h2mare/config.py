@@ -97,6 +97,28 @@ class Settings:
             return Path(store_dir).resolve()
         return None
 
+    def override_store_root(self, store_root: Path) -> None:
+        """
+        Point ``STORE_ROOT`` somewhere else for the rest of this process.
+
+        Backs the ``--store-path`` flag. Every store location in h2mare is
+        resolved from this one value through ``resolve_store_path``, including
+        places nothing threads an argument to — the per-variable catalogs the
+        compiler opens, ``cds.get_previous_dates_da``, the eddies processor. So
+        the override is applied at the source rather than passed down: a flag
+        handed step by step reaches only the steps someone remembered to change,
+        which is exactly how ``--store-path`` came to relocate the download and
+        Parquet steps while convert and compile stayed on the configured root.
+
+        Call once, from a CLI entry point, before any work begins. The value is
+        a *root* holding one subdirectory per variable (``local_folder``), the
+        same shape ``STORE_ROOT`` has in ``.env`` — not a single store's path.
+        """
+        resolved = Path(store_root).resolve()
+        if self.STORE_ROOT != resolved:
+            logger.info(f"Store root overridden: {resolved}")
+        self.STORE_ROOT = resolved
+
     @property
     def CLIMATOLOGY_DIR(self) -> Path | None:
         if self.STORE_ROOT is None:
