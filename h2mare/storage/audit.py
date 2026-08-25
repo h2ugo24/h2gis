@@ -99,10 +99,6 @@ class VarAudit(NamedTuple):
         return len(self.known_gaps)
 
     @property
-    def n_missing_days(self) -> int:
-        return sum(len(g.missing) for g in self.gaps)
-
-    @property
     def ok(self) -> bool:
         return not (self.gaps or self.slices or self.errors)
 
