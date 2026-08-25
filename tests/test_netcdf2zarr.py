@@ -94,8 +94,17 @@ class TestResolveString:
     def test_integer_year_returns_string(self, converter):
         assert converter._resolve_string(2021) == "2021"
 
-    def test_tuple_returns_year_backslash_month(self, converter):
-        assert converter._resolve_string((2021, 3)) == r"2021\3"
+    def test_tuple_returns_year_slash_month(self, converter):
+        assert converter._resolve_string((2021, 3)) == "2021/3"
+
+    def test_tuple_resolves_to_nested_dirs_on_every_platform(self, converter, tmp_path):
+        # Regression: a literal backslash separator made this one directory
+        # named "2021\3" on POSIX instead of 2021/3, so archived raw files for a
+        # month-partitioned store landed in the wrong place off Windows.
+        resolved = tmp_path / converter._resolve_string((2021, 3))
+        assert resolved.parent.name == "2021"
+        assert resolved.name == "3"
+        assert resolved.relative_to(tmp_path).parts == ("2021", "3")
 
     def test_invalid_input_raises(self, converter):
         with pytest.raises((ValueError, TypeError)):
