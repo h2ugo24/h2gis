@@ -221,6 +221,16 @@ class ZarrReader:
                 data_vars="minimal",
                 coords="minimal",  # type: ignore[arg-type]
                 compat="override",
+                # Explicit, for the reason storage.py pins it on concat: xarray's
+                # default moves from "outer" to "exact". Here "exact" is also the
+                # behaviour this reader is built to give. The snap above unifies
+                # axes that differ by float noise, and anything coarser is a
+                # genuinely different grid that must raise — but under "outer" it
+                # does not: two grids 5 degrees apart union into a longer axis of
+                # near-duplicate points and the read succeeds with a coordinate
+                # axis that is not the grid. That is the silent corruption the
+                # snap exists to prevent, arriving by the other door.
+                join="exact",
                 chunks=chunks,
                 preprocess=lambda d: self._preprocess_dataset(
                     d, bbox, variables, reference
@@ -329,6 +339,16 @@ class ZarrReader:
                 data_vars="minimal",
                 coords="minimal",  # type: ignore[arg-type]
                 compat="override",
+                # Explicit, for the reason storage.py pins it on concat: xarray's
+                # default moves from "outer" to "exact". Here "exact" is also the
+                # behaviour this reader is built to give. The snap above unifies
+                # axes that differ by float noise, and anything coarser is a
+                # genuinely different grid that must raise — but under "outer" it
+                # does not: two grids 5 degrees apart union into a longer axis of
+                # near-duplicate points and the read succeeds with a coordinate
+                # axis that is not the grid. That is the silent corruption the
+                # snap exists to prevent, arriving by the other door.
+                join="exact",
                 chunks=chunks,
                 preprocess=lambda d: self._preprocess_dataset(
                     d, bbox, variables, reference
