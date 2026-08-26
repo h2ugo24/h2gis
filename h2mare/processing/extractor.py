@@ -27,7 +27,7 @@ from h2mare.storage.zarr_catalog import ZarrCatalog
 from h2mare.types import BBox, DateRange
 from h2mare.utils.datetime_utils import end_of_day
 from h2mare.utils.logging import configure_extraction_logging, log_time
-from h2mare.utils.paths import resolve_store_path
+from h2mare.utils.paths import store_root_for
 from h2mare.utils.spatial import sel_padded_bbox
 
 #: ``source`` marking the var_key that holds the compiled dataset, rather than
@@ -600,6 +600,20 @@ class Extractor:
         self.data = self._prepare_data(data_orig)
         self.data = self._resolve_time_col(self.data)
 
+    def _store_dir(self, var_config) -> Path:
+        """
+        This variable's own store directory under the root that applies to it.
+
+        ``self.store_root`` is a *root* holding one folder per variable, the
+        shape ``STORE_ROOT`` has in ``.env``, so it cannot be handed to a
+        catalog as-is — ``ZarrCatalog(store_root=...)`` means one store's exact
+        directory. It is also only the *default*: a variable naming its own
+        ``store_root`` in config.yaml is read from there, and ``--store-path``
+        outranks both. Same rule as ``PipelineManager._store_dir`` and
+        ``Compiler._catalog_for``.
+        """
+        return store_root_for(var_config, self.store_root) / var_config.local_folder
+
     # =================== DATA PREPARATION =====================
 
     def _resolve_time_col(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -883,7 +897,7 @@ class Extractor:
             # publishes live in the compiled store, not in its own.
             return self._extract_compiled(var_key, vars, var_cfg, n_workers)
 
-        vr_catalog = ZarrCatalog(var_key)
+        vr_catalog = ZarrCatalog(var_key, store_root=self._store_dir(var_cfg))
         dates_resolved = self._resolve_coverage(vr_catalog)
         data_resolved = self._subset_to_coverage(dates_resolved)
         bounds = self._define_bbox(data_resolved)
@@ -1033,7 +1047,12 @@ class Extractor:
         ``run()`` can route several var_keys here, so the catalog (and its index
         scan) is cached rather than rebuilt per var_key.
         """
-        return ZarrCatalog(self._compiled_var_key, app_config=self.app_config)
+        var_cfg = self.app_config.variables[self._compiled_var_key]
+        return ZarrCatalog(
+            self._compiled_var_key,
+            app_config=self.app_config,
+            store_root=self._store_dir(var_cfg),
+        )
 
     def _extract_compiled(
         self,
@@ -1621,7 +1640,7 @@ class Extractor:
         """
         vkey = "bathy"
         var_cfg = self.app_config.variables[vkey]
-        store_root = resolve_store_path(var_cfg)
+        store_root = self._store_dir(var_cfg)
 
         if self.input_type == "shp":
             if var_cfg.data_file_hires is None:

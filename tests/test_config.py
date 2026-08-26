@@ -292,6 +292,48 @@ class TestLoadAppConfig:
 
         assert any("subset" in m and "non-CMEMS" in m for m in messages)
 
+    def _warnings_for(self, tmp_path, monkeypatch, yaml_text: str) -> list[str]:
+        from loguru import logger
+
+        monkeypatch.setenv("H2MARE_ROOT", str(tmp_path))
+        monkeypatch.delenv("STORE_ROOT", raising=False)
+        (tmp_path / "config.yaml").write_text(yaml_text)
+        s = Settings()
+
+        messages: list[str] = []
+        sink_id = logger.add(messages.append, level="WARNING")
+        try:
+            s.load_app_config()
+        finally:
+            logger.remove(sink_id)
+        return messages
+
+    def test_unrecognised_per_variable_key_is_reported(self, tmp_path, monkeypatch):
+        """
+        msgspec drops unknown fields in silence, so a typo left the variable on
+        the default the author meant to override — invisibly. Only *top-level*
+        keys were checked.
+        """
+        typo_yaml = _MINIMAL_CONFIG_YAML.replace(
+            "    local_folder: sst\n",
+            "    local_folder: sst\n    store_roots: /mnt/typo\n",
+        )
+        messages = self._warnings_for(tmp_path, monkeypatch, typo_yaml)
+
+        assert any(
+            "sst" in m and "store_roots" in m and "unrecognised" in m for m in messages
+        )
+
+    def test_recognised_keys_are_not_reported(self, tmp_path, monkeypatch):
+        """The correctly-spelled field must not trip the same warning."""
+        ok_yaml = _MINIMAL_CONFIG_YAML.replace(
+            "    local_folder: sst\n",
+            "    local_folder: sst\n    store_root: /mnt/elsewhere\n",
+        )
+        messages = self._warnings_for(tmp_path, monkeypatch, ok_yaml)
+
+        assert not any("unrecognised key" in m for m in messages)
+
 
 # ---------------------------------------------------------------------------
 # get_var_info

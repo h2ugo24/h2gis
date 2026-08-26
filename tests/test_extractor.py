@@ -517,6 +517,9 @@ def _atm_config(*, hourly: bool = True) -> SimpleNamespace:
         time_step=TimeStep.HOURLY if hourly else TimeStep.DAILY,
         extract_depth_slices=None,
         rename_lonlat=False,
+        # Required on a real config entry, and read when resolving the store.
+        local_folder="CDS_AtmAccumAvg",
+        store_root=None,
         source="cds",
     )
 
@@ -533,6 +536,8 @@ def _h2ds_config() -> SimpleNamespace:
         extract_depth_slices=None,
         rename_lonlat=False,
         source="h2mare",
+        local_folder="h2ds",
+        store_root=None,
     )
 
 
@@ -833,6 +838,8 @@ class TestProcessSingleVarkeyRouting:
             time_step=TimeStep.DAILY,
             extract_depth_slices=None,
             rename_lonlat=False,
+            local_folder="CDS_AtmAccumAvg",
+            store_root=None,
         )
         seen = self._patch_catalogs(monkeypatch, self._h2ds()[["tp"]], self._h2ds())
         ext = self._extractor_for(cfg, ["2020-01-01", "2020-01-02"])
@@ -901,6 +908,92 @@ class TestProcessSingleVarkeyRouting:
             ext.process_single_varkey("atm-accum-avg")
 
 
+class TestStoreRootReachesTheReads:
+    """
+    Regression: ``Extractor`` captured ``store_root`` in __init__ and then never
+    used it. All three read paths built a rootless ``ZarrCatalog``, so they
+    resolved from settings and passing a root changed nothing about which files
+    were opened — silently, since the store that answered was a real one.
+    """
+
+    _R = TestProcessSingleVarkeyRouting
+
+    def _patch_recording_roots(self, monkeypatch) -> dict:
+        """Route ZarrCatalog anywhere, recording the store_root each was given."""
+        roots: dict = {}
+
+        def _factory(var_key, **kw):
+            roots[var_key] = kw.get("store_root")
+            catalog = MagicMock()
+            catalog.var_key = var_key
+            catalog.get_time_coverage.return_value = DateRange(
+                pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05")
+            )
+            catalog.get_bbox.return_value = BBox(-20.0, 30.0, 20.0, 50.0)
+            catalog.open_dataset.return_value = (
+                self._R._h2ds()
+                if var_key == "h2ds"
+                else self._R._h2ds()[["tp"]]  # a daily native store
+            )
+            return catalog
+
+        monkeypatch.setattr(extractor_module, "ZarrCatalog", _factory)
+        return roots
+
+    def _extractor_for(self, cfg, **kwargs) -> Extractor:
+        df = pd.DataFrame(
+            {
+                "time": ["2020-01-01", "2020-01-02"],
+                "lon": [-9.0, -1.0],
+                "lat": [31.0, 39.0],
+            }
+        )
+        ext = _extractor(df, time_col="time", **kwargs)
+        ext.app_config = SimpleNamespace(
+            variables={"atm-accum-avg": cfg, "h2ds": _h2ds_config()}
+        )
+        return ext
+
+    def _daily_cfg(self, **over) -> SimpleNamespace:
+        cfg = _atm_config(hourly=False)
+        cfg.compiled_vars = ["tp"]
+        for k, v in over.items():
+            setattr(cfg, k, v)
+        return cfg
+
+    def test_native_read_uses_the_given_root(self, monkeypatch, tmp_path):
+        roots = self._patch_recording_roots(monkeypatch)
+        ext = self._extractor_for(self._daily_cfg(), store_root=tmp_path)
+
+        ext.process_single_varkey("atm-accum-avg")
+
+        assert roots["atm-accum-avg"] == tmp_path / "CDS_AtmAccumAvg"
+
+    def test_compiled_read_uses_the_given_root(self, monkeypatch, tmp_path):
+        roots = self._patch_recording_roots(monkeypatch)
+        # An hourly var_key with a date-only input routes to the compiled store.
+        ext = self._extractor_for(_atm_config(), store_root=tmp_path)
+
+        ext.process_single_varkey("atm-accum-avg")
+
+        assert roots["h2ds"] == tmp_path / "h2ds"
+
+    def test_a_variables_own_root_beats_the_extractors(self, monkeypatch, tmp_path):
+        """
+        The Extractor's root is the default, the same rule PipelineManager and
+        Compiler follow — a variable naming its own is read from there.
+        """
+        own = tmp_path / "other_drive"
+        roots = self._patch_recording_roots(monkeypatch)
+        ext = self._extractor_for(
+            self._daily_cfg(store_root=str(own)), store_root=tmp_path
+        )
+
+        ext.process_single_varkey("atm-accum-avg")
+
+        assert roots["atm-accum-avg"] == own / "CDS_AtmAccumAvg"
+
+
 class TestPinnedReadFrom:
     """read_from overrides the inference, in both directions."""
 
@@ -955,6 +1048,8 @@ class TestPinnedReadFrom:
             extract_depth_slices=None,
             rename_lonlat=False,
             source="cmems",
+            local_folder="CDS_AtmAccumAvg",
+            store_root=None,
         )
         seen = self._R()._patch_catalogs(
             monkeypatch, self._R._hourly_ds(), self._R._h2ds()
@@ -1079,6 +1174,8 @@ def _depth_config(
         time_step=TimeStep.DAILY,
         rename_lonlat=False,
         source="cmems",
+        local_folder="CMEMS_Thetao",
+        store_root=None,
     )
 
 

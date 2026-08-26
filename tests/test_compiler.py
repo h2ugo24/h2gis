@@ -311,6 +311,28 @@ class TestCatalogsFollowTheStoreRoot:
             tmp_path / "elsewhere" / "sst",  # a source read
         ]
 
+    def test_source_coverage_is_read_from_the_same_root_as_the_data(self, tmp_path):
+        """
+        Regression: _compute_source_coverage called the module-level
+        get_store_coverage, which builds a rootless ZarrCatalog and resolves
+        from settings. The compile *window* was therefore computed from a
+        different root than the data was *read* from, and the mismatch only
+        ever surfaced as "No source coverage found — skipping".
+        """
+        with patch("h2mare.processing.compiler.ZarrCatalog") as MockCatalog:
+            c = Compiler(
+                var_key="h2ds",
+                app_config=_make_config(),
+                remote_store_root=tmp_path / "elsewhere",
+                local_store_root=tmp_path / "local",
+            )
+            MockCatalog.reset_mock()
+            c.var_keys = ["sst"]
+            c._compute_source_coverage()
+
+        roots = [call.kwargs["store_root"] for call in MockCatalog.call_args_list]
+        assert roots == [tmp_path / "elsewhere" / "sst"]
+
     def test_a_source_variable_is_read_from_its_own_store_root(self, tmp_path):
         """
         remote_store_root is the default, not the answer. A source naming its

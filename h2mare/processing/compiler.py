@@ -17,7 +17,6 @@ from loguru import logger
 from h2mare.config import AppConfig, get_settings
 from h2mare.models import SYSTEM_VAR_KEYS
 from h2mare.storage.coverage import (
-    get_store_coverage,
     resolve_date_range,
     split_time_range,
 )
@@ -308,17 +307,47 @@ class Compiler:
 
     # =========== DATE RANGE RESOLUTION ===========
     def _compute_source_coverage(self) -> dict[str, DateRange]:
-        """Return source catalog coverage for every non-system source variable."""
+        """
+        Return source catalog coverage for every non-system source variable.
+
+        Read through this compiler's own catalogs. The module-level
+        ``get_store_coverage`` builds a rootless ``ZarrCatalog``, resolving from
+        settings alone, so the compile *window* was computed from a different
+        root than the data was *read* from whenever the two disagreed — a
+        ``remote_store_root`` passed in, or a variable naming its own
+        ``store_root``. The mismatch never raised: it surfaced as "No source
+        coverage found — skipping", dropping a variable from the compile with a
+        warning that reads like an empty store.
+        """
         result: dict[str, DateRange] = {}
         for vkey in self.var_keys:
             if vkey == self.var_key or vkey in SYSTEM_VAR_KEYS:
                 continue
-            cov = get_store_coverage(vkey)
+            cov = self._read_source_coverage(vkey)
             if cov is not None:
                 result[vkey] = cov
             else:
                 logger.warning(f"No source coverage found for '{vkey}' — skipping.")
         return result
+
+    def _read_source_coverage(self, var_key: str) -> Optional[DateRange]:
+        """
+        Coverage of *var_key*'s own store, or None when it cannot be read.
+
+        Named apart from the ``_source_coverage`` dict this feeds — an instance
+        attribute of that name would otherwise shadow the method.
+
+        Shares ``_catalog_cache`` with the compile loop, so the scan this does
+        is the one that loop would have done anyway.
+        """
+        try:
+            catalog = self._catalog_cache.setdefault(
+                var_key, self._catalog_for(var_key, auto_refresh=False)
+            )
+            return catalog.get_time_coverage()
+        except Exception as e:
+            logger.warning(f"Could not read store coverage for '{var_key}': {e}")
+            return None
 
     def _h2ds_nonnull_ends(self) -> dict[str, pd.Timestamp]:
         """
