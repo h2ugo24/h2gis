@@ -49,6 +49,11 @@ class Settings:
 
         # External Storage (where all data lives)
         self.STORE_ROOT = self._get_store_dir()
+        # Whether STORE_ROOT was set by --store-path rather than read from .env.
+        # A variable may name its own root in config.yaml, and that root beats
+        # the configured STORE_ROOT — but not an operator who explicitly asked
+        # this run to go somewhere else. See utils.paths.store_root_for.
+        self._store_root_overridden = False
 
         # No directories are created here: Settings() runs on any import, and
         # BASE_DIR may be a directory that merely contains a config.yaml. Writers
@@ -113,11 +118,25 @@ class Settings:
         Call once, from a CLI entry point, before any work begins. The value is
         a *root* holding one subdirectory per variable (``local_folder``), the
         same shape ``STORE_ROOT`` has in ``.env`` — not a single store's path.
+
+        It also outranks a per-variable ``store_root`` from ``config.yaml``:
+        relocating a run is something an operator asks for deliberately, and a
+        flag that moved only the variables which had not opted out would be a
+        partial relocation nobody could reason about. That is why the override
+        is recorded as such rather than just written into ``STORE_ROOT`` — the
+        resolver has to tell "the configured root" apart from "the root this
+        run was told to use".
         """
         resolved = Path(store_root).resolve()
         if self.STORE_ROOT != resolved:
             logger.info(f"Store root overridden: {resolved}")
         self.STORE_ROOT = resolved
+        self._store_root_overridden = True
+
+    @property
+    def store_root_overridden(self) -> bool:
+        """True when ``STORE_ROOT`` came from ``--store-path``, not from ``.env``."""
+        return self._store_root_overridden
 
     @property
     def CLIMATOLOGY_DIR(self) -> Path | None:

@@ -14,6 +14,7 @@ Each key under `variables:` defines one data stream:
 variables:
   sst:
     local_folder: CMEMS_SST           # subdirectory under STORE_ROOT
+    store_root: /mnt/fast_ssd         # optional: this variable's own root
     source_vars: [analysed_sst, ...]  # variable names inside the source file
     dataset_id_rep: <cmems-id>        # reprocessed (multiyear) dataset ID
     dataset_id_nrt: <cmems-id>        # near-real-time dataset ID (optional)
@@ -40,7 +41,8 @@ either on an existing variable means re-converting it.
 
 | Field | Required | Description |
 |---|---|---|
-| `local_folder` | yes | Subdirectory under `STORE_ROOT` for this variable's Zarr files |
+| `local_folder` | yes | Subdirectory under `STORE_ROOT` (or `store_root`) for this variable's Zarr files |
+| `store_root` | no | Root holding this variable's `local_folder`, for stores that should not live under `STORE_ROOT` — e.g. the hourly ERA5 stores on one drive and the CMEMS dailies on another. Must be absolute (either `/data/store` or `D:\Data`; a relative path is rejected at config load because it would resolve against the current working directory). Defaults to `STORE_ROOT`. See [Where a variable's store lives](#where-a-variables-store-lives). |
 | `source_vars` | yes | Variable names to extract from source files |
 | `dataset_id_rep` | yes | Reprocessed dataset identifier |
 | `dataset_id_nrt` | no | Near-real-time dataset identifier. Omit for reanalysis-only products |
@@ -218,11 +220,46 @@ distance above *the surface*, not above the geoid.
 
 ---
 
+## Where a variable's store lives
+
+A variable's Zarr store is `<root>/<local_folder>/`. The root is chosen in this
+order, first match winning:
+
+1. `--store-path` on the command line — relocates the **whole run**, including
+   variables that name a root of their own.
+2. `store_root` in that variable's `config.yaml` entry.
+3. `STORE_ROOT` from `.env`.
+4. `data/processed/zarr/` under the project root, when `STORE_ROOT` is unset.
+
+Declaring nothing keeps the historical behaviour: every variable sits under
+`STORE_ROOT`. Spreading variables across drives is a matter of adding
+`store_root` to the entries that should move:
+
+```yaml
+variables:
+  sst:
+    local_folder: CMEMS_SST         # -> $STORE_ROOT/CMEMS_SST
+  radiation:
+    local_folder: CDS_Radiation
+    store_root: /mnt/bulk           # -> /mnt/bulk/CDS_Radiation
+```
+
+Only the Zarr stores follow this setting. Downloads stay under the project's
+`data/raw/`, and the Parquet store and `Climatology/` remain single shared trees
+under `STORE_ROOT` — they are not per-variable.
+
+Moving an existing store is a file move plus a config edit; nothing rewrites the
+data. The catalog sidecar under `data/processed/metadata/` still points at the
+old location, but it is detected as belonging to another root and rebuilt on the
+next read, so it does not need deleting by hand.
+
+---
+
 ## .env
 
 | Variable | Required | Description |
 |---|---|---|
-| `STORE_ROOT` | yes | Root path for Zarr output (can be an external drive) |
+| `STORE_ROOT` | yes* | Root path for Zarr output (can be an external drive). *Required unless every variable declares its own `store_root` in `config.yaml`; it is the root for those that do not. |
 | `H2MARE_ROOT` | no | Directory containing `config.yaml` and `.env`. Overrides the default auto-detection (walking up from the current working directory). Set it when running `h2mare` from an unrelated directory or when another project imports h2mare. See [Installation](installation.md#where-to-place-these-files). |
 | `CMEMS_USERNAME` | CMEMS only | Copernicus Marine account username |
 | `CMEMS_PASSWORD` | CMEMS only | Copernicus Marine account password |
@@ -236,7 +273,7 @@ CDS / ERA5 credentials are handled by the `cdsapi` package and stored in `~/.cds
 
 ## Adding a new variable
 
-1. Add an entry under `variables:` in `config.yaml` with the correct `source`, `dataset_id_rep`, and `local_folder`.
+1. Add an entry under `variables:` in `config.yaml` with the correct `source`, `dataset_id_rep`, and `local_folder`. Add `store_root` only if this variable's store should not sit under `STORE_ROOT` — see [Where a variable's store lives](#where-a-variables-store-lives).
 2. Add `variable_attrs` entries for each output variable name (used to set metadata in the Zarr stores). See [Variable metadata](#variable-metadata) for what each key must contain — `units` has to parse under udunits2 and any `standard_name` has to exist in the CF table.
 3. If the variable is a CDS/ERA5 accumulated or averaged product (GRIB files with a `time × step` structure), set `merge_time_step: true` in its config entry.
 4. If each downloaded file covers a date range encoded in its filename as two groups (e.g. `2021-01-01-2021-01-31.nc`), set `filename_date_range: true` and make the second group optional so a one-day download still parses. Leave it unset for variables whose filenames encode a single date (e.g. AVISO FSLE).

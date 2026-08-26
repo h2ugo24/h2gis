@@ -47,7 +47,7 @@ Extractor(
 | `lon_col` | `"lon"` | Longitude column name (CSV/point input only). |
 | `lat_col` | `"lat"` | Latitude column name (CSV/point input only). |
 | `app_config` | `settings.app_config` | Override the application configuration (variable registry, depth slices, etc.). |
-| `store_root` | `STORE_ROOT` | Root directory of the Zarr stores. |
+| `store_root` | `STORE_ROOT` | Root directory of the Zarr stores. Each `var_key` is read from its own `store_root` where `config.yaml` declares one; see [Where a variable's store lives](../configuration.md#where-a-variables-store-lives). |
 | `crs` | `4326` | EPSG code that geometries are reprojected to (SHP/geometry input only). |
 | `time_cadence` | `"auto"` | How `time_col` is read: `"daily"` truncates to midnight, `"hourly"` keeps the precision, `"auto"` infers. See [Cadence](#cadence). |
 | `read_from` | `"auto"` | Which store each `var_key` is read from: its own Zarr (`"native"`), the compiled h2ds (`"compiled"`), or per-`var_key` (`"auto"`). See [Cadence](#cadence). |

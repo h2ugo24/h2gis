@@ -311,6 +311,39 @@ class TestCatalogsFollowTheStoreRoot:
             tmp_path / "elsewhere" / "sst",  # a source read
         ]
 
+    def test_a_source_variable_is_read_from_its_own_store_root(self, tmp_path):
+        """
+        remote_store_root is the default, not the answer. A source naming its
+        own root has to be read from where it actually lives, or the compile
+        would silently merge nothing for it.
+        """
+        own = tmp_path / "other_drive"
+        cfg = msgspec.convert(
+            {
+                "variables": {
+                    "h2ds": _H2DS_ENTRY,
+                    "sst": {**_SST_ENTRY, "store_root": str(own)},
+                },
+                "secrets": {},
+            },
+            AppConfig,
+        )
+
+        with patch("h2mare.processing.compiler.ZarrCatalog") as MockCatalog:
+            c = Compiler(
+                var_key="h2ds",
+                app_config=cfg,
+                remote_store_root=tmp_path / "elsewhere",
+                local_store_root=tmp_path / "local",
+            )
+            c._catalog_for("sst", auto_refresh=False)
+
+        roots = [call.kwargs["store_root"] for call in MockCatalog.call_args_list]
+        assert roots == [
+            tmp_path / "elsewhere" / "h2ds",  # h2ds names no root — unchanged
+            own / "sst",  # sst is read where it lives
+        ]
+
 
 class TestHasOverlap:
     def test_returns_true_when_ranges_overlap(self, compiler):

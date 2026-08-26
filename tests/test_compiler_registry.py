@@ -126,6 +126,10 @@ class TestCompileBathy:
         bathy_cfg = MagicMock()
         bathy_cfg.data_file = "bathy.nc"
         bathy_cfg.local_folder = "bathy"
+        # A MagicMock invents any attribute asked of it, so this has to be set
+        # explicitly: without it bathy would appear to declare a store_root of
+        # its own and resolve under a mock instead of remote_store_root.
+        bathy_cfg.store_root = None
         compiler.app_config.variables["bathy"] = bathy_cfg
 
         fake_ds = _daily_ds("elevation", _DATES).isel(time=0).drop_vars("time")

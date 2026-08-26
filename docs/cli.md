@@ -17,7 +17,7 @@ uv run h2mare run [OPTIONS]
 | `-v, --vars` | text (repeatable) | all keys | Variable key(s) to process |
 | `--start-date` | YYYY-MM-DD | inferred | Start of date range. Must be paired with `--end-date` |
 | `--end-date` | YYYY-MM-DD | inferred | End of date range. Must be paired with `--start-date` |
-| `--store-path` | path | `STORE_ROOT` | Override the Zarr store root |
+| `--store-path` | path | `STORE_ROOT` | Override the Zarr store root for the whole run, including variables that declare their own `store_root` in `config.yaml` |
 | `--no-convert` | flag | false | Download raw files only; skip Zarr conversion and compile |
 | `--no-compile` | flag | false | Convert to Zarr but skip the h2ds compile step |
 | `--no-parquet` | flag | false | Skip the Zarr → Parquet conversion step |
@@ -74,7 +74,7 @@ uv run h2mare compile [OPTIONS]
 | `-v, --vars` | text (repeatable) | all keys | Variable key(s) to include |
 | `--start-date` | YYYY-MM-DD | inferred | Start of date range |
 | `--end-date` | YYYY-MM-DD | inferred | End of date range |
-| `--store-path` | path | `STORE_ROOT` | Override the Zarr store root |
+| `--store-path` | path | `STORE_ROOT` | Override the Zarr store root for the whole run, including variables that declare their own `store_root` in `config.yaml` |
 | `--zarr-backup` | flag | false | Copy compiled Zarr files to the local backup store |
 | `--zarr-backup-dir` | path | `local_store_root` | Override destination for the Zarr backup (only used with `--zarr-backup`) |
 
@@ -145,7 +145,7 @@ uv run h2mare parquet [OPTIONS]
 | `--start-date` | YYYY-MM-DD | inferred | Start of date range |
 | `--end-date` | YYYY-MM-DD | inferred | End of date range |
 | `--out-dir` | path | `PARQUET_DIR` | Root directory for Parquet output |
-| `--store-path` | path | `STORE_ROOT` | Override the Zarr store root |
+| `--store-path` | path | `STORE_ROOT` | Override the Zarr store root for the whole run, including variables that declare their own `store_root` in `config.yaml` |
 | `--depth` | float | — | Depth level in metres for depth-aware variables (e.g. `thetao`, `o2`) |
 | `--parquet-backup` | flag | false | Copy the Parquet output to the remote store |
 | `--parquet-backup-dir` | path | `STORE_ROOT/parquet` | Override destination for the Parquet backup (only used with `--parquet-backup`) |

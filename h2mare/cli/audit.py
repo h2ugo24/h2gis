@@ -311,8 +311,9 @@ def audit(
             typer.echo(
                 "  A key variable that could not be checked counts as a "
                 "finding: an absent or unreadable store is not a store that "
-                "passed. Check STORE_ROOT points at the right drive and that "
-                "it is mounted."
+                "passed. Check the root printed for each one above points at "
+                "the right drive and that it is mounted — a variable's own "
+                "store_root where it sets one, STORE_ROOT otherwise."
             )
         if n_gaps:
             typer.echo(

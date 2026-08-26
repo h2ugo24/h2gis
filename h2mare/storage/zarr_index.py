@@ -119,6 +119,31 @@ class ZarrIndex:
             logger.error(f"Failed to load catalog: {e}")
             return pd.DataFrame()
 
+    def _catalogs_another_root(self, df: pd.DataFrame) -> bool:
+        """
+        True when *df* lists files that do not sit directly under this store root.
+
+        The sidecar is named for the ``var_key`` alone and lives under the
+        project's ``METADATA_DIR``, so nothing ties it to the root it was built
+        from. Repoint a variable — add a per-variable ``store_root`` to
+        config.yaml, or pass ``--store-path`` — and the catalog left behind
+        still holds the *previous* root's absolute paths.
+
+        The ordinary staleness check cannot catch that. ``has_changes()``
+        swallows the scanner's ``FileNotFoundError`` and reports False, and the
+        disk-vs-catalog comparison below is gated on ``store_root.exists()``, so
+        a root that is unmounted or not yet created would quietly serve the old
+        location's files. Comparing the recorded parent against the current root
+        is what makes the move visible.
+        """
+        if df.empty or "path" not in df.columns:
+            return False
+
+        root = self.store_root.resolve()
+        # The scanner only ever records files it globbed directly in the root,
+        # so parent equality is the exact invariant — not mere containment.
+        return any(Path(p).resolve().parent != root for p in df["path"].unique())
+
     def _scan_and_build(self) -> pd.DataFrame:
         """Scan zarr files via the scanner and build a fresh catalog DataFrame."""
         self._log("info", f"Scanning {self.store_root}")
@@ -175,7 +200,14 @@ class ZarrIndex:
             self._df_cache = self._scan_and_build()
         elif self._df_cache is None:
             self._df_cache = self._load_from_disk()
-            if self.store_root.exists():
+            if self._catalogs_another_root(self._df_cache):
+                self._log(
+                    "debug",
+                    f"[{self.var_key}] Catalog was built for a different store root "
+                    f"— rescanning {self.store_root}",
+                )
+                self._df_cache = self._scan_and_build()
+            elif self.store_root.exists():
                 if self._df_cache.empty:
                     self._log("debug", "No catalog file found, performing initial scan")
                     self._df_cache = self._scan_and_build()
