@@ -260,14 +260,12 @@ next read, so it does not need deleting by hand.
 | Variable | Required | Description |
 |---|---|---|
 | `STORE_ROOT` | yes* | Root path for Zarr output (can be an external drive). *Required unless every variable declares its own `store_root` in `config.yaml`; it is the root for those that do not. |
-| `H2MARE_ROOT` | no | Directory containing `config.yaml` and `.env`. Overrides the default auto-detection (walking up from the current working directory). Set it when running `h2mare` from an unrelated directory or when another project imports h2mare. See [Installation](installation.md#where-to-place-these-files). |
-| `CMEMS_USERNAME` | CMEMS only | Copernicus Marine account username |
-| `CMEMS_PASSWORD` | CMEMS only | Copernicus Marine account password |
+| `H2MARE_ROOT` | no | The project root. `data/` (raw, interim, processed) and `logs/` hang off it, and `config.yaml` / `.env` are read from it by default — so pointing it elsewhere moves the whole data tree, not just the config. Distinct from `STORE_ROOT`, which only locates the per-variable Zarr stores. Overrides the default auto-detection (walking up from the current working directory looking for `config.yaml`); the path is taken as given, so no `config.yaml` need exist there. Must be a real environment variable — the root is resolved before `.env` is loaded, so setting it inside `.env` has no effect. See [Installation](installation.md#where-to-place-these-files). |
 | `AVISO_USERNAME` | AVISO only | AVISO account username |
 | `AVISO_PASSWORD` | AVISO only | AVISO account password |
 | `AVISO_FTP_SERVER` | AVISO only | FTP server hostname |
 
-CDS / ERA5 credentials are handled by the `cdsapi` package and stored in `~/.cdsapirc`.
+CMEMS credentials take no env var: the `copernicusmarine` CLI stores them itself (`copernicusmarine login`) and h2mare reads none. CDS / ERA5 credentials are handled by the `cdsapi` package and stored in `~/.cdsapirc`.
 
 ---
 
