@@ -16,7 +16,11 @@ import pandas as pd
 import pytest
 import xarray as xr
 
-from h2mare.storage.zarr_reader import ZarrReader, snap_axes_to_reference
+from h2mare.storage.zarr_reader import (
+    AXIS_SNAP_TOL,
+    ZarrReader,
+    snap_axes_to_reference,
+)
 from h2mare.types import BBox
 
 
@@ -232,6 +236,63 @@ class TestSnapAxesToReference:
         assert set(snapped) == {"lon"}
 
 
+class TestDepthIsSnappedToo:
+    """
+    The o2 store's 2023+ files label the same 46 CMEMS levels up to 6.1e-05 m
+    away from the older files — one float32 ULP at ~900 m, a relabel and not a
+    regrid. Reading the store whole failed with "cannot align objects with
+    join='exact' ... 'depth'", because depth is not the axis being concatenated
+    along, so the mismatch surfaced as an alignment failure rather than as the
+    monotonicity complaint lat/lon give.
+
+    depth is metres while lat/lon are degrees, which is why the tolerance is
+    per coordinate: the degrees limit (1e-9) rejects this by six orders of
+    magnitude.
+    """
+
+    #: Levels 36-38 of the real o2 axis, in both of the store's spellings.
+    OLD = np.array([846.7606201171875, 894.9822387695312, 947.4478759765625])
+    NEW = np.array([846.7606201171875, 894.9822998046875, 947.4478149414062])
+
+    @staticmethod
+    def _ds_with_depth(depths) -> xr.Dataset:
+        return xr.Dataset(
+            {"o2": (("depth",), np.arange(len(depths), dtype=float))},
+            coords={"depth": np.asarray(depths, dtype=float)},
+        )
+
+    def test_the_real_o2_drift_is_snapped(self):
+        out, snapped = snap_axes_to_reference(
+            self._ds_with_depth(self.NEW), {"depth": self.OLD}
+        )
+
+        assert set(snapped) == {"depth"}
+        assert snapped["depth"] == pytest.approx(6.1e-05, rel=0.05)
+        np.testing.assert_array_equal(out.depth.values, self.OLD)
+
+    def test_a_genuinely_different_level_is_refused(self):
+        """A metre is a different level, not a relabel — it must still raise."""
+        shifted = self.OLD + 1.0
+
+        out, snapped = snap_axes_to_reference(
+            self._ds_with_depth(shifted), {"depth": self.OLD}
+        )
+
+        assert snapped == {}
+        np.testing.assert_array_equal(out.depth.values, shifted)
+
+    def test_the_degrees_tolerance_would_have_refused_it(self):
+        """Pins why the tolerance had to become per coordinate."""
+        _, snapped = snap_axes_to_reference(
+            self._ds_with_depth(self.NEW), {"depth": self.OLD}, tol=AXIS_SNAP_TOL["lon"]
+        )
+
+        assert snapped == {}
+
+    def test_depth_is_one_of_the_axes_the_reader_collects(self):
+        assert "depth" in AXIS_SNAP_TOL
+
+
 class TestDriftedStoreIsReadable:
     """
     Regression, end to end through xarray: two files whose axes differ only by
@@ -326,3 +387,158 @@ class TestDriftedStoreIsReadable:
     def test_reference_axes_survives_an_unreadable_path(self):
         """Advisory only — a failure here must fall back, not break the read."""
         assert ZarrReader._reference_axes(["/no/such/a.zarr", "/no/such/b.zarr"]) == {}
+
+
+def _ds_depth(times, depths, variables=("o2",)) -> xr.Dataset:
+    """time × depth dataset, standing in for a depth-resolved store."""
+    index = pd.DatetimeIndex(times)
+    shape = (len(index), len(depths))
+    size = int(np.prod(shape))
+    return xr.Dataset(
+        {
+            v: (("time", "depth"), np.arange(size, dtype=float).reshape(shape))
+            for v in variables
+        },
+        coords={"time": index, "depth": np.asarray(depths, dtype=float)},
+    )
+
+
+class TestDepthDriftedStoreIsReadable:
+    """
+    Regression, end to end: the o2 store, whose 2023+ files label the same 46
+    CMEMS levels one float32 ULP away from the older ones. Reading it whole
+    raised "cannot align objects with join='exact' ... 'depth'" — depth is not
+    the concat axis, so the mismatch reached alignment rather than the
+    monotonicity check lat/lon drift trips.
+    """
+
+    _DATES = ["2021-01-01", "2021-01-02", "2021-01-03", "2021-01-04"]
+    _OLD = TestDepthIsSnappedToo.OLD
+    _NEW = TestDepthIsSnappedToo.NEW
+
+    def _write_pair(self, tmp_path, second_depths):
+        a = _ds_depth(self._DATES[:2], self._OLD)
+        b = _ds_depth(self._DATES[2:], second_depths)
+        pa, pb = tmp_path / "a.zarr", tmp_path / "b.zarr"
+        a.to_zarr(pa)
+        b.to_zarr(pb)
+        return [str(pa), str(pb)]
+
+    def _open(self, paths):
+        index = MagicMock()
+        index.var_key = "o2"
+        index.map_dates_to_paths.return_value = {
+            p: [pd.Timestamp(d) for d in self._DATES] for p in paths
+        }
+        return ZarrReader(index).open_dataset(dates=self._DATES)
+
+    def test_ulp_drifted_depth_files_combine(self, tmp_path):
+        paths = self._write_pair(tmp_path, self._NEW)
+
+        with self._open(paths) as ds:
+            assert ds.sizes["time"] == 4
+            assert ds.sizes["depth"] == 3  # one axis, not two concatenated
+            np.testing.assert_array_equal(ds.depth.values, self._OLD)
+
+    def test_the_same_files_are_refused_without_the_snap(self, tmp_path):
+        """Pins what the snap buys: this is the failure the o2 read hit."""
+        paths = self._write_pair(tmp_path, self._NEW)
+
+        with patch.object(ZarrReader, "_reference_axes", staticmethod(lambda _: {})):
+            with pytest.raises(RuntimeError, match="(?i)align|monotonic"):
+                self._open(paths).close()
+
+    def test_a_genuinely_different_level_is_refused_even_with_the_snap(self, tmp_path):
+        paths = self._write_pair(tmp_path, self._OLD + 1.0)
+
+        with pytest.raises(RuntimeError, match="(?i)align|monotonic"):
+            self._open(paths).close()
+
+
+class TestRaggedVariableSetsAreReadable:
+    """
+    Regression, end to end: h2ds is ragged by design — ``run -v X`` compiles
+    only X's columns, and a source that does not reach the current year yet
+    leaves that year's file short. combine_by_coords groups datasets *by their
+    set of data variables* before combining anything, so the store arrived at
+    the final merge as two cubes covering different periods and join="exact"
+    refused to align them: "cannot align objects ... (dimensions): 'time'",
+    naming the axis the cubes differ on rather than the variables that split
+    them.
+    """
+
+    _DATES = ["2021-01-01", "2021-01-02", "2021-01-03", "2021-01-04"]
+
+    def _write_pair(self, tmp_path, second_vars=("sst",)):
+        a = _ds(self._DATES[:2], variables=("sst", "npp"))
+        b = _ds(self._DATES[2:], variables=second_vars)
+        pa, pb = tmp_path / "a.zarr", tmp_path / "b.zarr"
+        a.to_zarr(pa)
+        b.to_zarr(pb)
+        return [str(pa), str(pb)]
+
+    def _open(self, paths, **kwargs):
+        index = MagicMock()
+        index.var_key = "h2ds"
+        index.map_dates_to_paths.return_value = {
+            p: [pd.Timestamp(d) for d in self._DATES] for p in paths
+        }
+        return ZarrReader(index).open_dataset(dates=self._DATES, **kwargs)
+
+    def test_a_short_file_does_not_break_the_read(self, tmp_path):
+        paths = self._write_pair(tmp_path)
+
+        with self._open(paths) as ds:
+            assert ds.sizes["time"] == 4
+            assert set(ds.data_vars) == {"sst", "npp"}
+
+    def test_the_padded_variable_reads_back_as_nan_only_where_it_is_absent(
+        self, tmp_path
+    ):
+        """
+        The truthful answer, and the one join='outer' used to give: real values
+        where the variable was written, NaN for the period it never covered.
+        """
+        paths = self._write_pair(tmp_path)
+
+        with self._open(paths) as ds:
+            npp = ds["npp"]
+            assert not np.isnan(npp.sel(time=self._DATES[:2]).values).any()
+            assert np.isnan(npp.sel(time=self._DATES[2:]).values).all()
+            # The variable both files carry is untouched by the padding.
+            assert not np.isnan(ds["sst"].values).any()
+
+    def test_the_same_files_are_refused_without_the_padding(self, tmp_path):
+        """Pins what the padding buys — this is the h2ds failure verbatim."""
+        paths = self._write_pair(tmp_path)
+
+        with patch.object(
+            ZarrReader, "_reference_data_vars", staticmethod(lambda _: {})
+        ):
+            with pytest.raises(RuntimeError, match="(?i)align"):
+                self._open(paths).close()
+
+    def test_a_requested_variable_is_not_padded_back_in(self, tmp_path):
+        """
+        Padding to the full union would undo the caller's selection, and
+        re-split the very group it exists to keep whole.
+        """
+        paths = self._write_pair(tmp_path)
+
+        with self._open(paths, variables=["sst"]) as ds:
+            assert set(ds.data_vars) == {"sst"}
+            assert ds.sizes["time"] == 4
+
+    def test_reference_data_vars_needs_more_than_one_file(self, tmp_path):
+        """A lone file is never grouped against anything."""
+        paths = self._write_pair(tmp_path)
+
+        assert ZarrReader._reference_data_vars(paths[:1]) == {}
+        assert set(ZarrReader._reference_data_vars(paths)) == {"sst", "npp"}
+
+    def test_reference_data_vars_survives_an_unreadable_path(self):
+        """Advisory only — a failure here must fall back, not break the read."""
+        assert (
+            ZarrReader._reference_data_vars(["/no/such/a.zarr", "/no/such/b.zarr"])
+            == {}
+        )

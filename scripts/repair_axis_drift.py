@@ -1,5 +1,5 @@
 """
-Snap float-drifted spatial axes in a variable's Zarr store onto one canonical axis.
+Snap float-drifted coordinate axes in a variable's Zarr store onto one canonical axis.
 
 The same grid written on different occasions can disagree in the last
 floating-point bits. Each file stays perfectly monotonic on its own, so nothing
@@ -7,6 +7,10 @@ looks wrong until ``open_mfdataset(combine="by_coords")`` compares the arrays
 exactly, stops treating the axis as shared, and reports
 
     Resulting object does not have monotonic global indexes along dimension lon
+
+or, for an axis that is not the one being concatenated along,
+
+    cannot align objects with join='exact' ... along these coordinates: 'depth'
 
 which names neither the cause nor the file. ``ZarrReader`` now snaps such axes
 on read so a store in this state is still usable, but the store itself stays
@@ -39,14 +43,15 @@ import zarr
 
 from h2mare import get_settings
 from h2mare.storage.zarr_catalog import ZarrCatalog
+from h2mare.storage.zarr_reader import AXIS_SNAP_TOL
 
-#: Coordinates worth repairing. Time is excluded deliberately: a differing time
-#: axis is different data, never a relabel.
-COORDS = ("lat", "lon")
-
-#: Default agreement required before an axis is treated as the same grid. See
-#: ``zarr_reader._AXIS_SNAP_TOL`` — kept in step with the read-side tolerance.
-DEFAULT_TOL = 1e-9
+#: Coordinates worth repairing, and the agreement each needs before it is
+#: treated as the same axis. Imported rather than restated so the repair can
+#: never disagree with what the reader snaps — a copy of the tolerance here
+#: drifted out of step once already, leaving the o2 store's depth axis
+#: unreadable *and* unrepairable. Time is excluded deliberately, at the source:
+#: a differing time axis is different data, never a relabel.
+COORDS = tuple(AXIS_SNAP_TOL)
 
 
 def canonical_paths(var_key: str) -> list[Path]:
@@ -90,8 +95,13 @@ def write_axis(path: Path, name: str, values: np.ndarray) -> None:
     arr[:] = values.astype(arr.dtype)
 
 
-def repair(var_key: str, *, tol: float, apply: bool) -> int:
-    """Report (and optionally fix) drift for one var_key. Returns files repaired."""
+def repair(var_key: str, *, tol: float | None, apply: bool) -> int:
+    """
+    Report (and optionally fix) drift for one var_key. Returns files repaired.
+
+    *tol* of ``None`` uses each coordinate's own limit — they are not in the
+    same units, so one number cannot serve degrees and metres at once.
+    """
     paths = canonical_paths(var_key)
     if len(paths) < 2:
         print(f"[{var_key}] {len(paths)} file(s) — nothing to compare")
@@ -99,7 +109,7 @@ def repair(var_key: str, *, tol: float, apply: bool) -> int:
 
     reference = read_axes(paths[0])
     if not reference:
-        print(f"[{var_key}] no lat/lon coords — skipped")
+        print(f"[{var_key}] no {'/'.join(COORDS)} coords — skipped")
         return 0
 
     print(f"[{var_key}] {len(paths)} files, canonical axis from {paths[0].name}")
@@ -113,7 +123,8 @@ def repair(var_key: str, *, tol: float, apply: bool) -> int:
         for name, ref in reference.items():
             if name not in axes:
                 continue
-            verdict, delta = classify(axes[name], ref, tol)
+            limit = AXIS_SNAP_TOL[name] if tol is None else tol
+            verdict, delta = classify(axes[name], ref, limit)
             if verdict == "drift":
                 drifted[name] = delta
             elif verdict == "different":
@@ -148,7 +159,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--all", action="store_true", help="check every configured var_key"
     )
-    parser.add_argument("--tol", type=float, default=DEFAULT_TOL)
+    parser.add_argument(
+        "--tol",
+        type=float,
+        default=None,
+        help=f"one limit for every coordinate; default is each one's own "
+        f"({', '.join(f'{k}={v:g}' for k, v in AXIS_SNAP_TOL.items())})",
+    )
     parser.add_argument(
         "--apply", action="store_true", help="write the repair (default is a dry run)"
     )
