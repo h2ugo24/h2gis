@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import cached_property
 from pathlib import Path
@@ -19,6 +20,7 @@ import pandas as pd
 import rioxarray  # noqa: F401  # registers .rio accessor on xarray objects
 import xarray as xr
 from loguru import logger
+from rasterio.errors import NotGeoreferencedWarning
 from scipy.spatial import KDTree
 
 from h2mare import AppConfig, get_settings
@@ -1615,6 +1617,19 @@ class Extractor:
                 (id, None, geom, ds_computed, index_col)
                 for id, geom in zip(data.index, data.geometry)
             ]
+
+        # rasterio builds a scratch in-memory raster per clip and reads its
+        # (not yet assigned) geotransform, warning about it inside its own
+        # `catch_warnings(...ignore)`. That suppression is global filter state,
+        # so with the thread pool below one worker's exit un-ignores it while
+        # another is mid-clip and the warning leaks — a handful per run, on
+        # correct data. A permanent filter has no such window: it is in the
+        # list every worker saves and restores. A real missing-geotransform
+        # would still surface, as the all-NaN columns _warn_if_wholly_failed
+        # and the null summary report.
+        warnings.filterwarnings(
+            "ignore", category=NotGeoreferencedWarning, module="rasterio"
+        )
 
         out = []
         errors: list[Exception] = []
