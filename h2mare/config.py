@@ -14,7 +14,7 @@ import yaml
 from dotenv import load_dotenv
 from loguru import logger
 
-from h2mare.models import AppConfig
+from h2mare.models import AppConfig, KeyVarConfigEntry
 
 
 class Settings:
@@ -198,6 +198,24 @@ class Settings:
                 f"{sorted(unknown)} — these will be ignored. "
                 f"Expected keys: {sorted(_KNOWN_KEYS)}."
             )
+
+        # Warn on unrecognised per-variable keys — catches "store_roots:" or
+        # "local_foldr:". msgspec structs here do not set forbid_unknown_fields,
+        # so an unknown key is dropped in silence and the variable keeps the
+        # default the author meant to override. Warn rather than raise: the
+        # top-level check above warns too, and a config that has been loading
+        # for months should not start failing over a key that was already
+        # being ignored.
+        _VAR_FIELDS = set(KeyVarConfigEntry.__struct_fields__)
+        for var_key, entry in (config_dict.get("variables") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            unknown_fields = set(entry) - _VAR_FIELDS
+            if unknown_fields:
+                logger.warning(
+                    f"config.yaml variable '{var_key}' has unrecognised key(s): "
+                    f"{sorted(unknown_fields)} — these will be ignored."
+                )
 
         # Extract global and variable metadata (not part of AppConfig)
         self._global_attrs = config_dict.get("global_attrs", {})
