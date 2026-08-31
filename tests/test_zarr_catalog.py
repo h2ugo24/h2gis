@@ -421,6 +421,126 @@ class TestVarsNonnullEnd:
         assert cov is not None
         assert cov.end == pd.Timestamp("2026-05-15")
 
+    def test_a_timeless_column_is_omitted_rather_than_raising(self, tmp_path):
+        # bathy rides in h2ds on lon/lat alone. Reducing it over every non-time
+        # dim leaves a scalar mask, and indexing the time axis with that used to
+        # raise "Multi-dimensional indexing is no longer supported".
+        ds = _make_padded_ds("2026-05-01", n_days=5, n_valid=5, var="ac_amp")
+        ds["bathy"] = (["lat", "lon"], np.ones((3, 3)))
+        zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _df_for_zarr(
+            zarr_path, ["ac_amp", "bathy"], "2026-05-05"
+        )
+
+        result = catalog.get_vars_nonnull_end(["ac_amp", "bathy"])
+
+        assert result == {"ac_amp": pd.Timestamp("2026-05-05")}
+
+
+# ---------------------------------------------------------------------------
+# Variable coverage: the leading edge, and both ends together
+#
+# xr.merge(join="outer") pads a variable to the union time axis at *both* ends,
+# so a source that starts later or ends earlier than the store reads as covered
+# across its own padding.
+# ---------------------------------------------------------------------------
+
+
+def _make_edge_padded_ds(start: str, n_days: int, valid: slice, var: str) -> xr.Dataset:
+    """Dataset where *var* holds data only within *valid*, NaN either side."""
+    times = pd.date_range(start, periods=n_days, freq="D")
+    data = np.full((n_days, 3, 3), np.nan)
+    data[valid] = 1.0
+    return xr.Dataset(
+        {var: (["time", "lat", "lon"], data)},
+        coords={"time": times, "lat": [30.0, 35.0, 40.0], "lon": [-10.0, -5.0, 0.0]},
+    )
+
+
+def _span_df(zarr_path, variables, start_date, end_date) -> pd.DataFrame:
+    """Single-row catalog df spanning the dates the file's axis actually holds."""
+    return pd.DataFrame(
+        [
+            {
+                "path": str(zarr_path),
+                "filename": zarr_path.name,
+                "variables": variables,
+                "start_date": pd.Timestamp(start_date),
+                "end_date": pd.Timestamp(end_date),
+            }
+        ]
+    )
+
+
+class TestVarsNonnullStart:
+    def test_nonnull_start_ignores_nan_head(self, tmp_path):
+        # Real data on days 4..10 of a 15-day file.
+        ds = _make_edge_padded_ds("2026-05-01", 15, slice(3, 10), "o2_0")
+        zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _span_df(
+            zarr_path, ["o2_0"], "2026-05-01", "2026-05-15"
+        )
+
+        result = catalog.get_vars_nonnull_start(["o2_0"])
+
+        assert result["o2_0"] == pd.Timestamp("2026-05-04")
+
+    def test_all_null_variable_omitted(self, tmp_path):
+        ds = _make_edge_padded_ds("2026-05-01", 5, slice(0, 0), "o2_0")
+        zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _span_df(
+            zarr_path, ["o2_0"], "2026-05-01", "2026-05-05"
+        )
+
+        assert catalog.get_vars_nonnull_start(["o2_0"]) == {}
+
+
+class TestGetVarCoverage:
+    def test_both_ends_narrow_to_real_data(self, tmp_path):
+        ds = _make_edge_padded_ds("2026-05-01", 15, slice(3, 10), "o2_0")
+        zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _span_df(
+            zarr_path, ["o2_0"], "2026-05-01", "2026-05-15"
+        )
+
+        cov = catalog.get_var_coverage("o2_0")
+
+        assert cov is not None
+        assert (cov.start, cov.end) == (
+            pd.Timestamp("2026-05-04"),
+            pd.Timestamp("2026-05-10"),
+        )
+
+    def test_file_span_kept_when_there_is_no_frontier_to_measure(self, tmp_path):
+        """A timeless column has no dates of its own; the file's span is the answer."""
+        ds = _make_padded_ds("2026-05-01", n_days=5, n_valid=5, var="ac_amp")
+        ds["bathy"] = (["lat", "lon"], np.ones((3, 3)))
+        zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _span_df(
+            zarr_path, ["ac_amp", "bathy"], "2026-05-01", "2026-05-05"
+        )
+
+        cov = catalog.get_var_coverage("bathy")
+
+        assert cov is not None
+        assert (cov.start, cov.end) == (
+            pd.Timestamp("2026-05-01"),
+            pd.Timestamp("2026-05-05"),
+        )
+
+    def test_unknown_variable_is_none(self, tmp_path):
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _span_df(
+            tmp_path / "h2ds_2026.zarr", ["ac_amp"], "2026-05-01", "2026-05-05"
+        )
+
+        assert catalog.get_var_coverage("not_a_var") is None
+
 
 # ---------------------------------------------------------------------------
 # get_bbox

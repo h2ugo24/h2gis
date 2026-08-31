@@ -194,3 +194,126 @@ class TestPlotMapsAutoDerive:
             save_path=save,
         )
         assert save.exists()
+
+
+# ---------------------------------------------------------------------------
+# field_for_plot — collapsing a date's field down to something plottable
+# ---------------------------------------------------------------------------
+
+
+def _field_ds(n_times: int) -> "xr.Dataset":  # noqa: F821
+    """(time, lat, lon) dataset for one calendar day, with `n_times` steps."""
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+
+    return xr.Dataset(
+        {"u10": (("time", "lat", "lon"), np.ones((n_times, 2, 2)))},
+        coords={
+            "time": pd.date_range("2020-01-01", periods=n_times, freq="h"),
+            "lat": [30.0, 31.0],
+            "lon": [-10.0, -9.0],
+        },
+    )
+
+
+class TestFieldForPlot:
+    """
+    open_dataset selects by calendar day, so an hourly store hands back all 24
+    steps and the array reaching .plot() is 3-D. It is reduced here, and the
+    note is what keeps the plot from quietly misreporting what it shows.
+    """
+
+    def test_hourly_day_is_averaged_and_says_so(self):
+        from h2mare.utils.plot import field_for_plot
+
+        field, note = field_for_plot(_field_ds(24), "u10")
+
+        assert set(field.dims) == {"lat", "lon"}
+        assert note == "u10: mean of 24 steps"
+
+    def test_single_step_is_squeezed_silently(self):
+        """A daily store needs no note — there was nothing to collapse."""
+        from h2mare.utils.plot import field_for_plot
+
+        field, note = field_for_plot(_field_ds(1), "u10")
+
+        assert set(field.dims) == {"lat", "lon"}
+        assert note == ""
+
+    def test_missing_var_blames_the_file_not_the_request(self):
+        """
+        Reachable after routing: get_variables unions across a store's files, so
+        a variable added later is 'in the store' but absent from an older file.
+        """
+        from h2mare.utils.plot import field_for_plot
+
+        with pytest.raises(KeyError, match="added to the store"):
+            field_for_plot(_field_ds(24), "wind_mean")
+
+
+# ---------------------------------------------------------------------------
+# plot_records_on_field — a record the store has no file for
+# ---------------------------------------------------------------------------
+
+
+class TestUncoveredRecordsAreSkipped:
+    """
+    The docstring has always promised these are skipped with a warning, but
+    open_dataset raises rather than returning None, so the `is None` check that
+    stood here never fired and the first uncovered record ended the loop with
+    every later one undrawn.
+    """
+
+    def _patch(self, monkeypatch, missing_date: str) -> list:
+        """Catalog answering every date but *missing_date*; returns figures drawn."""
+        from unittest.mock import MagicMock
+
+        import pandas as pd
+
+        from h2mare.utils import plot as plot_module
+
+        catalog = MagicMock()
+        catalog.var_key = "atm-instante"
+
+        def _open(dates=None, **_kw):
+            if pd.Timestamp(dates) == pd.Timestamp(missing_date):
+                raise FileNotFoundError(f"No zarr files contain dates: [{dates}]")
+            return _field_ds(1)
+
+        catalog.open_dataset.side_effect = _open
+        monkeypatch.setattr(plot_module, "catalog_for_var", lambda *a, **k: catalog)
+
+        drawn: list = []
+        monkeypatch.setattr(plot_module.plt, "show", lambda *a, **k: drawn.append(1))
+        return drawn
+
+    def _records(self):
+        import pandas as pd
+
+        return pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2020-01-01", "2020-01-02", "2020-01-03"]),
+                "lon": [-9.0, -8.0, -7.0],
+                "lat": [31.0, 32.0, 33.0],
+            }
+        )
+
+    def test_the_loop_survives_and_draws_the_rest(self, monkeypatch):
+        from h2mare.utils.plot import plot_records_on_field
+
+        drawn = self._patch(monkeypatch, missing_date="2020-01-02")
+
+        plot_records_on_field(self._records(), "atm-instante", var="u10")
+
+        assert len(drawn) == 2
+
+    def test_every_record_missing_draws_nothing_and_does_not_raise(self, monkeypatch):
+        from h2mare.utils.plot import plot_records_on_field
+
+        drawn = self._patch(monkeypatch, missing_date="2020-01-01")
+        one = self._records().head(1)
+
+        plot_records_on_field(one, "atm-instante", var="u10")
+
+        assert drawn == []

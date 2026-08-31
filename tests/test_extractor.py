@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
+from loguru import logger
 from shapely.geometry import box
 
 from h2mare.models import TimeStep
@@ -20,6 +21,7 @@ from h2mare.processing.extractor import (
     _load_completed_keys,
     _save_completed_keys,
     _warn_if_wholly_failed,
+    _widen_degenerate,
     ensure_row_id,
     input_fingerprint,
     null_summary_lines,
@@ -781,9 +783,12 @@ class TestProcessSingleVarkeyRouting:
             seen.append(var_key)
             catalog = MagicMock()
             catalog.var_key = var_key
-            catalog.get_time_coverage.return_value = DateRange(
-                pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05")
-            )
+            coverage = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05"))
+            catalog.get_time_coverage.return_value = coverage
+            # The compiled path asks per variable: the store's own end is the
+            # union of everything merged into it, which over-promises for any
+            # var_key padded out to it. Same dates here, different question.
+            catalog.get_var_coverage.return_value = coverage
             catalog.get_bbox.return_value = BBox(-20.0, 30.0, 20.0, 50.0)
             catalog.open_dataset.return_value = h2ds if var_key == "h2ds" else store_ds
             return catalog
@@ -792,7 +797,8 @@ class TestProcessSingleVarkeyRouting:
         return seen
 
     def _extractor_for(self, cfg, times, **kwargs) -> Extractor:
-        # Distinct lon/lat: a single repeated point yields a degenerate bbox.
+        # Distinct lon/lat, so the bbox is a real box rather than the widened
+        # point _define_bbox falls back to.
         df = pd.DataFrame({"time": times, "lon": [-9.0, -1.0], "lat": [31.0, 39.0]})
         ext = _extractor(df, time_col="time", **kwargs)
         ext.app_config = SimpleNamespace(
@@ -881,9 +887,12 @@ class TestProcessSingleVarkeyRouting:
             seen.append(var_key)
             catalog = MagicMock()
             catalog.var_key = var_key
-            catalog.get_time_coverage.return_value = DateRange(
-                pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05")
-            )
+            coverage = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05"))
+            catalog.get_time_coverage.return_value = coverage
+            # The compiled path asks per variable: the store's own end is the
+            # union of everything merged into it, which over-promises for any
+            # var_key padded out to it. Same dates here, different question.
+            catalog.get_var_coverage.return_value = coverage
             catalog.get_bbox.return_value = BBox(-20.0, 30.0, 20.0, 50.0)
             catalog.open_dataset.return_value = self._h2ds()
             return catalog
@@ -908,6 +917,100 @@ class TestProcessSingleVarkeyRouting:
             ext.process_single_varkey("atm-accum-avg")
 
 
+class TestCompiledCoverageIsPerVariable:
+    """
+    h2ds ends where its furthest-ahead source ends, and ``xr.merge`` pads every
+    slower one with NaN out to that date. Clipping the compiled read against the
+    *store's* end therefore let those padded days through, to be extracted as
+    NaN with nothing said — the quiet half of the same bug that made the padding
+    look like spatial gaps downstream.
+    """
+
+    _R = TestProcessSingleVarkeyRouting
+
+    def _patch(self, monkeypatch, var_end: str) -> None:
+        """h2ds runs to 2020-01-05; this var_key's own columns stop at *var_end*."""
+
+        def _factory(var_key, **_kw):
+            catalog = MagicMock()
+            catalog.var_key = var_key
+            catalog.get_time_coverage.return_value = DateRange(
+                pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05")
+            )
+            catalog.get_var_coverage.return_value = DateRange(
+                pd.Timestamp("2020-01-01"), pd.Timestamp(var_end)
+            )
+            catalog.get_bbox.return_value = BBox(-20.0, 30.0, 20.0, 50.0)
+            catalog.open_dataset.return_value = self._R._h2ds()
+            return catalog
+
+        monkeypatch.setattr(extractor_module, "ZarrCatalog", _factory)
+
+    def _extractor_for(self, times) -> Extractor:
+        # Distinct lon/lat per row, so what survives a clip is a real box rather
+        # than the widened point _define_bbox falls back to.
+        n = len(times)
+        df = pd.DataFrame(
+            {
+                "time": times,
+                "lon": [-9.0 - i for i in range(n)],
+                "lat": [31.0 + i for i in range(n)],
+            }
+        )
+        ext = _extractor(df, time_col="time")
+        ext.app_config = SimpleNamespace(
+            variables={"atm-accum-avg": _atm_config(), "h2ds": _h2ds_config()}
+        )
+        return ext
+
+    _DATES = ["2020-01-01", "2020-01-02", "2020-01-04"]
+
+    def test_dates_in_the_padding_are_clipped(self, monkeypatch):
+        self._patch(monkeypatch, var_end="2020-01-02")
+        ext = self._extractor_for(self._DATES)
+
+        out = ext.process_single_varkey("atm-accum-avg")
+
+        # 01-04 is on h2ds's axis but past this var_key's own end.
+        assert out["time"].dt.strftime("%Y-%m-%d").tolist() == [
+            "2020-01-01",
+            "2020-01-02",
+        ]
+
+    def test_the_clip_names_the_var_key_not_the_store(self, monkeypatch):
+        """'h2ds ends 01-05' would be true and useless; the var_key is the news."""
+        self._patch(monkeypatch, var_end="2020-01-02")
+        ext = self._extractor_for(self._DATES)
+
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="WARNING", format="{message}")
+        try:
+            ext.process_single_varkey("atm-accum-avg")
+        finally:
+            logger.remove(sink)
+
+        warned = "".join(messages)
+        assert "atm-accum-avg in h2ds" in warned
+        assert "variable ends 2020-01-02" in warned
+
+    def test_a_var_key_level_with_the_store_is_not_clipped(self, monkeypatch):
+        self._patch(monkeypatch, var_end="2020-01-05")
+        ext = self._extractor_for(self._DATES)
+
+        out = ext.process_single_varkey("atm-accum-avg")
+
+        assert len(out) == 3
+
+    def test_clipping_down_to_one_record_still_extracts(self, monkeypatch):
+        """The survivor's extent has no width; that is a query, not an error."""
+        self._patch(monkeypatch, var_end="2020-01-01")
+        ext = self._extractor_for(self._DATES)
+
+        out = ext.process_single_varkey("atm-accum-avg")
+
+        assert len(out) == 1
+
+
 class TestStoreRootReachesTheReads:
     """
     Regression: ``Extractor`` captured ``store_root`` in __init__ and then never
@@ -926,9 +1029,12 @@ class TestStoreRootReachesTheReads:
             roots[var_key] = kw.get("store_root")
             catalog = MagicMock()
             catalog.var_key = var_key
-            catalog.get_time_coverage.return_value = DateRange(
-                pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05")
-            )
+            coverage = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-05"))
+            catalog.get_time_coverage.return_value = coverage
+            # The compiled path asks per variable: the store's own end is the
+            # union of everything merged into it, which over-promises for any
+            # var_key padded out to it. Same dates here, different question.
+            catalog.get_var_coverage.return_value = coverage
             catalog.get_bbox.return_value = BBox(-20.0, 30.0, 20.0, 50.0)
             catalog.open_dataset.return_value = (
                 self._R._h2ds()
@@ -1132,7 +1238,8 @@ class TestResolveCoverageEndOfDay:
 
     @staticmethod
     def _extractor(times: list[str]) -> Extractor:
-        # Distinct lon/lat: a single repeated point yields a degenerate bbox.
+        # Distinct lon/lat, so the bbox is a real box rather than the widened
+        # point _define_bbox falls back to.
         return _extractor(
             pd.DataFrame({"time": times, "lon": [-9.0, -1.0], "lat": [31.0, 39.0]})
         )
@@ -1161,6 +1268,50 @@ class TestResolveCoverageEndOfDay:
         dates = ext._resolve_coverage(self._catalog())
 
         assert dates == [pd.Timestamp("2020-01-05 23:00:00")]
+
+
+class TestDefineBboxWidensADegenerateExtent:
+    """
+    A query extent with no width is ordinary input — one sample, a transect
+    along a parallel, or the single row left after a coverage clip. ``BBox``
+    refuses it, rightly, for a *store's* extent; as a query it only has to name
+    the cells to read, and the read pads by a whole grid cell either way.
+    """
+
+    @staticmethod
+    def _ext(lons: list[float], lats: list[float]) -> Extractor:
+        return _extractor(
+            pd.DataFrame({"time": ["2020-01-01"] * len(lons), "lon": lons, "lat": lats})
+        )
+
+    def test_single_point_becomes_a_box_around_it(self):
+        ext = self._ext([-9.0], [31.0])
+
+        bbox = ext._define_bbox(ext.data)
+
+        assert bbox.xmin < -9.0 < bbox.xmax
+        assert bbox.ymin < 31.0 < bbox.ymax
+
+    def test_a_transect_widens_only_the_flat_axis(self):
+        """Rows along one parallel: lon already spans, lat does not."""
+        ext = self._ext([-9.0, -5.0, -1.0], [31.0, 31.0, 31.0])
+
+        bbox = ext._define_bbox(ext.data)
+
+        assert (bbox.xmin, bbox.xmax) == (-9.0, -1.0)
+        assert bbox.ymin < 31.0 < bbox.ymax
+
+    def test_a_real_box_is_left_alone(self):
+        ext = self._ext([-9.0, -1.0], [31.0, 39.0])
+
+        bbox = ext._define_bbox(ext.data)
+
+        assert bbox.to_tuple() == (-9.0, 31.0, -1.0, 39.0)
+
+    def test_an_inverted_box_is_still_refused(self):
+        """min/max cannot produce one, so it means a defect, not a point."""
+        with pytest.raises(ValueError, match="xmin"):
+            BBox.from_tuple(_widen_degenerate((1.0, 30.0, -1.0, 40.0)))
 
 
 def _depth_config(

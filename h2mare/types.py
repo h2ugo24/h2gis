@@ -18,6 +18,13 @@ import xarray as xr
 
 DateLike = str | pd.Timestamp | datetime | date
 
+#: Which store a var_key is read from. ``native`` is its own per-variable Zarr,
+#: ``compiled`` is the h2ds every var_key is merged into, and ``auto`` picks per
+#: var_key. Lives here rather than beside its users because both the extraction
+#: side (``processing.extractor``) and the read side
+#: (``storage.var_routing``) name it, and neither may import the other.
+ReadFrom = Literal["auto", "native", "compiled"]
+
 
 def to_datetime(value) -> datetime:
     """Coerce date, pd.Timestamp, str, or datetime to stdlib datetime."""

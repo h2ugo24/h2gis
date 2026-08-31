@@ -11,7 +11,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import cached_property
 from pathlib import Path
-from typing import Literal, Optional, Union, overload
+from typing import Literal, Optional, Sequence, Union, overload
 
 import ephem
 import geopandas as gpd
@@ -25,32 +25,33 @@ from scipy.spatial import KDTree
 
 from h2mare import AppConfig, get_settings
 from h2mare.models import step_freq
+from h2mare.storage.var_routing import compiled_var_key
 from h2mare.storage.zarr_catalog import ZarrCatalog
-from h2mare.types import BBox, DateRange
+from h2mare.types import BBox, DateRange, ReadFrom
 from h2mare.utils.datetime_utils import end_of_day
 from h2mare.utils.logging import configure_extraction_logging, log_time
 from h2mare.utils.paths import store_root_for
 from h2mare.utils.spatial import sel_padded_bbox
 
-#: ``source`` marking the var_key that holds the compiled dataset, rather than
-#: its name — the same marker ``_normalize_var_dict`` excludes from default runs,
-#: so a compiled store named something other than ``h2ds`` is still found.
-_COMPILED_SOURCE = "h2mare"
-
 #: How the input's own timestamps are read. ``auto`` infers it from the data;
 #: ``daily`` and ``hourly`` state it outright. Purely about parsing ``time_col``
-#: — which store answers is :data:`ReadFrom`.
+#: — which store answers is :data:`~h2mare.types.ReadFrom`.
 TimeCadence = Literal["auto", "daily", "hourly"]
-
-#: Which store a var_key is read from. ``native`` is its own per-variable Zarr,
-#: ``compiled`` is the h2ds every var_key is merged into, and ``auto`` picks per
-#: var_key from the cadence the input asked for.
-ReadFrom = Literal["auto", "native", "compiled"]
 
 #: Coordinate columns that ride out of ``to_dataframe()`` alongside the real
 #: values. Carried by every engine result, so they are stripped before a join
 #: and again from the final frame.
 _COORD_COLS = ["time", "lat", "lon", "geom"]
+
+#: Half-width added to a bbox axis that came out with no width. Only has to
+#: clear ``BBox``'s ``xmin < xmax`` check: the read pads by a whole grid cell on
+#: each side anyway (:func:`~h2mare.utils.spatial.sel_padded_bbox`), so the
+#: cells surrounding the point are in the subset either way. It does not make a
+#: one-point query identical to a wide one — a sample landing exactly halfway
+#: between two cell centres is a tie, and which of them the nearest-neighbour
+#: search returns depends on the subset it was given. That was already true of
+#: any two differently-sized bboxes.
+_DEGENERATE_BBOX_PAD = 1e-6
 
 # Module-level KDTree cache keyed on grid identity (shape + first/last values).
 # All var_keys produced by this pipeline share the same 0.25° grid, so the tree
@@ -308,6 +309,23 @@ def _extract_geometry_bathy(
 def _declared_vars(var_config) -> list[str]:
     """Variables this var_key publishes, per ``compiled_vars`` in config."""
     return list(getattr(var_config, "compiled_vars", None) or [])
+
+
+def _widen_degenerate(
+    bounds: Sequence[float],
+) -> tuple[float, float, float, float]:
+    """
+    Nudge apart any axis of *bounds* whose min equals its max.
+
+    Only exact equality, so an inverted box still reaches ``BBox`` and is still
+    rejected — that one is a real defect, not a shape the input can take.
+    """
+    xmin, ymin, xmax, ymax = (float(v) for v in bounds)
+    if xmin == xmax:
+        xmin, xmax = xmin - _DEGENERATE_BBOX_PAD, xmax + _DEGENERATE_BBOX_PAD
+    if ymin == ymax:
+        ymin, ymax = ymin - _DEGENERATE_BBOX_PAD, ymax + _DEGENERATE_BBOX_PAD
+    return xmin, ymin, xmax, ymax
 
 
 def resolve_read_from(var_config, *, read_from: ReadFrom, subdaily_input: bool) -> str:
@@ -772,6 +790,13 @@ class Extractor:
     def _define_bbox(self, data: pd.DataFrame | gpd.GeoDataFrame) -> BBox:
         """
         Returns bbox from data according to input_type ('csv' or 'shp').
+
+        An extent with no width — every row on one point, or strung along one
+        parallel or meridian — is widened rather than refused. That shape is
+        ordinary input: a single sample, a transect, or whatever is left after
+        the coverage clip drops the rest. ``BBox`` goes on rejecting it, because
+        for a *store's* own extent a single cell really is an error; here it is
+        only a query, and the read pads it by a grid cell on each side anyway.
         """
         if self.input_type == "csv":
             bounds = (
@@ -787,20 +812,47 @@ class Extractor:
         else:
             raise ValueError(f"Unsupported input_type: {self.input_type!r}")
 
-        return BBox.from_tuple(bounds)
+        return BBox.from_tuple(_widen_degenerate(bounds))
 
-    def _resolve_coverage(self, catalog: ZarrCatalog) -> list[pd.Timestamp]:
+    def _resolve_coverage(
+        self, catalog: ZarrCatalog, source_key: str | None = None
+    ) -> list[pd.Timestamp]:
         """
         Resolve input/store data space/time coverage limits.
 
+        ``source_key`` names the var_key whose columns are being read out of
+        *catalog*, and narrows the time side to what that var_key actually has
+        there. It matters only on the compiled store, where every source is
+        padded out to the union axis by ``xr.merge``: the store ends where its
+        furthest-ahead source ends, and clipping against that lets every date in
+        a slower source's padding through, to be extracted as NaN, silently. A
+        var_key's compiled columns all come from one source and so share one
+        frontier, so the first one it publishes dates the group — the same
+        convention the compiler's own watermarks use.
+
+        Args:
+            catalog: Store to clip against.
+            source_key: var_key whose columns are being read. ``None`` uses the
+                store's own coverage, which is right for a native store — its
+                files end where its data does.
+
         Raises:
-            ValueError: if ``catalog.get_time_coverage()`` or ``get_bbox()`` returns None
+            ValueError: if the coverage lookup or ``get_bbox()`` returns None
 
         Returns:
             list[pd.Timestamp]: List of unique dates within store limits if out of range, else returns None.
         """
+        published = (
+            list(self.app_config.variables[source_key].compiled_vars or [])
+            if source_key is not None
+            else []
+        )
         # get storage coverage
-        store_dates = catalog.get_time_coverage()
+        store_dates = (
+            catalog.get_var_coverage(published[0])
+            if published
+            else catalog.get_time_coverage()
+        )
         store_bbox = catalog.get_bbox()
 
         if store_dates is None or store_bbox is None:
@@ -828,17 +880,23 @@ class Extractor:
         start_date = pd.to_datetime(max(start, start_store))
         end_date = pd.to_datetime(min(end, end_store))
 
+        # Name what was actually measured. Reporting these as the store's bounds
+        # would have the compiled store "ending" on a different day for every
+        # var_key routed through it.
+        label = f"{source_key} in {catalog.var_key}" if published else catalog.var_key
+        scope = "variable" if published else "store"
+
         if start < start_store:
             clipped = dates[dates < start_store]
             logger.warning(
-                f"{catalog.var_key}: {len(clipped)} date(s) before store coverage clipped "
-                f"({clipped.min().date()} -> {clipped.max().date()} | store starts {start_store.date()})"
+                f"{label}: {len(clipped)} date(s) before {scope} coverage clipped "
+                f"({clipped.min().date()} -> {clipped.max().date()} | {scope} starts {start_store.date()})"
             )
         if end > end_store:
             clipped = dates[dates > end_store]
             logger.warning(
-                f"{catalog.var_key}: {len(clipped)} date(s) after store coverage clipped "
-                f"({clipped.min().date()} -> {clipped.max().date()} | store ends {end_store.date()})"
+                f"{label}: {len(clipped)} date(s) after {scope} coverage clipped "
+                f"({clipped.min().date()} -> {clipped.max().date()} | {scope} ends {end_store.date()})"
             )
 
         return sorted(dates[(dates >= start_date) & (dates <= end_date)])
@@ -1022,24 +1080,9 @@ class Extractor:
         Identified the same way :meth:`_normalize_var_dict` excludes it from
         default runs — by ``source: h2mare`` rather than by the name ``h2ds`` —
         so a deployment that names its compiled store differently still routes.
+        Cached here because ``run()`` can route several var_keys through it.
         """
-        keys = [
-            k
-            for k, cfg in self.app_config.variables.items()
-            if getattr(cfg, "source", None) == _COMPILED_SOURCE
-        ]
-        if not keys:
-            raise ValueError(
-                f"No compiled var_key in config: none has source "
-                f"'{_COMPILED_SOURCE}'. Reading a variable from the compiled "
-                f"store needs one (conventionally 'h2ds')."
-            )
-        if len(keys) > 1:
-            raise ValueError(
-                f"Ambiguous compiled var_key: {sorted(keys)} all declare source "
-                f"'{_COMPILED_SOURCE}'. Exactly one is expected."
-            )
-        return keys[0]
+        return compiled_var_key(self.app_config)
 
     @cached_property
     def _compiled_catalog(self) -> ZarrCatalog:
@@ -1071,6 +1114,13 @@ class Extractor:
         its provider differently and compile trails convert. Asking the native
         store what is available would over-promise.
 
+        And asking the compiled store *as a whole* would over-promise the other
+        way. It reports the union of everything merged into it, so a var_key
+        whose source lags the furthest-ahead one is padded with NaN to that end
+        and reads as covered there. Coverage is therefore asked per variable,
+        keyed on the first column this var_key publishes — they all come from
+        one source and share one frontier.
+
         Sample times are normalised to the day, because the compiled store is
         daily and the caller may arrive here holding sub-daily stamps — either
         via the broadcast path or by pinning ``read_from="compiled"``. Each
@@ -1082,7 +1132,7 @@ class Extractor:
         axis.
         """
         catalog = self._compiled_catalog
-        dates_resolved = self._resolve_coverage(catalog)
+        dates_resolved = self._resolve_coverage(catalog, var_key)
         data_resolved = self._subset_to_coverage(dates_resolved).copy()
 
         # Only for a pinned read_from: on the broadcast path the caller has
