@@ -240,35 +240,23 @@ class ZarrCatalog:
         """Time coverage for zarr files that contain *var_name* as a data variable."""
         return self._index.get_var_time_coverage(var_name)
 
-    def get_vars_nonnull_end(self, var_names: Sequence[str]) -> dict[str, pd.Timestamp]:
+    def _scan_nonnull_edge(
+        self, var_names: Sequence[str], *, newest_first: bool
+    ) -> dict[str, pd.Timestamp]:
         """
-        Last date at which each variable holds a non-null value in the store.
+        Outermost date each variable holds a non-null value, from one end.
 
-        Unlike :meth:`get_var_time_coverage` — which reports the *file's* date
-        span for any file listing the variable — this reflects where the variable
-        actually has data. That distinction matters for compiled stores where a
-        lagging variable is NaN-padded out to the global end by ``xr.merge``: the
-        file end overstates its real coverage, whereas this method returns the
-        last date with genuine data.
-
-        Files are opened newest-first and scanning stops once every requested
-        variable has been found, so the common case (all variables current)
-        touches only the most recent file. Variables never found non-null — or
-        absent from the store — are omitted from the result.
-
-        Args:
-            var_names: Variables to look up (typically one representative column
-                per source var_key).
-
-        Returns:
-            Mapping of variable name to its last non-null date (normalised to
-            midnight). Empty when the store has no data.
+        Shared by :meth:`get_vars_nonnull_start` and :meth:`get_vars_nonnull_end`.
+        ``newest_first`` picks which end to walk in from, and files are visited
+        in that order so the common case — the answer lies in the outermost
+        file — opens exactly one of them.
         """
         df = self.df
         if df.empty or "variables" not in df.columns or "path" not in df.columns:
             return {}
 
-        files = df.sort_values("end_date", ascending=False).drop_duplicates(
+        sort_col = "end_date" if newest_first else "start_date"
+        files = df.sort_values(sort_col, ascending=not newest_first).drop_duplicates(
             subset="path"
         )
         remaining = set(var_names)
@@ -289,6 +277,17 @@ class ZarrCatalog:
             try:
                 if "time" not in ds.coords:
                     continue
+                # A column carried without a time axis (bathy, which is lon/lat
+                # alone) has no edge to report: the reduction below would
+                # collapse it to a scalar, leaving no date to attach. Dropped
+                # from the scan rather than skipped over, so older files are not
+                # reopened looking for an answer that cannot exist.
+                for c in [c for c in cols_here if "time" not in ds[c].dims]:
+                    remaining.discard(c)
+                cols_here = [c for c in cols_here if "time" in ds[c].dims]
+                if not cols_here:
+                    continue
+
                 times = pd.to_datetime(ds["time"].values)
                 # Reduce each variable to a per-time "has any data" mask, batched
                 # into one lazy compute so the file is read in a single pass.
@@ -300,12 +299,101 @@ class ZarrCatalog:
                 for c in cols_here:
                     m = mask_ds[c].values
                     if m.any():
-                        result[c] = pd.Timestamp(times[m].max()).normalize()
+                        if newest_first:
+                            edge = pd.Timestamp(times[m].max())
+                        else:
+                            edge = pd.Timestamp(times[m].min())
+                        result[c] = edge.normalize()
                         remaining.discard(c)
             finally:
                 ds.close()
 
         return result
+
+    def get_vars_nonnull_end(self, var_names: Sequence[str]) -> dict[str, pd.Timestamp]:
+        """
+        Last date at which each variable holds a non-null value in the store.
+
+        Unlike :meth:`get_var_time_coverage` — which reports the *file's* date
+        span for any file listing the variable — this reflects where the variable
+        actually has data. That distinction matters for compiled stores where a
+        lagging variable is NaN-padded out to the global end by ``xr.merge``: the
+        file end overstates its real coverage, whereas this method returns the
+        last date with genuine data.
+
+        Files are opened newest-first and scanning stops once every requested
+        variable has been found, so the common case (all variables current)
+        touches only the most recent file. Variables never found non-null —
+        absent from the store, or carried without a time axis — are omitted from
+        the result.
+
+        Args:
+            var_names: Variables to look up (typically one representative column
+                per source var_key).
+
+        Returns:
+            Mapping of variable name to its last non-null date (normalised to
+            midnight). Empty when the store has no data.
+        """
+        return self._scan_nonnull_edge(var_names, newest_first=True)
+
+    def get_vars_nonnull_start(
+        self, var_names: Sequence[str]
+    ) -> dict[str, pd.Timestamp]:
+        """
+        First date at which each variable holds a non-null value in the store.
+
+        The leading-edge mirror of :meth:`get_vars_nonnull_end`, and needed for
+        the same reason: ``xr.merge`` pads a variable to the union axis at both
+        ends, so a source whose archive starts later than the store's is
+        present-but-null over the stretch before it begins.
+
+        Files are opened oldest-first, otherwise identical. Same omissions.
+
+        Args:
+            var_names: Variables to look up.
+
+        Returns:
+            Mapping of variable name to its first non-null date (normalised to
+            midnight). Empty when the store has no data.
+        """
+        return self._scan_nonnull_edge(var_names, newest_first=False)
+
+    def get_var_coverage(self, var_name: str) -> DateRange | None:
+        """
+        Dates *var_name* really holds data for, not the span of the files carrying it.
+
+        The two differ on a compiled store. ``xr.merge(join="outer")`` pads every
+        variable out to the union time axis, so a source lagging the furthest-ahead
+        one by two months is present-but-null across that stretch and
+        :meth:`get_time_coverage` — which reports the union — calls it covered.
+        Reading that as coverage turns "the compile has not reached here yet"
+        into "the value is missing at this point", and those have different
+        fixes.
+
+        The file span comes first (which files list the variable at all), then
+        both ends are narrowed to where the values are real. A variable with no
+        time axis, or one whose scan finds nothing non-null, keeps the file
+        span — the honest answer when there is no frontier to measure.
+
+        Costs two edge scans, each opening one file in the common case. Callers
+        needing this for many variables at once should use
+        :meth:`get_vars_nonnull_start` / :meth:`get_vars_nonnull_end` directly,
+        which answer for a whole batch in the same pass.
+
+        Args:
+            var_name: Variable to report on.
+
+        Returns:
+            The variable's own DateRange, or None when no file lists it.
+        """
+        span = self.get_var_time_coverage(var_name)
+        if span is None:
+            return None
+
+        start = self.get_vars_nonnull_start([var_name]).get(var_name, span.start)
+        end = self.get_vars_nonnull_end([var_name]).get(var_name, span.end)
+        return DateRange(start=start, end=end)
 
     def get_nonnull_days(
         self,
