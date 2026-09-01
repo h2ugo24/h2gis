@@ -17,7 +17,6 @@ import pandas as pd
 import plotly.express as px
 import polars as pl
 import xarray as xr
-from IPython.display import clear_output, display
 from loguru import logger
 
 from h2mare.config import get_settings
@@ -338,7 +337,16 @@ def animate_vars(
         dim: Dimension to animate over. Defaults to 'time'.
         time_idx: Time index used as the fixed time step when dim='depth'. Defaults to 0.
         depth_idx: Depth index used as the fixed depth level when dim='time'. Defaults to 0.
+
+    Note:
+        Renders through ``IPython.display``, so it only animates inside a
+        notebook. The import is function-local: this is the only thing in the
+        package that needs IPython, and at module scope it made a heavyweight
+        notebook-only dependency a hard requirement of importing any plotting
+        helper.
     """
+    from IPython.display import clear_output, display
+
     if isinstance(data, xr.Dataset):
         if var_name is None:
             raise ValueError("var_name must be provided when input is a Dataset")

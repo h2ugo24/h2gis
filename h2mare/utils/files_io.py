@@ -9,12 +9,8 @@ import re
 import shutil
 import stat
 import time
-import zipfile
 from pathlib import Path
-from typing import Optional
 
-import numpy as np
-import xarray as xr
 from loguru import logger
 
 # ========================== IO ==========================================
@@ -156,66 +152,3 @@ def safe_move_files(
             raise RuntimeError(
                 f"Failed to move {path} after {retries} attempts"
             ) from last_err
-
-
-def move_files(
-    source_dir: str | Path, destination_dir: str | Path, file_extension: Optional[str]
-):
-    """
-    Function to move files from source_dir to destination_dir based on file_extension (e.g. 'nc', 'zarr')
-    """
-    source_dir = Path(source_dir)
-    destination_dir = Path(destination_dir)
-
-    destination_dir.mkdir(parents=True, exist_ok=True)
-
-    for file_path in source_dir.glob(f"*.{file_extension}"):
-        destination_file = destination_dir / file_path.name
-        try:
-            logger.info(f"Moving {file_path} to {destination_dir}")
-            shutil.move(file_path, destination_file)
-            logger.success(f"File saved at {destination_file}")
-
-        except Exception as e:
-            logger.exception(f"Error moving file {file_path}: {e}")
-    return
-
-
-# ------------------
-# Utilities
-# ----------------
-def unizp_files(zip_path: str | Path, extract_dir: str | Path) -> None:
-    """Unzip files that may be downloaded from CLS"""
-    Path(extract_dir).mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "r") as zip_ref:
-        zip_ref.extractall(extract_dir)
-        logger.info(f"Extracted all files to: {extract_dir}")
-
-
-def clean_era_dataset(ds: xr.Dataset, var: str) -> xr.Dataset:
-    """Check for corrupted variables in ERA5 files."""
-    # 1. Ensure time is datetime64
-    if not np.issubdtype(ds["time"].dtype, np.datetime64):
-        ds = xr.decode_cf(ds)
-
-    # 2. Drop invalid (NaT-like) times
-    valid_time_mask = ~np.isnat(ds["time"].values)
-    ds = ds.isel(time=valid_time_mask)
-
-    # 3. Drop duplicate times
-    _, index = np.unique(ds["time"].values, return_index=True)
-    ds = ds.isel(time=np.sort(index))
-
-    # 4. Safely check timesteps one by one
-    good_times = []
-    for t in ds["time"].values:
-        try:
-            da = ds[var].sel(time=t)
-            if np.isfinite(da).any():
-                good_times.append(t)
-        except Exception:
-            logger.warning(f"Corrupted time index {t} — skipping.")
-            continue
-
-    ds = ds.sel(time=good_times)
-    return ds
