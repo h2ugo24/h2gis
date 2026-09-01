@@ -1200,3 +1200,68 @@ class TestParquetCLIDispatch:
         ):
             _runner.invoke(zarr2parquet_app, ["--store-path", str(custom)])
         settings.override_store_root.assert_called_once_with(custom)
+
+
+class TestParquetCLIReportsFailure:
+    """
+    A failed conversion has to reach the exit code. Both loops used to log the
+    error and return 0, so a script driving `h2mare parquet` saw success after
+    every variable had failed. `h2mare run` has always done the opposite —
+    PipelineManager.run() returns False and cli/main.py exits 1.
+    """
+
+    def _invoke(self, tmp_path, args, converter):
+        with (
+            patch(
+                "h2mare.cli.zarr2parquet.get_settings",
+                return_value=_parquet_settings(tmp_path),
+            ),
+            patch(
+                "h2mare.format_converters.zarr2parquet.Zarr2Parquet",
+                return_value=converter,
+            ),
+        ):
+            return _runner.invoke(zarr2parquet_app, args)
+
+    def test_single_failing_var_key_exits_1(self, tmp_path):
+        conv = MagicMock()
+        conv.run.side_effect = ValueError("no zarr data in range")
+        result = self._invoke(tmp_path, ["-v", "sst"], conv)
+        assert result.exit_code == 1
+
+    def test_every_var_key_failing_exits_1(self, tmp_path):
+        conv = MagicMock()
+        conv.run.side_effect = ValueError("no zarr data in range")
+        result = self._invoke(tmp_path, ["-v", "sst", "-v", "o2"], conv)
+        assert result.exit_code == 1
+
+    def test_one_failure_among_several_still_exits_1(self, tmp_path):
+        """A partial failure is still a failure — the good ones are not a pass."""
+        conv = MagicMock()
+        conv.run.side_effect = [None, ValueError("no zarr data in range")]
+        result = self._invoke(tmp_path, ["-v", "sst", "-v", "o2"], conv)
+        assert result.exit_code == 1
+
+    def test_the_other_var_keys_are_still_attempted(self, tmp_path):
+        """Failing early must not abort the rest — only change the exit code."""
+        conv = MagicMock()
+        conv.run.side_effect = [ValueError("boom"), None]
+        result = self._invoke(tmp_path, ["-v", "sst", "-v", "o2"], conv)
+        assert conv.run.call_count == 2, "the second var_key was skipped"
+        assert result.exit_code == 1
+
+    def test_all_succeeding_still_exits_0(self, tmp_path):
+        conv = MagicMock()
+        result = self._invoke(tmp_path, ["-v", "sst", "-v", "o2"], conv)
+        assert result.exit_code == 0
+
+    def test_add_var_failure_exits_1(self, tmp_path):
+        conv = MagicMock()
+        conv.run.side_effect = ValueError("nothing to merge")
+        result = self._invoke(tmp_path, ["--add-var", "sst"], conv)
+        assert result.exit_code == 1
+
+    def test_add_var_success_still_exits_0(self, tmp_path):
+        conv = MagicMock()
+        result = self._invoke(tmp_path, ["--add-var", "sst"], conv)
+        assert result.exit_code == 0
