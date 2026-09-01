@@ -236,6 +236,23 @@ def download_original(
 
 
 class CMEMSDownloader(BaseDownloader):
+    """
+    Downloads Copernicus Marine products via the ``copernicusmarine`` client.
+
+    Registered for ``source: cmems``, and the source behind most variables.
+    Credentials are held by the ``copernicusmarine`` CLI (``copernicusmarine
+    login``); nothing here reads them.
+
+    A variable's ``subset`` flag picks the API: ``subset()`` honours the
+    configured bbox and ``source_vars``, while ``get()`` fetches whole original
+    files. Where a variable configures both a reprocessed (REP) and a
+    near-real-time (NRT) dataset id, the recent tail comes from NRT and is
+    superseded by REP once that catches up.
+
+    Downloads are recorded in a manifest the convert step reads to stamp
+    provenance onto the resulting Zarr.
+    """
+
     def __init__(
         self,
         var_key: str,

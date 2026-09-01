@@ -86,6 +86,20 @@ def postprocess_sst_fdist(ds: xr.Dataset, var_name: str = "sst_fdist") -> xr.Dat
 
 
 class Compiler:
+    """
+    Merges the per-variable Zarr stores into the compiled product (``h2ds``).
+
+    Each variable is read from its own native store, interpolated onto the
+    common 0.25° daily grid, and merged into one dataset written per period
+    (a file per year by default). What a given var_key contributes is decided
+    by ``compiler_registry.COMPILE_PROCESSORS``; anything unregistered goes
+    through ``compile_default``.
+
+    Compiling a subset (``run(var_keys=[...])``) writes only those variables'
+    columns. The rest are preserved rather than nulled — see
+    ``storage._append_data`` — and catch up on the next full compile.
+    """
+
     def __init__(
         self,
         var_key: str = "h2ds",

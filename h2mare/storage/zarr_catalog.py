@@ -30,11 +30,31 @@ from h2mare.validators import validate_file_period, validate_var_key
 
 # ================ Convenience functions for quick access ==========================
 def get_zarr_time_coverage(var_key: str) -> DateRange | None:
+    """
+    Time span of *var_key*'s Zarr store, or None if it holds nothing.
+
+    Convenience wrapper that builds a default :class:`ZarrCatalog` — so it
+    resolves the store root the usual way and takes no root argument. Callers
+    needing a specific root should construct the catalog themselves.
+    """
     catalog = ZarrCatalog(var_key)
     return catalog.get_time_coverage()
 
 
 class ZarrCatalog:
+    """
+    Facade over one variable's Zarr store: what it holds and how to read it.
+
+    Combines a ``ZarrIndex`` (the Parquet-backed catalog of files, their
+    extents, variables and dates — which is what makes a run resumable) with a
+    ``ZarrReader`` (opening those files as one dataset, snapping drifted axes
+    and padding ragged variable sets).
+
+    Construct one per var_key. It is the read-side counterpart to
+    ``write_append_zarr``, and :meth:`build_file_path` is what decides the
+    filename a write lands in.
+    """
+
     def __init__(
         self,
         var_key: str,

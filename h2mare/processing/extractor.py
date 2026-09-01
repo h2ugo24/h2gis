@@ -546,6 +546,25 @@ def ensure_row_id(
 
 
 class Extractor:
+    """
+    Extracts values at points or geometries from the stores, for analysis.
+
+    A standalone tool, not part of the run/convert/compile flow. Takes a CSV,
+    shapefile, GeoDataFrame or DataFrame of locations and returns one row per
+    input row with a column per requested variable.
+
+    Two independent arguments decide where each value comes from:
+    ``time_cadence`` picks how the input's time column is read, and
+    ``read_from`` picks the store. Under ``auto`` a daily store answers for
+    itself, while an hourly one answers only sub-daily input — a date-only
+    query against it goes to the compiled ``h2ds``, which therefore needs to be
+    current. Units can differ between the two sources (``msl`` is Pa natively,
+    hPa in h2ds). See ``docs/api/extractor.md#cadence``.
+
+    A failed run leaves a checkpoint that a later run resumes from, keyed by a
+    fingerprint of the input.
+    """
+
     def __init__(
         self,
         file_path: Union[Path, gpd.GeoDataFrame, pd.DataFrame],

@@ -25,6 +25,19 @@ from h2mare.utils.labels import create_filename_label
 
 
 class CDSDownloader(BaseDownloader):
+    """
+    Downloads ERA5 reanalysis from the Copernicus Climate Data Store.
+
+    Registered for ``source: cds``. Requests go through the ``cdsapi`` client,
+    which reads its own credentials file — nothing here consults ``.env`` for
+    them. CDS queues and builds each request server-side, so a call can sit
+    pending for a long time before any bytes arrive.
+
+    These are the hourly variables: the store keeps ERA5's native cadence and
+    the daily reduction happens at compile time, which is why several of their
+    derived fields exist only in ``h2ds``.
+    """
+
     def __init__(
         self,
         var_key: str,
