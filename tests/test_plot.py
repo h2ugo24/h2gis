@@ -317,3 +317,38 @@ class TestUncoveredRecordsAreSkipped:
         plot_records_on_field(one, "atm-instante", var="u10")
 
         assert drawn == []
+
+
+class TestNoNotebookOnlyImportsAtModuleScope:
+    """
+    IPython is needed by one function (``animate_vars``, which renders through
+    ``IPython.display`` and only works in a notebook). At module scope it made
+    a heavyweight notebook-only dependency a hard requirement of importing any
+    plotting helper, including in headless pipeline runs.
+    """
+
+    def test_ipython_is_not_imported_at_module_scope(self):
+        import ast
+        import pathlib
+
+        import h2mare.utils.plot as plot_mod
+
+        tree = ast.parse(pathlib.Path(plot_mod.__file__).read_text(encoding="utf-8"))
+        top_level = [
+            n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))
+        ]
+        names = {
+            (n.module or "") if isinstance(n, ast.ImportFrom) else n.names[0].name
+            for n in top_level
+        }
+        offenders = {n for n in names if n.split(".")[0] == "IPython"}
+        assert not offenders, f"notebook-only import at module scope: {offenders}"
+
+    def test_animate_vars_still_reaches_ipython(self):
+        """The import moved, it did not disappear — the function still needs it."""
+        import inspect
+
+        from h2mare.utils.plot import animate_vars
+
+        src = inspect.getsource(animate_vars)
+        assert "from IPython.display import" in src
