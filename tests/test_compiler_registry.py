@@ -218,6 +218,23 @@ class TestCompileO2:
         )
         assert result is None
 
+    def test_missing_compile_depth_slices_raises_a_config_error(self, tmp_path):
+        """
+        A 3-D variable declaring no depth levels is a config error and must say
+        so. This was an `assert`, which `python -O` strips — with it gone, None
+        reached ds.sel(depth=None) and surfaced as a TypeError somewhere
+        unrelated to the config key that actually needed setting.
+        """
+        compiler = _make_compiler(tmp_path)
+        compiler.app_config.variables["o2"] = MagicMock(compile_depth_slices=None)
+
+        with pytest.raises(ValueError) as excinfo:
+            _compile_depth_var(compiler, self._make_o2_catalog(self._make_o2_ds()), _DR)
+
+        msg = str(excinfo.value)
+        assert "o2" in msg
+        assert "compile_depth_slices" in msg, "the message does not name the config key"
+
     def test_returns_one_variable_per_depth(self, tmp_path):
         result = _compile_depth_var(
             self._make_o2_compiler(tmp_path),

@@ -133,7 +133,15 @@ def _compile_depth_var(
     assert catalog is not None
     var_key = catalog.var_key
     depths = compiler.app_config.variables[var_key].compile_depth_slices
-    assert depths is not None, f"{var_key} has no compile_depth_slices configured"
+    if depths is None:
+        # Not an assert: assertions are stripped under `python -O`, and without
+        # this None would reach ds.sel(depth=None) and surface as a TypeError
+        # somewhere unrelated. A config error should name the config key.
+        raise ValueError(
+            f"'{var_key}' is compiled as a 3-D variable but declares no "
+            f"compile_depth_slices in config.yaml. Add the depth levels it "
+            f"should publish (e.g. [0, 100, 500, 1000])."
+        )
 
     ds = _open_or_warn(catalog, var_key, date_range, compiler.bbox, chunks={"depth": 1})
     if ds is None:

@@ -81,3 +81,65 @@ class TestGetStoreCoverage:
             side_effect=OSError("no store"),
         ):
             assert get_store_coverage("sst") is None
+
+
+class TestUnreadableStoreIsNotAnEmptyStore:
+    """
+    Both return None from get_store_coverage, but they are different problems.
+    resolve_date_range used to report either as "No existing data found",
+    sending the reader to look for missing files while the real cause — a
+    locked or damaged store — sat on a warning line above it.
+    """
+
+    def test_read_failure_is_reported_with_its_cause(self):
+        from h2mare.storage.coverage import resolve_date_range
+
+        with patch(
+            "h2mare.storage.coverage.get_zarr_time_coverage",
+            side_effect=OSError("[WinError 32] file in use"),
+        ):
+            with pytest.raises(ValueError) as excinfo:
+                resolve_date_range("sst")
+
+        msg = str(excinfo.value)
+        assert "Could not read the store" in msg
+        assert "WinError 32" in msg, "the underlying cause is not in the message"
+        assert excinfo.value.__cause__ is not None, "cause not chained"
+
+    def test_genuinely_empty_store_keeps_its_own_message(self):
+        from h2mare.storage.coverage import resolve_date_range
+
+        with patch("h2mare.storage.coverage.get_zarr_time_coverage", return_value=None):
+            with pytest.raises(ValueError, match="No existing data found"):
+                resolve_date_range("sst")
+
+    def test_a_later_clean_read_clears_the_recorded_failure(self):
+        """
+        The breadcrumb must describe the most recent attempt. Without clearing,
+        a var_key that failed once would keep reporting that stale error for
+        every later genuinely-empty lookup.
+        """
+        from h2mare.storage.coverage import resolve_date_range
+
+        with patch(
+            "h2mare.storage.coverage.get_zarr_time_coverage",
+            side_effect=OSError("transient"),
+        ):
+            with pytest.raises(ValueError, match="Could not read the store"):
+                resolve_date_range("sst")
+
+        # Same var_key, store now readable but empty.
+        with patch("h2mare.storage.coverage.get_zarr_time_coverage", return_value=None):
+            with pytest.raises(ValueError, match="No existing data found"):
+                resolve_date_range("sst")
+
+    def test_explicit_dates_skip_the_lookup_entirely(self):
+        from h2mare.storage.coverage import resolve_date_range
+
+        with patch(
+            "h2mare.storage.coverage.get_zarr_time_coverage",
+            side_effect=OSError("would fail if consulted"),
+        ):
+            dr = resolve_date_range("sst", start="2021-01-01", end="2021-01-31")
+        assert dr is not None
+        assert dr.start == pd.Timestamp("2021-01-01")
