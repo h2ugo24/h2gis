@@ -16,13 +16,37 @@ def xr_float64_to_float32(ds: xr.Dataset) -> xr.Dataset:
 ds_float64_to_float32 = xr_float64_to_float32
 
 
+#: How much wider than the observed range to make the int16 scale.
+#:
+#: A store's scale is fixed when it is *created* and every later append
+#: inherits it, so the range this batch happens to span becomes the range the
+#: store can represent for its whole life. At 1.0 the observed data fills
+#: ±32500 of int16's ±32767 — about 0.4% headroom, which a single unusually
+#: cold day or deep low is enough to exceed, and an exceedance wraps rather
+#: than clips.
+#:
+#: 1.6 spreads the same span over 1.6× the value range, leaving roughly 60%
+#: headroom beyond the observed half-range on each side at 1.6× coarser
+#: resolution — msl ~0.24 Pa rather than ~0.15 Pa, still far inside ERA5's own
+#: precision. Appends outside even this are refused by
+#: ``storage._check_packed_range`` rather than silently wrapped.
+_INT16_HEADROOM = 1.6
+
+
 def int16_encoding(ds: xr.Dataset, level: int = 9) -> dict:
     """
     Scale/offset int16 encoding, one scale per data variable.
 
-    The scale spans each variable's own range over 65000 levels, which for ERA5
-    lands well inside the source's own precision (msl ~0.15 Pa, wind ~0.001 m/s).
-    NaN — land, or a gap — round-trips through ``_FillValue``.
+    The scale spans each variable's own range, widened by
+    :data:`_INT16_HEADROOM`, over 65000 levels — which for ERA5 lands well
+    inside the source's own precision (msl ~0.24 Pa, wind ~0.002 m/s). NaN —
+    land, or a gap — round-trips through ``_FillValue``.
+
+    The headroom is not slack. This encoding is applied only when a store is
+    *created*; appends inherit it, so a scale derived from one batch has to
+    hold for every later one. Without it, data outside the first batch's range
+    overflows int16 and wraps back into the middle of the range — worse than
+    clipping, because a wrapped value looks like ordinary data.
 
     Computing the range forces one pass over the data. That is deliberate: a
     fixed guess would clip, and clipping is silent.
@@ -57,7 +81,7 @@ def int16_encoding(ds: xr.Dataset, level: int = 9) -> dict:
             continue
         encoding[name] = {
             "dtype": "int16",
-            "scale_factor": span / 65000.0,
+            "scale_factor": span * _INT16_HEADROOM / 65000.0,
             "add_offset": (hi + lo) / 2.0,
             "_FillValue": -32767,
             "compressors": [zarr.codecs.ZstdCodec(level=level)],

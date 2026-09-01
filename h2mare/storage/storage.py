@@ -97,6 +97,11 @@ def write_append_zarr(
         # one run vanished on the next, so merge_records never found anything to
         # merge with and backfill_provenance's "skip files that already have the
         # attr" was undone by the following append.
+        # Before anything is written: a packed store's scale was fixed at
+        # creation and an append inherits it, so data outside that range has no
+        # encoding and would wrap rather than clip. No-op for float32 stores.
+        _check_packed_range(ds, path)
+
         preserved = _read_root_attrs(path)
         _append_data(var_key, ds, path)
         _restore_root_attrs(path, preserved)
@@ -151,6 +156,94 @@ def _time_bounds(ds: xr.Dataset) -> tuple[pd.Timestamp, pd.Timestamp]:
     """First and last actual timestamps on *ds*'s time axis."""
     times = ds.time.values
     return pd.Timestamp(times[0]), pd.Timestamp(times[-1])
+
+
+def _check_packed_range(ds_new: xr.Dataset, path: Path) -> None:
+    """
+    Refuse an append whose values the store's frozen packing cannot represent.
+
+    A scale/offset store fixes ``scale_factor`` and ``add_offset`` when it is
+    *created*, from the range of whatever batch was written first, and every
+    later append inherits them (see :func:`write_append_zarr`'s ``encoding``
+    argument). Nothing re-derives them, so a value outside that first batch's
+    range has no encoding — and it does not clip, it overflows the integer
+    dtype and wraps back into the middle of the range. A store scaled for msl
+    99000-102000 Pa, appended with a storm year reaching 92000 Pa, read back
+    with a 9074 Pa error and no warning: the wrapped values land *inside* the
+    plausible band, so there are no outliers to notice and no NaNs to count.
+
+    Failing loudly here turns that into an ordinary operational error. The fix
+    when it fires is to re-convert the store, which re-derives the scale over
+    the full range.
+
+    Costs one pass over *ds_new* to find its bounds, and only for stores that
+    are actually packed — a float32 store returns before reading anything.
+    Every variable's min and max go into a single graph, so the source is
+    decoded once rather than twice per variable.
+
+    Note this checks the representable *range* only. A value that happens to
+    encode exactly onto ``_FillValue`` still reads back as NaN; that is a far
+    rarer single-value collision, not the systematic wraparound above.
+
+    Raises:
+        ValueError: If any variable in *ds_new* falls outside what the store's
+            packing can represent, naming the variable and both windows.
+    """
+    import dask
+
+    ds_old = xr.open_zarr(path, consolidated=False)
+    try:
+        packed = {}
+        for name in ds_new.data_vars:
+            if name not in ds_old.data_vars:
+                continue
+            enc = ds_old[name].encoding
+            scale = enc.get("scale_factor")
+            dtype = np.dtype(enc.get("dtype", "f4"))
+            if scale is None or dtype.kind not in "iu":
+                continue
+            packed[name] = (float(scale), float(enc.get("add_offset", 0.0)), dtype)
+    finally:
+        ds_old.close()
+
+    if not packed:
+        return
+
+    logger.info(
+        f"Checking {len(packed)} packed variable(s) against {path.name}'s stored "
+        "scale (one pass over the incoming data)"
+    )
+    bounds: dict[tuple[str, str], xr.DataArray] = {}
+    for name in packed:
+        bounds[(str(name), "lo")] = ds_new[name].min()
+        bounds[(str(name), "hi")] = ds_new[name].max()
+    (computed,) = dask.compute(bounds)
+
+    problems: list[str] = []
+    for name, (scale, offset, dtype) in packed.items():
+        lo = float(computed[(str(name), "lo")])
+        hi = float(computed[(str(name), "hi")])
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            # All-NaN increment: nothing to encode, nothing to overflow.
+            continue
+        info = np.iinfo(dtype)
+        repr_lo = offset + info.min * scale
+        repr_hi = offset + info.max * scale
+        if lo < repr_lo or hi > repr_hi:
+            problems.append(
+                f"  {name} ({dtype.name}): incoming [{lo:.6g}, {hi:.6g}] is "
+                f"outside the representable [{repr_lo:.6g}, {repr_hi:.6g}]"
+            )
+
+    if problems:
+        raise ValueError(
+            f"{path.name} is scale/offset-packed with a scale fixed when it was "
+            f"created, and cannot represent the incoming data:\n"
+            + "\n".join(problems)
+            + f"\nAppending would silently wrap these values back into range. "
+            f"Re-convert this store so the scale is re-derived over the full "
+            f"range (delete {path.name} and re-run the convert step for it)."
+        )
 
 
 def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
