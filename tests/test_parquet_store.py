@@ -605,3 +605,106 @@ class TestGetSchema:
         schema = store.get_schema()
         assert "chl" in schema
         assert "sst" in schema
+
+
+# ---------------------------------------------------------------------------
+# Time-column resolution
+# ---------------------------------------------------------------------------
+
+
+class TestStringTimeColumn:
+    """
+    A string time column has to be *parsed*, not cast. `cast(pl.Datetime)` on
+    Utf8 is not a parse in polars 1.x: it fails for every value, and under
+    `strict=False` that failure is a silent null — so a frame of well-formed
+    ISO dates arrived with its whole time column nulled, the partition values
+    derived from it were null too, and the rows landed in
+    `year=__HIVE_DEFAULT_PARTITION__` before anything complained.
+    """
+
+    @staticmethod
+    def _as_strings(df: pl.DataFrame, fmt: str = "%Y-%m-%d") -> pl.DataFrame:
+        return df.with_columns(pl.col("time").dt.strftime(fmt))
+
+    def test_iso_strings_are_parsed_not_nulled(self, tmp_path):
+        store = _store(tmp_path)
+        df = self._as_strings(make_grid_df([date(2021, 6, 1), date(2021, 6, 2)]))
+        assert df["time"].dtype == pl.Utf8
+
+        out = store._resolve_time_col(df)
+        assert out["time"].null_count() == 0, "well-formed dates were nulled"
+        assert sorted(set(out["time"].to_list())) == [
+            date(2021, 6, 1),
+            date(2021, 6, 2),
+        ]
+
+    def test_add_data_accepts_a_string_time_column(self, tmp_path):
+        """The documented public API: idx.add_data(df) with string dates."""
+        store = _store(tmp_path)
+        store.add_data(self._as_strings(make_grid_df([date(2021, 6, 1)])))
+
+        assert not list(store.parquet_root.rglob("*__HIVE_DEFAULT_PARTITION__*"))
+        files = list((store.parquet_root / "year=2021" / "month=6").rglob("*.parquet"))
+        assert files, "no partition written for the parsed dates"
+        assert store.get_time_coverage() is not None
+
+    def test_explicit_fmt_still_honoured(self, tmp_path):
+        store = _store(tmp_path)
+        df = self._as_strings(make_grid_df([date(2021, 6, 1)]), fmt="%d/%m/%Y")
+        out = store._resolve_time_col(df, fmt="%d/%m/%Y")
+        assert out["time"].to_list()[0] == date(2021, 6, 1)
+
+    def test_unparseable_strings_raise_rather_than_null(self, tmp_path):
+        store = _store(tmp_path)
+        df = make_grid_df([date(2021, 6, 1)]).with_columns(
+            pl.lit("not-a-date").alias("time")
+        )
+        with pytest.raises(Exception):
+            store._resolve_time_col(df)
+
+    def test_fmt_is_rejected_for_a_non_string_column(self, tmp_path):
+        store = _store(tmp_path)
+        with pytest.raises(ValueError, match="only valid when time column is Utf8"):
+            store._resolve_time_col(make_grid_df([date(2021, 6, 1)]), fmt="%Y-%m-%d")
+
+
+class TestNullTimeIsRefusedBeforeWriting:
+    """
+    Partition values are derived from the time column, so a null time cannot be
+    placed. add_data used to write first and only notice afterwards, leaving a
+    `year=__HIVE_DEFAULT_PARTITION__` directory that the store-wide
+    rglob('*.parquet') scans would then read back as data.
+    """
+
+    def test_null_times_raise(self, tmp_path):
+        store = _store(tmp_path)
+        df = make_grid_df([date(2021, 6, 1)]).with_columns(
+            pl.lit(None, dtype=pl.Date).alias("time")
+        )
+        with pytest.raises(ValueError, match="cannot be partitioned"):
+            store.add_data(df)
+
+    def test_nothing_is_written_when_times_are_null(self, tmp_path):
+        store = _store(tmp_path)
+        df = make_grid_df([date(2021, 6, 1)]).with_columns(
+            pl.lit(None, dtype=pl.Date).alias("time")
+        )
+        with pytest.raises(ValueError):
+            store.add_data(df)
+
+        assert not list(store.parquet_root.rglob("*.parquet")), (
+            "a partition was written before the time column was validated"
+        )
+
+    def test_a_partially_null_time_column_is_refused(self, tmp_path):
+        store = _store(tmp_path)
+        df = make_grid_df([date(2021, 6, 1), date(2021, 6, 2)])
+        df = df.with_columns(
+            pl.when(pl.col("time") == date(2021, 6, 2))
+            .then(None)
+            .otherwise(pl.col("time"))
+            .alias("time")
+        )
+        with pytest.raises(ValueError, match="null value"):
+            store.add_data(df)
+        assert not list(store.parquet_root.rglob("*.parquet"))
