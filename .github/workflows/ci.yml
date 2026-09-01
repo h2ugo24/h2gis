@@ -4,6 +4,15 @@ on:
   pull_request:
     branches: [dev, main]
 
+# Every job installs with `uv sync --dev --locked`. The `--locked` is the point:
+# plain `uv sync` silently *updates* uv.lock when it has drifted from
+# pyproject.toml, so a dependency edit committed without re-locking went green
+# and the lockfile in the repo stopped describing what CI actually tested.
+# `--locked` fails instead, which is what makes the lockfile a real pin rather
+# than a convention — and the lockfile is the only thing standing between this
+# project and a dependency surface whose floors are mostly unstated.
+# When it fails: run `uv lock` and commit the result with your change.
+
 jobs:
   # Required gate: every commit in the PR must follow Conventional Commits.
   commit-lint:
@@ -61,7 +70,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.11"
-      - run: uv sync --dev
+      - run: uv sync --dev --locked
       - run: uv run ruff check h2mare/ tests/ scripts/
       - run: uv run ruff format --check h2mare/ tests/ scripts/
       - run: uv run pytest tests/
@@ -81,7 +90,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.11"
-      - run: uv sync --dev
+      - run: uv sync --dev --locked
       - name: pyright
         run: uv run pyright h2mare --outputjson > pyright.json || true
       - name: Summarise findings
@@ -111,5 +120,5 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --dev
+      - run: uv sync --dev --locked
       - run: uv run pytest tests/ -q
