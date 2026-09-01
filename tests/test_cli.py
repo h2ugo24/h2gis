@@ -17,6 +17,7 @@ from h2mare.cli.catalog import app as catalog_app
 from h2mare.cli.compile import app as compile_app
 from h2mare.cli.main import app as main_app
 from h2mare.cli.nc2zarr import app as nc2zarr_app
+from h2mare.cli.zarr2parquet import app as zarr2parquet_app
 from h2mare.models import AppConfig
 from h2mare.types import BBox
 
@@ -1021,3 +1022,181 @@ class TestAuditFindingCount:
 
         printed = sum(1 for line in out.splitlines() if "[empty]" in line)
         assert f"{printed} finding(s)" in out
+
+
+# ---------------------------------------------------------------------------
+# cli/zarr2parquet.py — parquet command
+# ---------------------------------------------------------------------------
+
+
+def _parquet_settings(tmp_path: Path) -> MagicMock:
+    """_mock_settings plus the compiled_vars the --add-var path reads."""
+    m = _mock_settings(tmp_path)
+    cfg = msgspec.convert(
+        {
+            "variables": {
+                "h2ds": {
+                    "local_folder": "h2ds",
+                    "source_vars": ["sst"],
+                    "dataset_id_rep": "compiled",
+                    "source": "cmems",
+                    "archive_raw": False,
+                    "pattern": r".*\.nc",
+                },
+                "sst": {
+                    "local_folder": "sst",
+                    "source_vars": ["analysed_sst"],
+                    "dataset_id_rep": "cmems-sst",
+                    "source": "cmems",
+                    "archive_raw": False,
+                    "pattern": r".*\.nc",
+                    "compiled_vars": ["sst", "sst_std"],
+                },
+                "o2": {
+                    "local_folder": "o2",
+                    "source_vars": ["o2"],
+                    "dataset_id_rep": "cmems-o2",
+                    "source": "cmems",
+                    "archive_raw": False,
+                    "pattern": r".*\.nc",
+                },
+            },
+            "secrets": {},
+        },
+        AppConfig,
+    )
+    m.app_config = cfg
+    return m
+
+
+class TestParquetCLIArgumentValidation:
+    """
+    The argument handling that decides which partitions get rewritten. Explicit
+    dates re-read every variable and rewrite the affected partitions wholesale,
+    so getting the window wrong is destructive — and this was the least
+    exercised command in the CLI.
+    """
+
+    def _invoke(self, tmp_path, args):
+        with patch(
+            "h2mare.cli.zarr2parquet.get_settings",
+            return_value=_parquet_settings(tmp_path),
+        ):
+            return _runner.invoke(zarr2parquet_app, args)
+
+    def test_only_start_date_exits_with_code_1(self, tmp_path):
+        result = self._invoke(tmp_path, ["--start-date", "2021-01-01"])
+        assert result.exit_code == 1
+
+    def test_only_end_date_exits_with_code_1(self, tmp_path):
+        result = self._invoke(tmp_path, ["--end-date", "2021-12-31"])
+        assert result.exit_code == 1
+
+    def test_start_after_end_exits_with_code_1(self, tmp_path):
+        result = self._invoke(
+            tmp_path, ["--start-date", "2021-12-31", "--end-date", "2021-01-01"]
+        )
+        assert result.exit_code == 1
+
+    def test_add_var_and_vars_together_exit_with_code_1(self, tmp_path):
+        result = self._invoke(tmp_path, ["--add-var", "sst", "-v", "h2ds"])
+        assert result.exit_code == 1
+        assert "cannot be used together" in result.output
+
+    def test_unknown_var_key_exits_with_code_1(self, tmp_path):
+        result = self._invoke(tmp_path, ["-v", "nonexistent"])
+        assert result.exit_code == 1
+        assert "unknown variable key" in result.output
+
+    def test_unknown_add_var_key_exits_with_code_1(self, tmp_path):
+        result = self._invoke(tmp_path, ["--add-var", "nonexistent"])
+        assert result.exit_code == 1
+        assert "unknown variable key" in result.output
+
+    def test_add_var_without_compiled_vars_exits_with_code_1(self, tmp_path):
+        """o2 exists but declares no compiled_vars, so there is nothing to merge."""
+        result = self._invoke(tmp_path, ["--add-var", "o2"])
+        assert result.exit_code == 1
+        assert "compiled_vars" in result.output
+
+
+class TestParquetCLIDispatch:
+    """What the validated arguments actually hand to Zarr2Parquet."""
+
+    def _invoke(self, tmp_path, args, converter):
+        with (
+            patch(
+                "h2mare.cli.zarr2parquet.get_settings",
+                return_value=_parquet_settings(tmp_path),
+            ),
+            patch(
+                "h2mare.format_converters.zarr2parquet.Zarr2Parquet",
+                return_value=converter,
+            ) as ctor,
+        ):
+            result = _runner.invoke(zarr2parquet_app, args)
+        return result, ctor
+
+    def test_defaults_to_h2ds_when_no_vars_given(self, tmp_path):
+        conv = MagicMock()
+        result, ctor = self._invoke(tmp_path, [], conv)
+        assert result.exit_code == 0
+        assert ctor.call_args.kwargs["var_key"] == "h2ds"
+
+    def test_each_requested_var_key_is_converted(self, tmp_path):
+        conv = MagicMock()
+        result, ctor = self._invoke(tmp_path, ["-v", "sst", "-v", "o2"], conv)
+        assert result.exit_code == 0
+        assert [c.kwargs["var_key"] for c in ctor.call_args_list] == ["sst", "o2"]
+
+    def test_date_window_is_passed_through(self, tmp_path):
+        conv = MagicMock()
+        self._invoke(
+            tmp_path,
+            ["-v", "sst", "--start-date", "2021-03-01", "--end-date", "2021-03-31"],
+            conv,
+        )
+        kwargs = conv.run.call_args.kwargs
+        assert kwargs["start_date"] == "2021-03-01"
+        assert kwargs["end_date"] == "2021-03-31"
+
+    def test_depth_is_passed_through(self, tmp_path):
+        conv = MagicMock()
+        self._invoke(tmp_path, ["-v", "o2", "--depth", "100"], conv)
+        assert conv.run.call_args.kwargs["depth"] == 100.0
+
+    def test_out_dir_overrides_the_parquet_root(self, tmp_path):
+        conv = MagicMock()
+        out = tmp_path / "elsewhere"
+        _, ctor = self._invoke(tmp_path, ["--out-dir", str(out)], conv)
+        assert ctor.call_args.kwargs["parquet_root"] == out
+
+    def test_add_var_expands_to_compiled_vars_on_h2ds(self, tmp_path):
+        conv = MagicMock()
+        result, ctor = self._invoke(tmp_path, ["--add-var", "sst"], conv)
+        assert result.exit_code == 0
+        assert ctor.call_args.kwargs["var_key"] == "h2ds"
+        assert conv.run.call_args.kwargs["variables"] == ["sst", "sst_std"]
+
+    def test_backup_is_only_synced_when_requested(self, tmp_path):
+        conv = MagicMock()
+        self._invoke(tmp_path, ["-v", "sst"], conv)
+        conv.sync_data.assert_not_called()
+
+        conv2 = MagicMock()
+        self._invoke(tmp_path, ["-v", "sst", "--parquet-backup"], conv2)
+        conv2.sync_data.assert_called_once()
+
+    def test_store_path_overrides_the_store_root(self, tmp_path):
+        conv = MagicMock()
+        settings = _parquet_settings(tmp_path)
+        custom = tmp_path / "other_store"
+        with (
+            patch("h2mare.cli.zarr2parquet.get_settings", return_value=settings),
+            patch(
+                "h2mare.format_converters.zarr2parquet.Zarr2Parquet",
+                return_value=conv,
+            ),
+        ):
+            _runner.invoke(zarr2parquet_app, ["--store-path", str(custom)])
+        settings.override_store_root.assert_called_once_with(custom)
