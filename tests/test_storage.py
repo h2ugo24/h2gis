@@ -867,6 +867,168 @@ class TestInt16Encoding:
         assert int16_encoding(ds) == {}
 
 
+class TestPackedRangeGuard:
+    """
+    A packed store's scale is fixed at creation and inherited by every append,
+    so data outside it has no encoding. It does not clip — it overflows int16
+    and wraps back into the middle of the range, which reads as ordinary data.
+    The append must be refused instead.
+    """
+
+    @staticmethod
+    def _tight_encoding(lo: float, hi: float) -> dict:
+        """
+        Packing that spans exactly [lo, hi] with no headroom.
+
+        Built by hand rather than via int16_encoding so this pins the guard
+        itself and not whatever margin _INT16_HEADROOM currently carries.
+        """
+        import zarr
+
+        return {
+            "sst": {
+                "dtype": "int16",
+                "scale_factor": (hi - lo) / 65000.0,
+                "add_offset": (hi + lo) / 2.0,
+                "_FillValue": -32767,
+                "compressors": [zarr.codecs.ZstdCodec(level=1)],
+            }
+        }
+
+    def _store_scaled_for(self, path, lo, hi):
+        ds = _make_ds("2020-01-01", 5)
+        ds["sst"] = ds["sst"] * 0 + np.linspace(lo, hi, ds["sst"].size).reshape(
+            ds["sst"].shape
+        )
+        write_append_zarr("sst", ds, path, encoding=self._tight_encoding(lo, hi))
+        return ds
+
+    def test_append_outside_the_frozen_scale_is_refused(self, tmp_path):
+        path = tmp_path / "sst.zarr"
+        self._store_scaled_for(path, 10.0, 20.0)
+
+        # Well outside: the stored scale cannot reach 200.
+        far = _make_ds("2020-01-06", 5, seed=1)
+        far["sst"] = far["sst"] * 0 + 200.0
+
+        with pytest.raises(ValueError, match="cannot represent the incoming data"):
+            write_append_zarr("sst", far, path)
+
+    def test_refusal_names_the_variable_and_both_windows(self, tmp_path):
+        path = tmp_path / "sst.zarr"
+        self._store_scaled_for(path, 10.0, 20.0)
+        far = _make_ds("2020-01-06", 5, seed=1)
+        far["sst"] = far["sst"] * 0 + 200.0
+
+        with pytest.raises(ValueError) as excinfo:
+            write_append_zarr("sst", far, path)
+        msg = str(excinfo.value)
+        assert "sst" in msg and "int16" in msg
+        assert "200" in msg, "the offending incoming range is not reported"
+        assert "Re-convert" in msg, "the message gives no way forward"
+
+    def test_the_store_is_untouched_when_the_append_is_refused(self, tmp_path):
+        """The guard runs before any write, so a refusal leaves no damage."""
+        path = tmp_path / "sst.zarr"
+        self._store_scaled_for(path, 10.0, 20.0)
+        before = xr.open_zarr(path, consolidated=False)
+        n_before = before.sizes["time"]
+        before.close()
+
+        far = _make_ds("2020-01-06", 5, seed=1)
+        far["sst"] = far["sst"] * 0 + 200.0
+        with pytest.raises(ValueError):
+            write_append_zarr("sst", far, path)
+
+        after = xr.open_zarr(path, consolidated=False)
+        try:
+            assert after.sizes["time"] == n_before
+            assert not list(path.parent.glob("*.tmp")), "a temp store was left behind"
+            assert not list(path.parent.glob("*.bak")), "a backup was left behind"
+        finally:
+            after.close()
+
+    def test_append_inside_the_frozen_scale_is_allowed(self, tmp_path):
+        path = tmp_path / "sst.zarr"
+        self._store_scaled_for(path, 10.0, 20.0)
+
+        near = _make_ds("2020-01-06", 5, seed=1)
+        near["sst"] = near["sst"] * 0 + 15.0
+        write_append_zarr("sst", near, path)
+
+        back = xr.open_zarr(path, consolidated=False)
+        try:
+            assert back.sizes["time"] == 10
+            tail = back.sst.sel(time=near.time).values
+            assert np.abs(tail - 15.0).max() < 0.01
+        finally:
+            back.close()
+
+    def test_float32_store_is_not_checked(self, tmp_path):
+        """An unpacked store has no frozen scale, so the guard is a no-op."""
+        path = tmp_path / "sst.zarr"
+        write_append_zarr("sst", _make_ds("2020-01-01", 5), path)
+
+        wild = _make_ds("2020-01-06", 5, seed=1)
+        wild["sst"] = wild["sst"] * 0 + 1e6
+        write_append_zarr("sst", wild, path)
+
+        back = xr.open_zarr(path, consolidated=False)
+        try:
+            assert back.sizes["time"] == 10
+            assert float(back.sst.max()) == pytest.approx(1e6)
+        finally:
+            back.close()
+
+    def test_all_nan_increment_is_not_refused(self, tmp_path):
+        """Nothing to encode means nothing to overflow."""
+        path = tmp_path / "sst.zarr"
+        self._store_scaled_for(path, 10.0, 20.0)
+
+        empty = _make_ds("2020-01-06", 5, seed=1)
+        empty["sst"] = empty["sst"] * np.nan
+        write_append_zarr("sst", empty, path)
+
+        back = xr.open_zarr(path, consolidated=False)
+        try:
+            assert back.sizes["time"] == 10
+        finally:
+            back.close()
+
+
+class TestInt16Headroom:
+    """
+    The scale is widened past the observed range because it has to serve every
+    later append, not just the batch it was derived from.
+    """
+
+    def test_representable_range_extends_beyond_the_observed_range(self):
+        from h2mare.storage.xarray_helpers import int16_encoding
+
+        ds = _make_ds("2020-01-01", 5)
+        lo = float(ds.sst.min())
+        hi = float(ds.sst.max())
+
+        enc = int16_encoding(ds)["sst"]
+        scale = enc["scale_factor"]
+        offset = enc["add_offset"]
+        repr_lo = offset + np.iinfo(np.int16).min * scale
+        repr_hi = offset + np.iinfo(np.int16).max * scale
+
+        assert repr_lo < lo and repr_hi > hi
+        # Comfortably more than the ~0.4% the un-widened scale left.
+        margin = min(lo - repr_lo, repr_hi - hi) / (hi - lo)
+        assert margin > 0.25, f"headroom is only {margin:.1%} of the observed range"
+
+    def test_quantisation_is_still_far_inside_source_precision(self):
+        from h2mare.storage.xarray_helpers import int16_encoding
+
+        ds = _make_ds("2020-01-01", 10)
+        enc = int16_encoding(ds)["sst"]
+        rng = float(ds.sst.max() - ds.sst.min())
+        assert enc["scale_factor"] / rng < 1e-4
+
+
 class TestInt16EncodingReadsSourceOnce:
     """
     Finding the ranges must cost one pass over the source, not one per
@@ -931,11 +1093,16 @@ class TestInt16EncodingReadsSourceOnce:
 
     def test_bounds_are_still_the_real_min_and_max(self):
         """Sharing the graph must not change the numbers it produces."""
-        from h2mare.storage.xarray_helpers import int16_encoding
+        from h2mare.storage.xarray_helpers import _INT16_HEADROOM, int16_encoding
 
         ds = _make_ds("2020-01-01", 10)
         enc = int16_encoding(ds)
 
+        # Recovering lo/hi from the encoding is what pins the bounds: the
+        # headroom scales the span and the offset stays the midpoint, so both
+        # ends invert back to the dataset's true min and max.
         lo, hi = float(ds.sst.min()), float(ds.sst.max())
-        assert enc["sst"]["scale_factor"] == pytest.approx((hi - lo) / 65000.0)
+        assert enc["sst"]["scale_factor"] == pytest.approx(
+            (hi - lo) * _INT16_HEADROOM / 65000.0
+        )
         assert enc["sst"]["add_offset"] == pytest.approx((hi + lo) / 2.0)

@@ -54,7 +54,7 @@ either on an existing variable means re-converting it.
 | `filename_date_range` | no | Set to `true` when the `pattern` captures a `(start, end)` date range (e.g. CMEMS/CDS files named `2021-01-01-2021-01-31.nc`). A **one-day** request is named with a single date instead (`2026-07-31.nc`), so make the second group optional and it will be read as that one day — without this a single-day repair download matches nothing and is discarded. Leave `false` (default) when the pattern yields a single date (e.g. AVISO FSLE: `_20210115_`). Controls how `Netcdf2Zarr` expands filenames into daily time steps. |
 | `known_gaps` | no | Days the provider never published, so they can never be downloaded, converted or backfilled. Each entry is a date (`2025-06-02`) or a closed interval (`2025-06-02/2025-06-05`). Excluded from the gap checks and from `h2mare audit`, which reports how many were suppressed. Needed because a source shipping one file per day leaves an *axis* hole when it skips one — AVISO has no `fsle` file for 2025-06-02 and its remote listing jumps `20250601` → `20250603` — which is otherwise indistinguishable from data the pipeline lost. Only for gaps confirmed absent at the source; anything else is a defect and belongs fixed, not listed. |
 | `time_step` | no | Cadence of this variable's own Zarr: `daily` (default) or `hourly`. An hourly store keeps the source's native axis and moves the daily reduction to compile time, so h2ds stays daily either way. Distinct from `file_period`, which is about the storage layout (one Zarr per year or per month) — a store can be hourly and still written one file per year. The gap checks read this so they compare a store against a calendar at its own resolution; a daily grid cannot see a missing hour, and an hourly grid over a daily store would report 23 phantom gaps a day. Flipping it on an existing store requires re-converting: the store is written at one cadence and the check expects the other, which fails the write verification rather than corrupting anything. It also changes where `Extractor` reads this variable from: with `hourly`, the daily values and the features derived from them are written only to the compiled h2ds, so a date-only extraction is answered from there and needs a current `compile`. Converting the same variable `daily` computes those up front and keeps everything in its own store, where `Extractor` finds them natively. See [Cadence](api/extractor.md#cadence). |
-| `store_dtype` | no | On-disk encoding: `float32` (default, byte-identical to what the pipeline has always written) or `int16`, which stores scale/offset-packed integers at roughly two thirds the size. Safe for ERA5, whose GRIB is already ~16-bit packed, so the packing discards quantisation noise rather than signal. The scale spans each variable's own measured range, so the encoding step makes one pass over the data before the first byte is written — expect a silent minutes-long pause on a large store. Applied only when a store is **created**; appends inherit whatever encoding the store already has, so changing this on an existing store does nothing until it is re-converted. Safe for some variables and not others — see [Choosing `store_dtype`](#choosing-store_dtype). |
+| `store_dtype` | no | On-disk encoding: `float32` (default, byte-identical to what the pipeline has always written) or `int16`, which stores scale/offset-packed integers at roughly two thirds the size. Safe for ERA5, whose GRIB is already ~16-bit packed, so the packing discards quantisation noise rather than signal. The scale spans each variable's own measured range widened for headroom, so the encoding step makes one pass over the data before the first byte is written — expect a silent minutes-long pause on a large store. Applied only when a store is **created**; appends inherit whatever encoding the store already has, so changing this on an existing store does nothing until it is re-converted, and an append carrying values the frozen scale cannot represent is refused rather than wrapped. Safe for some variables and not others — see [Choosing `store_dtype`](#choosing-store_dtype). |
 | `raw_include` | no | Regex matched (via `re.search`) against each raw filename; only matching files are converted. Use when a download directory holds files the pipeline must not read — AVISO ships META3.2 eddy trajectories as `long`/`short`/`untracked` variants side by side, and only the long ones belong in the store (the `untracked` files carry no `track` variable at all). Omit (default) to convert every file the date `pattern` matches. |
 | `bbox` | no | Bounding box for subset. If omitted, the full available extent is downloaded |
 | `depth_range` | no | Depth range for 3D variables (e.g. `o2`) |
@@ -103,6 +103,27 @@ wider than 65,000 (`ac_track`: `[176122, 242079]`, giving a step of 1.01;
     silently has no effect. Given what packing would do to the track ids, the
     no-op is the safer outcome — but do not read the setting as evidence that
     the store is packed.
+
+!!! warning "A store's scale is fixed for its lifetime"
+
+    The scale is derived when the store is **created**, from the range of
+    whatever batch is written first, and every later append inherits it. A
+    value outside that range has no encoding — and it does not clip, it
+    overflows `int16` and wraps back into the middle of the range, which is
+    worse: a wrapped value lands inside the plausible band, so there are no
+    outliers to spot and no NaNs to count.
+
+    Two things guard against this. The scale is widened past the observed
+    range (`_INT16_HEADROOM`, currently 1.6×, leaving ~60% headroom on each
+    side at 1.6× coarser resolution — `msl` ~0.24 Pa, still far inside ERA5's
+    own precision). Anything outside even that is **refused** by
+    `storage._check_packed_range`, which names the variable and both windows
+    rather than writing. The fix when it fires is to re-convert the store, so
+    the scale is re-derived over the full range.
+
+    This is why the first conversion of a packed store matters more than the
+    ones after it: a store first built from a single calm month carries that
+    month's range forever. Prefer to create one from a representative span.
 
 Reasonable candidates are the bounded, already-packed fields: `sst`, `thetao`,
 `o2`, `mld`, `adt`. Leave `chl`, `gke` and the other derived variables on
