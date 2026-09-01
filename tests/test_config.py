@@ -395,3 +395,53 @@ class TestGetSettingsFactory:
             assert s.BASE_DIR == tmp_path.resolve()
         finally:
             get_settings.cache_clear()  # restore default behaviour for other tests
+
+
+class TestExampleConfigStaysValid:
+    """
+    config.example.yaml is what the README tells a new user to copy, so it has
+    to keep parsing as the schema evolves. The full config.yaml is a 16-variable
+    reference and too heavy to start from.
+    """
+
+    @staticmethod
+    def _example():
+        import pathlib
+
+        import yaml
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        return yaml.safe_load(
+            (root / "config.example.yaml").read_text(encoding="utf-8")
+        )
+
+    def test_parses_as_an_app_config(self):
+        import msgspec
+
+        from h2mare.models import AppConfig
+
+        raw = self._example()
+        raw.setdefault("secrets", {})
+        cfg = msgspec.convert(raw, AppConfig, strict=False)
+        assert set(cfg.variables) == {"sst", "o2", "atm-instante", "h2ds"}
+
+    def test_includes_h2ds_which_compile_writes_to(self):
+        assert "h2ds" in self._example()["variables"]
+
+    def test_a_three_dimensional_variable_declares_its_depth_levels(self):
+        """A 3-D variable declaring neither depth key is refused at compile time."""
+        o2 = self._example()["variables"]["o2"]
+        assert o2.get("compile_depth_slices"), (
+            "the 3-D example would be refused by _compile_depth_var"
+        )
+
+    def test_is_much_smaller_than_the_reference_config(self):
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        example = (root / "config.example.yaml").stat().st_size
+        full = (root / "config.yaml").stat().st_size
+        assert example < full / 4, (
+            f"example config has grown to {example} bytes against {full}; "
+            "it is meant to be a starting point, not a second reference"
+        )

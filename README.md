@@ -52,7 +52,11 @@ H2MARE requires two configuration files in your working directory before first u
 
 ### 1. `config.yaml`
 
-Defines variables, dataset IDs, bounding boxes, and processing parameters. Copy the [template from the repository](https://github.com/h2ugoparra/h2mare/blob/main/config.yaml) as a starting point and edit it to match your needs.
+Defines variables, dataset IDs, bounding boxes, and processing parameters.
+
+Start from [`config.example.yaml`](https://github.com/h2ugoparra/h2mare/blob/main/config.example.yaml) — copy it to `config.yaml` and edit. It holds four entries chosen to cover the shapes you are likely to need: a plain 2-D daily variable, a 3-D one with depth levels, an hourly packed ERA5 one, and the `h2ds` entry the compile step writes to.
+
+The repository's own [`config.yaml`](https://github.com/h2ugoparra/h2mare/blob/main/config.yaml) configures 16 variables and is a **reference**, not a starting point — useful for seeing how a particular source is wired up, too heavy to copy wholesale. Every field is documented in the [configuration reference](https://h2ugoparra.github.io/h2mare/configuration/).
 
 ### 2. `.env`
 
