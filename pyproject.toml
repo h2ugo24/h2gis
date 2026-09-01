@@ -27,11 +27,14 @@ classifiers = [
 dependencies = [
     "cartopy>=0.23.0",
     "cdsapi>=0.7.0",
+    # xarray engine plugins, selected by name rather than imported
+    # (netcdf2zarr.py:138), so nothing in the source references them.
     "cfgrib>=0.9.10",
+    "eccodes>=1.7.0",
+    "netCDF4>=1.6.0",
     "copernicusmarine>=2.0.0",
     "dask>=2024.1.0",
     "duckdb>=1.0.0",
-    "eccodes>=1.7.0",
     "ephem>=4.1.0",
     "geopandas>=1.0.0",
     "global_land_mask>=1.0.0",
@@ -39,20 +42,29 @@ dependencies = [
     "loguru>=0.7.0",
     "matplotlib>=3.8.0",
     "msgspec>=0.18.0",
-    "netCDF4>=1.6.0",
+    # Imported directly throughout the package but previously undeclared,
+    # arriving only as transitives of xarray/geopandas/rioxarray/polars. That
+    # worked here because uv.lock pinned them, and broke nothing until someone
+    # ran `pip install h2mare`, where the resolver is free to pick anything.
+    # zarr is the sharp one: the code is written against the 3.x API
+    # (zarr.codecs.ZstdCodec, consolidated=False on every read).
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "pyarrow>=16.0",
+    "rasterio>=1.3",
+    "shapely>=2.0",
+    "zarr>=3.0",
     "plotly>=5.24.0",
     "polars>=1.0.0",
-    "PyYAML>=6.0.0",
     "python-dotenv>=1.0.0",
+    "PyYAML>=6.0.0",
     "rioxarray>=0.17.0",
     "scipy>=1.13.0",
+    "statsmodels>=0.14.6",
     "tenacity>=8.0.0",
     "tqdm>=4.66.0",
     "typer>=0.12.0",
     "xarray>=2024.1.0",
-    "mkdocs>=1.6.1",
-    "mkdocs-material>=9.7.6",
-    "statsmodels>=0.14.6",
 ]
 
 [project.urls]
@@ -66,7 +78,19 @@ where = ["."]
 include = ["h2mare*"]
 
 [tool.uv]
-# sparse>=0.15 breaks copernicusmarine.subset
+# sparse>=0.15 breaks copernicusmarine.subset.
+#
+# Currently inert, and deliberately kept that way. copernicusmarine 2.4.0 does
+# not depend on sparse at all (its only sparse-ish requirement is `arcosparse`,
+# an unrelated package), so nothing in the tree resolves sparse and this
+# constrains a package that is never installed — `sparse` appears in uv.lock
+# only as this declaration, never as a locked package.
+#
+# It stays as a constraint rather than moving to [project.dependencies]. A
+# constraint applies only if something else pulls sparse in; a dependency would
+# *force* it, dragging numba and llvmlite (~45 MB) into every install to guard
+# against a break that cannot currently happen. The cost of keeping it here is
+# zero and it still bites if a future copernicusmarine reintroduces sparse.
 constraint-dependencies = ["sparse==0.14.0"]
 
 [dependency-groups]
@@ -80,6 +104,13 @@ dev = [
     "ruff>=0.9.0",
     "tox>=4.30.3",
     "tox-uv>=1.28.1",
+]
+# Building the docs site. Not a runtime concern: these shipped to every install
+# as project dependencies, and the docs workflow installs them itself anyway
+# (`uv run --no-project --with mkdocs-material mkdocs build`).
+docs = [
+    "mkdocs>=1.6.1",
+    "mkdocs-material>=9.7.6",
 ]
 
 [tool.ruff]
@@ -119,11 +150,21 @@ isolated_build = true
 
 [testenv]
 runner = uv-venv-lock-runner
-extras = dev
+# `dependency_groups`, not `extras`: dev is a PEP 735 group under
+# [dependency-groups], and asking for it as an extra failed every environment
+# with "Extra `dev` is not defined in the project's `optional-dependencies`
+# table" before a single test ran. CI calls pytest directly, so nothing caught
+# it — the advertised py311/py312/py313 matrix and the pyright env had never
+# run. [testenv:pyright] inherits this, so the one line fixes both.
+dependency_groups = dev
 commands =
     pytest tests/ -q
 
 [testenv:pyright]
+# Exits non-zero on the standing finding count (~207, mostly pandas/xarray stub
+# noise), same as the informational CI job — that is the current baseline, not a
+# broken environment. Compare the count against CI's rather than reading FAIL as
+# a regression.
 description = Static type check with pyright (targets the 3.11 floor via pyrightconfig.json)
 commands =
     pyright h2mare
