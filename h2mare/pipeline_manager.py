@@ -15,6 +15,23 @@ from h2mare.utils.paths import store_root_for
 
 
 class PipelineManager:
+    """
+    Orchestrates Download → Convert → Compile → Parquet for a set of variables.
+
+    One instance runs the whole pipeline. Per-variable behaviour is not branched
+    on here — it is selected through the registries (``DOWNLOADER_REGISTRY`` by
+    source, ``processing.registry`` and ``compiler_registry`` by var_key), so
+    adding a variable means registering it, not editing this class.
+
+    Failures are contained per variable: a download or convert that raises is
+    logged with its traceback, marks the run failed, and the next variable
+    proceeds. :meth:`run` returns False if anything failed, which the CLI turns
+    into a non-zero exit.
+
+    The compile and parquet steps run once at the end, over all variables, and
+    are skipped when the corresponding ``no_*`` flag is set or under ``dry_run``.
+    """
+
     def __init__(
         self,
         app_config: AppConfig,

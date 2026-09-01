@@ -91,30 +91,41 @@ class ParquetIndexer:
 
     @property
     def parquet_root(self) -> Path:
+        """Root directory of the Hive-partitioned store."""
         return self._store.parquet_root
 
     @property
     def time_col(self) -> str:
+        """Name of the time column, as given to the constructor."""
         return self._store.time_col
 
     @property
     def lon_col(self) -> str:
+        """Name of the longitude column, as given to the constructor."""
         return self._store.lon_col
 
     @property
     def lat_col(self) -> str:
+        """Name of the latitude column, as given to the constructor."""
         return self._store.lat_col
 
     @property
     def physical_schema(self):
+        """
+        Column → polars dtype for the store as written, or None before the
+        first write. Excludes the Hive partition columns, which live in the
+        directory names rather than the files.
+        """
         return self._store.physical_schema
 
     @property
     def physical_cols(self) -> set[str]:
+        """Column names present in the parquet files themselves."""
         return self._store.physical_cols
 
     @property
     def partition_cols(self) -> set[str]:
+        """Column names encoded in the Hive directory layout, not in the files."""
         return self._store.partition_cols
 
     @property
@@ -145,6 +156,26 @@ class ParquetIndexer:
         bbox: Optional[tuple[float, float, float, float]] = None,
         columns: Optional[Union[str, list[str]]] = None,
     ) -> pl.LazyFrame:
+        """
+        Lazily query the store, filtered by date, bounding box and columns.
+
+        Nothing is read until the frame is collected, and only the partitions
+        the date filter selects are opened.
+
+        Args:
+            dates: Discrete ``list`` of dates, or a ``(start, end)`` tuple for a
+                range. None reads every partition.
+            bbox: ``(xmin, ymin, xmax, ymax)`` filter on the lon/lat columns.
+            columns: Column or columns to select, *in addition to* time/lon/lat,
+                which are always returned.
+
+        Returns:
+            A LazyFrame over the matching rows.
+
+        Raises:
+            RuntimeError: If the store has never been written to.
+            FileNotFoundError: If no parquet files match.
+        """
         return self._catalog.scan(dates=dates, bbox=bbox, columns=columns)
 
     def load(
@@ -153,28 +184,73 @@ class ParquetIndexer:
         bbox: Optional[tuple[float, float, float, float]] = None,
         columns: Optional[Union[str, list[str]]] = None,
     ) -> pl.DataFrame:
+        """
+        Eagerly read the store into memory. Same arguments as :meth:`scan`.
+
+        Prefer :meth:`scan` for anything large or further filtered — this
+        collects the whole result.
+        """
         return self._catalog.load(dates=dates, bbox=bbox, columns=columns)
 
     def get_schema(self) -> dict:
+        """Union of every partition's schema, as column → polars dtype."""
         return self._store.get_schema()
 
     def get_time_coverage(self) -> DateRange | None:
+        """
+        Span of the store's time column, or None before the first write.
+
+        A frontier — first and last date — not a completeness check: a store
+        holding only January 1st and December 31st reports the whole year.
+        """
         return self._store.get_time_coverage()
 
     def get_var_coverage(
         self, columns: list[str] | None = None
     ) -> dict[str, DateRange]:
+        """
+        Per-column span of *non-null* values, as column → DateRange.
+
+        Distinct from :meth:`get_time_coverage`, which spans rows regardless of
+        content. Use it to spot a lagging variable whose trailing dates exist as
+        rows but hold only nulls.
+
+        Args:
+            columns: Columns to report on. None means every data column.
+        """
         return self._store.get_var_coverage(columns)
 
     def get_var_coverage_end(self, columns: list[str]) -> dict:
+        """
+        Last non-null date per column, as column → datetime.
+
+        The same end dates :meth:`get_var_coverage` reports, found by reading
+        year- or year/month-partitioned stores newest-first and stopping once
+        every column has been seen non-null — usually one partition rather than
+        the whole store. Columns never found non-null are omitted.
+        """
         return self._store.get_var_coverage_end(columns)
 
     def get_var_backfill_start(
         self, columns: list[str], not_before: dict | None = None
     ) -> dict:
+        """
+        Earliest date each column has rows but only nulls, as column → datetime.
+
+        The signature of an append that landed while a column's source lagged.
+        :meth:`get_var_coverage_end` cannot see these: once a later append
+        arrives with the column populated, the last non-null date jumps past the
+        gap and an end-based backfill window strands it permanently.
+
+        Args:
+            columns: Columns to check.
+            not_before: Per-column floor, to stop the scan walking back past a
+                date a column is known never to have covered.
+        """
         return self._store.get_var_backfill_start(columns, not_before=not_before)
 
     def get_geoextent(self) -> BBox | None:
+        """Bounding box of the store's lon/lat columns, or None before the first write."""
         return self._store.get_geoextent()
 
     def _resolve_files(self, dates) -> list[Path]:

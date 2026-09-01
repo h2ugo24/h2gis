@@ -59,6 +59,24 @@ def _download_to_part(
 
 
 class AVISODownloader(BaseDownloader):
+    """
+    Downloads AVISO products over FTP (FSLE, eddy trajectories).
+
+    Registered for ``source: aviso``. Unlike the API-based downloaders, the
+    variable's ``dataset_id`` is an FTP *path*: the server is the root and the
+    id selects a directory under it. Files are listed, matched to dates by the
+    variable's filename ``pattern``, and fetched with retry and reconnection —
+    a dropped control connection is expected on long transfers.
+
+    Where a variable configures both, delayed-time (REP) and near-real-time
+    (NRT) trees are fetched into separate staging directories, so the convert
+    step can prefer REP where it exists.
+
+    Credentials come from ``AVISO_USERNAME``/``AVISO_PASSWORD``/
+    ``AVISO_FTP_SERVER`` in ``.env``; a missing one raises rather than
+    attempting an anonymous login.
+    """
+
     def __init__(
         self,
         var_key: str,

@@ -165,6 +165,19 @@ def convert_netcdf_to_zarr(
 
 
 class Netcdf2Zarr(BaseConverter):
+    """
+    Converts one variable's downloaded NetCDF/GRIB files into its Zarr store.
+
+    The convert half of the pipeline: raw files are matched to dates by the
+    variable's filename ``pattern``, read (GRIB via ``cfgrib``, NetCDF via the
+    default engine), passed through that var_key's convert-time processor from
+    ``processing.registry`` if it has one, and written per period.
+
+    Writes go through ``write_append_zarr``, so an existing store is extended
+    rather than replaced and keeps the encoding it was created with. Encoding
+    from :meth:`_encoding` is therefore consulted only on a first write.
+    """
+
     def __init__(
         self,
         var_key: str,
