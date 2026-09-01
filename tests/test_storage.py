@@ -519,6 +519,73 @@ class TestOverlapResolution:
         assert times.is_unique, "Duplicate timestamps after append"
         ds.close()
 
+    def test_backfill_entirely_before_stored_window_is_not_duplicated(self, tmp_path):
+        """
+        A backfill sitting entirely *before* the stored data must not re-add
+        that data on both sides of the incoming window.
+
+        Zarr files are named per year, so backfilling January against a file
+        that already holds June resolves to the same path and takes the append
+        path. The disjoint fallback used to return ds_old whole, and
+        _append_data concatenated it as the retained head *and* selected it
+        again as the retained tail: every stored step was written twice and the
+        time axis came back non-monotonic, logged as a success.
+        """
+        path = tmp_path / "sst.zarr"
+        stored = _make_ds("2021-06-01", n_days=5, seed=1)
+        stored.to_zarr(path)
+
+        incoming = _make_ds("2021-01-01", n_days=3, seed=2)
+        _append_data("sst", incoming, path)
+
+        ds = xr.open_zarr(path, consolidated=False)
+        try:
+            times = pd.DatetimeIndex(ds.time.values)
+            assert len(times) == 8, f"expected 3 + 5 steps, got {len(times)}"
+            assert times.is_unique, "stored steps were re-added by the backfill"
+            assert times.is_monotonic_increasing, "time axis is out of order"
+            # Each window keeps its own values — neither side overwrote the other.
+            np.testing.assert_allclose(
+                ds.sst.sel(time=incoming.time).values, incoming.sst.values
+            )
+            np.testing.assert_allclose(
+                ds.sst.sel(time=stored.time).values, stored.sst.values
+            )
+        finally:
+            ds.close()
+
+    def test_append_entirely_after_stored_window_keeps_both(self, tmp_path):
+        """
+        The mirror case, through the rewrite path.
+
+        A clean trailing append normally short-circuits into
+        _try_append_fast_path and never reaches _resolve_overlap, so the fast
+        path is disabled here to exercise the disjoint branch itself — the same
+        branch the backfill case above goes through, from the other side.
+        """
+        path = tmp_path / "sst.zarr"
+        stored = _make_ds("2021-01-01", n_days=3, seed=1)
+        stored.to_zarr(path)
+
+        incoming = _make_ds("2021-06-01", n_days=5, seed=2)
+        with patch("h2mare.storage.storage._try_append_fast_path", return_value=False):
+            _append_data("sst", incoming, path)
+
+        ds = xr.open_zarr(path, consolidated=False)
+        try:
+            times = pd.DatetimeIndex(ds.time.values)
+            assert len(times) == 8, f"expected 3 + 5 steps, got {len(times)}"
+            assert times.is_unique
+            assert times.is_monotonic_increasing
+            np.testing.assert_allclose(
+                ds.sst.sel(time=stored.time).values, stored.sst.values
+            )
+            np.testing.assert_allclose(
+                ds.sst.sel(time=incoming.time).values, incoming.sst.values
+            )
+        finally:
+            ds.close()
+
 
 # ---------------------------------------------------------------------------
 # Sub-daily (hourly) axes — the rewrite path resolves boundaries by instant

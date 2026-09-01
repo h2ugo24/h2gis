@@ -493,11 +493,18 @@ def _resolve_overlap(ds_new: xr.Dataset, path: Path) -> Optional[xr.Dataset]:
             ds_old.close()
             return None
 
-        # Keep the head of ds_old that sits strictly before the incoming window
-        # — slice directly, no second zarr open. The bound is one tick short of
-        # new_first rather than a day short, so a step on the same day as the
-        # incoming start but earlier than it is retained rather than discarded.
-        ds_subset = ds_old.sel(time=slice(None, new_first - _ONE_TICK))
-        return ds_subset if len(ds_subset.time) > 0 else None
-
-    return ds_old
+    # Keep the head of ds_old that sits strictly before the incoming window
+    # — slice directly, no second zarr open. The bound is one tick short of
+    # new_first rather than a day short, so a step on the same day as the
+    # incoming start but earlier than it is retained rather than discarded.
+    #
+    # Disjoint windows land here too, and must: returning ds_old whole for them
+    # put it in the head *and* in the tail _append_data selects after ds_new,
+    # so a store holding June-December that was backfilled with January came
+    # back with June-December written twice and a non-monotonic time axis. When
+    # ds_new is the earlier side this slice is empty (None) and the tail alone
+    # contributes ds_old; when it is the later side the slice is all of ds_old
+    # and the tail is empty. One expression covers overlap and disjoint alike,
+    # which is what keeps the two from drifting apart again.
+    ds_subset = ds_old.sel(time=slice(None, new_first - _ONE_TICK))
+    return ds_subset if len(ds_subset.time) > 0 else None
