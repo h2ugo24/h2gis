@@ -97,6 +97,7 @@ def write_append_zarr(
         # one run vanished on the next, so merge_records never found anything to
         # merge with and backfill_provenance's "skip files that already have the
         # attr" was undone by the following append.
+
         # Before anything is written: a packed store's scale was fixed at
         # creation and an append inherits it, so data outside that range has no
         # encoding and would wrap rather than clip. No-op for float32 stores.
@@ -409,6 +410,20 @@ def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
     # Backup-swap: keep original until new file is confirmed in place
     backup_path = path.with_name(path.name + ".bak")
     logger.debug(f"Atomic swap: {path.name}")
+    # Clear a stale backup first. A crash between the tmp → path move below and
+    # the rmtree that follows it leaves *both* path and path.bak present, and
+    # _restore_orphaned_backup only handles the other direction (path missing).
+    # shutil.move onto an existing directory moves *into* it rather than
+    # replacing it, so without this the store lands at path.bak/<name>.zarr and
+    # the rollback branch restores a directory mixing stale files with a nested
+    # store — losing the history in the one branch that exists to preserve it.
+    # Reaching here means path exists, so any surviving backup is known-stale.
+    if backup_path.exists():
+        logger.warning(
+            f"Discarding stale backup {backup_path.name} left by an earlier "
+            "interrupted append."
+        )
+        shutil.rmtree(backup_path, ignore_errors=True)
     shutil.move(str(path), str(backup_path))
     try:
         shutil.move(str(tmp_path), str(path))

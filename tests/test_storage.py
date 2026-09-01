@@ -141,6 +141,64 @@ class TestAtomicSwap:
 
         assert not path.with_name(path.name + ".bak").exists()
 
+    def test_stale_backup_does_not_nest_the_store_on_rollback(self, tmp_path):
+        """
+        A crash between the tmp → path move and the rmtree that follows it
+        leaves *both* path and path.bak present, and _restore_orphaned_backup
+        only handles the other direction. shutil.move onto an existing
+        directory moves *into* it, so the live store used to land at
+        path.bak/sst.zarr — and the rollback then restored that directory,
+        whose top level is the *stale* store. The failure is silent: the
+        restored path opens fine and holds the wrong data.
+        """
+        path = tmp_path / "sst.zarr"
+        _make_ds("2020-01-01", 5).to_zarr(path)
+
+        # A stale backup that is itself a valid zarr, holding different data.
+        # If it survives the swap it is what the rollback restores.
+        stale = path.with_name(path.name + ".bak")
+        _make_ds("2019-01-01", 3, seed=9).to_zarr(stale)
+
+        call_count = [0]
+        original_move = shutil.move
+
+        def failing_move(src, dst):
+            call_count[0] += 1
+            if call_count[0] == 2:  # second call: tmp → final, forces rollback
+                raise OSError("simulated disk full")
+            return original_move(src, dst)
+
+        with patch("h2mare.storage.storage.shutil.move", side_effect=failing_move):
+            with pytest.raises(RuntimeError, match="original restored from backup"):
+                _append_data("sst", _make_ds("2020-01-03", 5), path)
+
+        assert not (path / "sst.zarr").exists(), "the store was nested inside itself"
+        ds = xr.open_zarr(path, consolidated=False)
+        try:
+            assert len(ds.time) == 5, (
+                "rollback restored the stale backup, not the store"
+            )
+            assert pd.Timestamp(ds.time.values[0]) == pd.Timestamp("2020-01-01")
+        finally:
+            ds.close()
+
+    def test_stale_backup_is_cleared_on_a_successful_swap(self, tmp_path):
+        """The same stale backup must not survive a swap that succeeds."""
+        path = tmp_path / "sst.zarr"
+        _make_ds("2020-01-01", 5).to_zarr(path)
+        stale = path.with_name(path.name + ".bak")
+        _make_ds("2019-01-01", 3, seed=9).to_zarr(stale)
+
+        _append_data("sst", _make_ds("2020-01-03", 5), path)
+
+        assert not stale.exists()
+        assert not (path / "sst.zarr").exists()
+        ds = xr.open_zarr(path, consolidated=False)
+        try:
+            assert len(ds.time) == 7  # Jan 1-2 retained + Jan 3-7 incoming
+        finally:
+            ds.close()
+
 
 # ---------------------------------------------------------------------------
 # _append_data — in-place append fast path
