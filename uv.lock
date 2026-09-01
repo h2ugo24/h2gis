@@ -16,9 +16,6 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
-[manifest]
-constraints = [{ name = "sparse", specifier = "==0.14.0" }]
-
 [[package]]
 name = "affine"
 version = "2.4.0"
@@ -582,7 +579,7 @@ wheels = [
 
 [[package]]
 name = "copernicusmarine"
-version = "2.4.0"
+version = "2.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "arcosparse" },
@@ -599,9 +596,9 @@ dependencies = [
     { name = "xarray" },
     { name = "zarr" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/36/1a/3e9d2905a6a396c9da09dc95fab0bf0ce9382732940ad1a75efdba95200b/copernicusmarine-2.4.0.tar.gz", hash = "sha256:4de79f7402f482784fbc498ad05e82af284c7aa48c070a04184e52e5c21e0383", size = 98589, upload-time = "2026-04-20T13:28:39.052Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8d/1d/af62923754b8bad9ab114321b62a46d3e870edf4122c4f91708574ef87ec/copernicusmarine-2.4.1.tar.gz", hash = "sha256:3e9bc466de65abdfa38fb48dae107cec5b58f9dc7f84bab563f94ad379d632e8", size = 98662, upload-time = "2026-05-11T08:37:13.362Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/32/0a/7f36e5016563489c55a7a035a5c9c1c54c9e1ac381a6b533f1da1b473c7b/copernicusmarine-2.4.0-py3-none-any.whl", hash = "sha256:1b4f5f3257917b03dbfd001496d855b059cec041c49112453d45fd0e49754921", size = 130499, upload-time = "2026-04-20T13:28:37.614Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/7d/fae36b221be3b491bb46ff59817e452dd3f3d842aefef399d77253ff8259/copernicusmarine-2.4.1-py3-none-any.whl", hash = "sha256:e13fb4a50e469aca4063a0de5d984af9c3da4a7343c605021b86e247613079a5", size = 130541, upload-time = "2026-05-11T08:37:11.55Z" },
 ]
 
 [[package]]
@@ -1153,7 +1150,7 @@ requires-dist = [
     { name = "cartopy", specifier = ">=0.23.0" },
     { name = "cdsapi", specifier = ">=0.7.0" },
     { name = "cfgrib", specifier = ">=0.9.10" },
-    { name = "copernicusmarine", specifier = ">=2.0.0" },
+    { name = "copernicusmarine", specifier = ">=2.4.1" },
     { name = "dask", specifier = ">=2024.1.0" },
     { name = "duckdb", specifier = ">=1.0.0" },
     { name = "eccodes", specifier = ">=1.7.0" },
