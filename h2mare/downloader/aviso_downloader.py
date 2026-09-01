@@ -128,7 +128,20 @@ class AVISODownloader(BaseDownloader):
         return sorted(all_files)
 
     def connect_ftp(self):
-        """Connect to the FTP server."""
+        """
+        Connect to the AVISO FTP server.
+
+        Unencrypted, and not by choice. ``ftp-access.aviso.altimetry.fr`` offers
+        plain FTP only: its ``FEAT`` reply advertises no ``AUTH``, and an
+        explicit ``AUTH TLS`` is refused with *"500 AUTH not understood"*
+        (checked 2026-09-01). So the credentials and the transfers both cross
+        the network in cleartext, and there is no flag here that changes it —
+        see the warning beside ``AVISO_USERNAME`` in ``.env.template``.
+
+        If AVISO enables AUTH TLS later, this becomes ``FTP_TLS`` plus a
+        ``prot_p()`` after login; nothing else in this class depends on which
+        of the two it is.
+        """
         # FTP Connection - for AVISO data, dataset_id represents the ftp path.
         # server is the root of the path
         ftp_server = self.app_config.secrets.aviso_ftp_server

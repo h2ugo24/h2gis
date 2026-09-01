@@ -70,6 +70,8 @@ AVISO_PASSWORD=your_password
 AVISO_FTP_SERVER=ftp-access.aviso.altimetry.fr
 ```
 
+> **AVISO credentials cross the network in cleartext.** The AVISO server offers plain FTP only — it refuses `AUTH TLS` ("500 AUTH not understood", checked 2026-09-01) — so there is no FTPS option to enable. Use a password unique to AVISO, and prefer running downloads from a trusted network.
+
 CMEMS credentials are configured via the `copernicusmarine` client. ERA5 / CDS credentials are configured via the `cdsapi` client. See the [CDS documentation](https://cds.climate.copernicus.eu/how-to-api) for setup.
 
 > **Note:** Both files must be present in the directory where you run `h2mare`. You can also set the `H2MARE_ROOT` environment variable to point to a different directory containing them.
