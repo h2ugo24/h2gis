@@ -32,7 +32,7 @@ dependencies = [
     "cfgrib>=0.9.10",
     "eccodes>=1.7.0",
     "netCDF4>=1.6.0",
-    "copernicusmarine>=2.0.0",
+    "copernicusmarine>=2.4.1",
     "dask>=2024.1.0",
     "duckdb>=1.0.0",
     "ephem>=4.1.0",
@@ -76,22 +76,6 @@ h2mare = "h2mare.cli:app"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["h2mare*"]
-
-[tool.uv]
-# sparse>=0.15 breaks copernicusmarine.subset.
-#
-# Currently inert, and deliberately kept that way. copernicusmarine 2.4.0 does
-# not depend on sparse at all (its only sparse-ish requirement is `arcosparse`,
-# an unrelated package), so nothing in the tree resolves sparse and this
-# constrains a package that is never installed — `sparse` appears in uv.lock
-# only as this declaration, never as a locked package.
-#
-# It stays as a constraint rather than moving to [project.dependencies]. A
-# constraint applies only if something else pulls sparse in; a dependency would
-# *force* it, dragging numba and llvmlite (~45 MB) into every install to guard
-# against a break that cannot currently happen. The cost of keeping it here is
-# zero and it still bites if a future copernicusmarine reintroduces sparse.
-constraint-dependencies = ["sparse==0.14.0"]
 
 [dependency-groups]
 dev = [
