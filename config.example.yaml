@@ -1,0 +1,122 @@
+# h2mare — minimal example configuration
+#
+# Copy to `config.yaml` in your working directory (or under H2MARE_ROOT) and
+# edit. This holds three variables chosen to show the shapes you are likely to
+# need, plus the `h2ds` entry the compile step requires. The full shipped
+# config.yaml in this repository configures 16 variables and is a reference,
+# not a starting point.
+#
+# Every field is documented at
+# https://h2ugoparra.github.io/h2mare/configuration/ — the table there is the
+# authority, and this file only shows the common combinations.
+#
+# Before your first run you also need a `.env` (see .env.template) with
+# STORE_ROOT set, plus credentials for whichever sources you enable:
+#   cmems  -> run `copernicusmarine login`; nothing is read from .env
+#   cds    -> configure the `cdsapi` client's own credentials file
+#   aviso  -> AVISO_USERNAME / AVISO_PASSWORD / AVISO_FTP_SERVER in .env
+
+variables:
+  # --- A plain 2-D daily variable from CMEMS. The common case. -------------
+  sst:
+    local_folder: CMEMS_SST
+    archive_raw: false
+    source_vars: [analysed_sst, analysis_error]
+    # Names as they appear in the compiled h2ds store, including anything the
+    # convert step derives. `h2mare parquet --add-var` selects on these.
+    compiled_vars: [sst, analysis_error, sst_std, sst_fdist]
+    dataset_id_rep: METOFFICE-GLO-SST-L4-REP-OBS-SST
+    # Optional: a near-real-time id for the recent tail, superseded by REP
+    # once the reprocessed product catches up.
+    dataset_id_nrt: METOFFICE-GLO-SST-L4-NRT-OBS-SST-V2
+    source: cmems
+    # Matched against each raw filename to recover its date(s). The range tail
+    # is optional because a one-day download is named with a single date.
+    pattern: (\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?
+    filename_date_range: true
+    # true  -> copernicusmarine.subset(), honouring bbox and source_vars
+    # false -> copernicusmarine.get(), whole original files
+    subset: true
+    bbox: [-80, 0, 10, 70]
+
+  # --- A 3-D variable. Each depth level becomes its own compiled column. ---
+  o2:
+    local_folder: CMEMS_Biochemical
+    archive_raw: false
+    source_vars: [o2]
+    compiled_vars: [o2_0, o2_100, o2_500, o2_1000]
+    dataset_id_rep: cmems_mod_glo_bgc_my_0.25deg_P1D-m
+    source: cmems
+    pattern: (\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?
+    filename_date_range: true
+    subset: true
+    bbox: [-80, 0, 10, 70]
+    # What to download...
+    depth_range: [0, 1000]
+    # ...and which levels to publish. A 3-D variable declaring neither this nor
+    # extract_depth_slices is refused rather than averaged over its full range.
+    compile_depth_slices: [0, 100, 500, 1000]
+
+  # --- An hourly ERA5 variable, scale/offset packed on disk. ---------------
+  atm-instante:
+    local_folder: CDS_Atm_instante
+    archive_raw: false
+    source_vars:
+      - mean_sea_level_pressure
+      - 10m_u_component_of_wind
+      - 10m_v_component_of_wind
+      - total_cloud_cover
+    # wind_* are derived at compile time and exist only in h2ds, which is why
+    # a date-only extraction of them needs a current `h2mare compile`.
+    compiled_vars: [msl, u10, v10, tcc, wind_mean, wind_std, wind_max]
+    dataset_id_rep: reanalysis-era5-single-levels
+    source: cds
+    pattern: (\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?
+    filename_date_range: true
+    # Keep ERA5's native cadence; the daily reduction happens at compile time.
+    time_step: hourly
+    # int16 packing, ~2/3 the size. The scale is derived from the first batch
+    # written and fixed for the store's lifetime, so build a packed store from
+    # a representative span — see the warning in the configuration docs.
+    store_dtype: int16
+    bbox: [-80, 0, 10, 70]
+
+  # --- The compiled product. Required: `h2mare compile` writes here. -------
+  h2ds:
+    local_folder: h2ds
+    archive_raw: false
+    source_vars: []
+    compiled_vars: []
+    dataset_id_rep: compiled-data-0.25deg-P1D
+    source: h2mare
+    bbox: [-80, 0, 10, 70]
+
+# Root attributes stamped on every written store. Extents and Conventions are
+# computed per file and must not be set here.
+global_attrs:
+  title: "My h2mare dataset"
+  summary: "Daily ocean and atmosphere variables on a common 0.25 degree grid."
+  creator_name: "Your Name"
+  license: "CC-BY-4.0"
+  geospatial_lat_resolution: 0.25
+  geospatial_lon_resolution: 0.25
+
+# Per-variable CF attributes, applied by both write paths. Validated against
+# udunits2 and a CF standard-name snapshot by tests/test_cf_compliance.py.
+variable_attrs:
+  sst:
+    standard_name: sea_surface_temperature
+    long_name: "Analysed sea surface temperature"
+    units: degree_Celsius
+  msl:
+    standard_name: air_pressure_at_mean_sea_level
+    long_name: "Mean sea level pressure"
+    units: hPa
+
+# Where a native store differs from the compiled product. msl is stored in Pa
+# natively and converted to hPa for h2ds, and the hourly store carries no
+# cell_methods naming a daily reduction.
+native_attr_overrides:
+  atm-instante:
+    msl:
+      units: Pa
