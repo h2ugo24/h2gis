@@ -74,3 +74,99 @@ class TestNoGlobalWarningSuppression:
             f"at import: {offenders}. Suppress specific warnings by message in "
             f"pyproject.toml, or fix the code that raises them."
         )
+
+
+# Writing any zarr trips zarr 3.x's "consolidated metadata is not in the v3 spec"
+# warning, once per to_zarr. The CLI silences it by message; these check the
+# suppression is real, is narrow, and is scoped to the CLI rather than to import.
+_ZARR_WRITE_PROBE = """
+import tempfile, warnings, os, sys
+import numpy as np, xarray as xr
+{setup}
+ds = xr.Dataset({{"v": (("time",), np.arange(3.0))}}, coords={{"time": np.arange(3)}})
+with tempfile.TemporaryDirectory() as d:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+{filters}
+        ds.to_zarr(os.path.join(d, "t.zarr"))
+        warnings.warn("canary-unrelated", UserWarning)
+print("CONSOLIDATED" if any(
+    "Consolidated metadata" in str(w.message) for w in caught) else "NO_CONSOLIDATED")
+print("CANARY" if any(
+    "canary-unrelated" in str(w.message) for w in caught) else "NO_CANARY")
+"""
+
+
+def _run(code: str) -> list[str]:
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.split()
+
+
+class TestCliSilencesZarrConsolidatedWarning:
+    """The CLI filter must silence that one warning and nothing else."""
+
+    def test_warning_fires_without_the_filter(self):
+        """Guard the guard: the probe must see the warning when unfiltered."""
+        out = _run(_ZARR_WRITE_PROBE.format(setup="", filters="        pass"))
+        assert out == ["CONSOLIDATED", "CANARY"], out
+
+    def test_cli_filter_suppresses_it_but_not_other_warnings(self):
+        out = _run(
+            _ZARR_WRITE_PROBE.format(
+                setup="from h2mare.cli import _silence_known_benign_warnings",
+                filters="        _silence_known_benign_warnings()",
+            )
+        )
+        assert out == ["NO_CONSOLIDATED", "CANARY"], out
+
+    def test_importing_the_cli_does_not_install_the_filter(self):
+        """The filter belongs to the CLI callback, not to importing h2mare."""
+        out = _run(
+            _ZARR_WRITE_PROBE.format(setup="import h2mare.cli", filters="        pass")
+        )
+        assert out == ["CONSOLIDATED", "CANARY"], out
+
+
+# A rolling std whose window is wholly on land reduces over zero valid values,
+# so dask's `divide(total, n)` evaluates 0/0. The filter must silence that
+# without silencing a 0/0 that h2mare's own code performs.
+_DASK_DIVIDE_PROBE = """
+import warnings
+import numpy as np, dask.array as da, xarray as xr
+{setup}
+d = xr.DataArray(da.from_array(np.full((6, 3, 3), np.nan), chunks=(3, 3, 3)),
+                 dims=("time", "lat", "lon"))
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+{filters}
+    d.std("time").compute()                 # all-NaN reduction inside dask
+    np.divide(np.zeros(3), np.zeros(3))     # a 0/0 in our own code
+    np.array([1.0]) / np.array([0.0])       # x/0 in our own code
+msgs = [str(w.message) for w in caught]
+print("DASK" if any(
+    "invalid value" in m for m, w in zip(msgs, caught)
+    if "numpy_compat" in w.filename) else "NO_DASK")
+print("OWN_INVALID" if any(
+    "invalid value" in m for m, w in zip(msgs, caught)
+    if "numpy_compat" not in w.filename) else "NO_OWN_INVALID")
+print("OWN_DIVZERO" if any("divide by zero" in m for m in msgs) else "NO_OWN_DIVZERO")
+"""
+
+
+class TestCliSilencesDaskAllNaNDivide:
+    def test_warning_fires_without_the_filter(self):
+        out = _run(_DASK_DIVIDE_PROBE.format(setup="", filters="    pass"))
+        assert out == ["DASK", "OWN_INVALID", "OWN_DIVZERO"], out
+
+    def test_filter_silences_dask_but_not_our_own_zero_division(self):
+        """The whole point of the module pin: our own 0/0 must still surface."""
+        out = _run(
+            _DASK_DIVIDE_PROBE.format(
+                setup="from h2mare.cli import _silence_known_benign_warnings",
+                filters="    _silence_known_benign_warnings()",
+            )
+        )
+        assert out == ["NO_DASK", "OWN_INVALID", "OWN_DIVZERO"], out

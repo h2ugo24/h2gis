@@ -1,6 +1,7 @@
 """H2GIS command-line interface."""
 
 import sys
+import warnings
 
 import typer
 
@@ -34,10 +35,58 @@ def _use_utf8_console() -> None:
             reconfigure(encoding="utf-8", errors="replace")
 
 
+def _silence_known_benign_warnings() -> None:
+    """Filter warnings that are noise for every h2mare command, by message.
+
+    Installed here rather than at module import: importing h2mare as a library
+    must leave the interpreter's filters untouched, which
+    ``tests/test_warning_filters.py`` enforces after six modules once installed
+    blanket ignores at import and swallowed the AVISO missing-credentials
+    warning. Each entry is pinned to an exact message so a *new* warning still
+    reaches the console. ``pyproject.toml``'s ``filterwarnings`` covers the same
+    ground under pytest; keep the two lists in step.
+    """
+    from zarr.errors import ZarrUserWarning
+
+    # zarr 3.x warns that consolidated metadata sits outside the Zarr v3 spec.
+    # It is raised from `consolidate_metadata`, so it is a write-path warning
+    # only: every `to_zarr` triggers it (xarray consolidates by default) and no
+    # read ever does. h2mare cannot be bitten by what it warns about, because
+    # every `open_zarr` call site passes `consolidated=False` and so never reads
+    # the consolidated block. Appends re-consolidate, so it cannot go stale for
+    # an outside reader either. Drops out if xarray stops consolidating by
+    # default or zarr folds this into the spec.
+    warnings.filterwarnings(
+        "ignore",
+        message="Consolidated metadata is currently not part in the Zarr format 3 specification",
+        category=ZarrUserWarning,
+    )
+
+    # dask's reduction `divide` (numpy_compat.divide, the numpy-2.x fallback)
+    # computes `total / n` for var/std. A 3x3 rolling std whose window lies
+    # wholly on land has n == 0, so it evaluates 0/0 -> NaN and numpy flags the
+    # invalid operation. NaN is the correct answer there, and `clip_land_data`
+    # makes such windows certain on every run over the configured bbox, so the
+    # warning fires whatever the data looks like and reports nothing about it.
+    # Real holes in a store are what `h2mare audit` is for, not this.
+    #
+    # Pinned to dask's module so h2mare's own 0/0 or x/0 still surfaces: the
+    # `_std` chain is lazy (see process_sst), so it is raised at compute time,
+    # far from the expression, and a local errstate around the call site would
+    # not catch it. `mean` is unaffected — dask guards that one already.
+    warnings.filterwarnings(
+        "ignore",
+        message="invalid value encountered in divide",
+        category=RuntimeWarning,
+        module=r"dask\.array\.numpy_compat",
+    )
+
+
 @app.callback()
 def _configure() -> None:
     """Configure the console and logging once for every h2mare command."""
     _use_utf8_console()
+    _silence_known_benign_warnings()
     configure_logging()
 
 
