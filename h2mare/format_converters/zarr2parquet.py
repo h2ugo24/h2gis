@@ -94,9 +94,11 @@ def convert_zarr_to_parquet(
         ds = xr.open_zarr(zarr_path, **(open_kwargs or {}))
     else:
         stores = [str(p) for p in zarr_path]
-        # data_vars pinned for the reason netcdf2zarr pins it: xarray's
-        # default flips from "all" to "minimal" here, and these stores are
-        # read to be flattened into Parquet columns.
+        # data_vars pinned for the reason netcdf2zarr pins it: xarray's default
+        # flips from "all" to "minimal" here. Moot for the stores this reads —
+        # every variable in them carries `time` — but these rows become Parquet
+        # columns, so the set of variables the flip could change is exactly the
+        # set of columns written.
         ds = xr.open_mfdataset(
             stores, engine="zarr", **{"data_vars": "all", **(open_kwargs or {})}
         )
