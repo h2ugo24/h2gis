@@ -573,3 +573,55 @@ class TestDownloadParallelCollectsFailures:
 
         assert not (tmp_path / "b.nc").exists()
         assert not (tmp_path / "b.nc.part").exists()
+
+
+# ---------------------------------------------------------------------------
+# FTP connection lifecycle
+#
+# The control connection opened in __init__ used to be left for the garbage
+# collector ("# self.ftp.quit()" sat commented out), which Python reports as
+# ResourceWarning: unclosed <socket.socket ...>. ResourceWarning is ignored by
+# default, so it only showed up under PYTHONWARNINGS=always.
+# ---------------------------------------------------------------------------
+
+
+class TestFtpConnectionLifecycle:
+    def test_close_quits_the_connection(self, dl):
+        ftp = dl.ftp
+        dl.close()
+        ftp.quit.assert_called_once()
+
+    def test_close_falls_back_to_close_when_quit_raises(self, dl):
+        """A server that already dropped the link makes QUIT raise."""
+        ftp = dl.ftp
+        ftp.quit.side_effect = OSError("connection reset")
+        dl.close()
+        ftp.close.assert_called_once()
+
+    def test_close_is_idempotent(self, dl):
+        dl.close()
+        dl.close()  # must not raise
+
+    def test_context_manager_closes(self, tmp_path):
+        with patch.object(AVISODownloader, "connect_ftp", return_value=MagicMock()):
+            with AVISODownloader(
+                "fsle",
+                app_config=_make_app_config(_ENTRY),
+                store_root=tmp_path,
+                download_root=tmp_path,
+            ) as d:
+                ftp = d.ftp
+        ftp.quit.assert_called_once()
+
+    def test_reconnect_releases_the_dead_socket(self, dl, tmp_path):
+        """Each reconnect used to strand the previous socket."""
+        dead = dl.ftp
+        dead.voidcmd.side_effect = OSError("connection lost")
+        fresh = MagicMock()
+
+        with patch.object(AVISODownloader, "connect_ftp", return_value=fresh):
+            with patch("h2mare.downloader.aviso_downloader._download_to_part"):
+                dl.download_file("/dataset/fsle/rep/a.nc", tmp_path)
+
+        dead.close.assert_called_once()
+        assert dl.ftp is fresh

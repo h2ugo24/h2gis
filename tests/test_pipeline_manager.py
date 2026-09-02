@@ -379,3 +379,41 @@ class TestCleanup:
 
         d._cleanup_empty_download_dir()
         assert not empty_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Downloader connections are released per variable
+#
+# AVISO holds one FTP control connection for the whole run. Every branch after
+# run() can `continue`, so the close has to sit in a finally or the connection
+# leaks for the rest of the process (ResourceWarning: unclosed socket).
+# ---------------------------------------------------------------------------
+
+
+class TestDownloaderIsClosed:
+    def test_closed_after_a_successful_download(self, tmp_path):
+        cfg = _make_config("sst")
+        manager, cls = _make_manager(cfg, tmp_path, no_convert=True)
+        cls.return_value.run.return_value = True
+
+        manager.run()
+
+        cls.return_value.close.assert_called_once()
+
+    def test_closed_when_the_download_raises(self, tmp_path):
+        cfg = _make_config("sst")
+        manager, cls = _make_manager(cfg, tmp_path, no_convert=True)
+        cls.return_value.run.side_effect = RuntimeError("ftp exploded")
+
+        manager.run()
+
+        cls.return_value.close.assert_called_once()
+
+    def test_closed_once_per_variable(self, tmp_path):
+        cfg = _make_config("sst", "chl", "mld")
+        manager, cls = _make_manager(cfg, tmp_path, no_convert=True)
+        cls.return_value.run.return_value = True
+
+        manager.run()
+
+        assert cls.return_value.close.call_count == 3

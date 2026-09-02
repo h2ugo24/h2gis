@@ -142,6 +142,11 @@ class PipelineManager:
                     )
                     _failed = True
                     continue
+                finally:
+                    # One downloader per variable, so its connection dies with
+                    # the iteration. Must be a finally: every branch below can
+                    # `continue`. No-op for the HTTP sources.
+                    downloader.close()
 
                 if self.no_convert or self.dry_run or not downloaded:
                     continue
