@@ -128,3 +128,45 @@ class TestCliSilencesZarrConsolidatedWarning:
             _ZARR_WRITE_PROBE.format(setup="import h2mare.cli", filters="        pass")
         )
         assert out == ["CONSOLIDATED", "CANARY"], out
+
+
+# A rolling std whose window is wholly on land reduces over zero valid values,
+# so dask's `divide(total, n)` evaluates 0/0. The filter must silence that
+# without silencing a 0/0 that h2mare's own code performs.
+_DASK_DIVIDE_PROBE = """
+import warnings
+import numpy as np, dask.array as da, xarray as xr
+{setup}
+d = xr.DataArray(da.from_array(np.full((6, 3, 3), np.nan), chunks=(3, 3, 3)),
+                 dims=("time", "lat", "lon"))
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+{filters}
+    d.std("time").compute()                 # all-NaN reduction inside dask
+    np.divide(np.zeros(3), np.zeros(3))     # a 0/0 in our own code
+    np.array([1.0]) / np.array([0.0])       # x/0 in our own code
+msgs = [str(w.message) for w in caught]
+print("DASK" if any(
+    "invalid value" in m for m, w in zip(msgs, caught)
+    if "numpy_compat" in w.filename) else "NO_DASK")
+print("OWN_INVALID" if any(
+    "invalid value" in m for m, w in zip(msgs, caught)
+    if "numpy_compat" not in w.filename) else "NO_OWN_INVALID")
+print("OWN_DIVZERO" if any("divide by zero" in m for m in msgs) else "NO_OWN_DIVZERO")
+"""
+
+
+class TestCliSilencesDaskAllNaNDivide:
+    def test_warning_fires_without_the_filter(self):
+        out = _run(_DASK_DIVIDE_PROBE.format(setup="", filters="    pass"))
+        assert out == ["DASK", "OWN_INVALID", "OWN_DIVZERO"], out
+
+    def test_filter_silences_dask_but_not_our_own_zero_division(self):
+        """The whole point of the module pin: our own 0/0 must still surface."""
+        out = _run(
+            _DASK_DIVIDE_PROBE.format(
+                setup="from h2mare.cli import _silence_known_benign_warnings",
+                filters="    _silence_known_benign_warnings()",
+            )
+        )
+        assert out == ["NO_DASK", "OWN_INVALID", "OWN_DIVZERO"], out

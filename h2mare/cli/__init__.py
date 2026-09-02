@@ -62,6 +62,25 @@ def _silence_known_benign_warnings() -> None:
         category=ZarrUserWarning,
     )
 
+    # dask's reduction `divide` (numpy_compat.divide, the numpy-2.x fallback)
+    # computes `total / n` for var/std. A 3x3 rolling std whose window lies
+    # wholly on land has n == 0, so it evaluates 0/0 -> NaN and numpy flags the
+    # invalid operation. NaN is the correct answer there, and `clip_land_data`
+    # makes such windows certain on every run over the configured bbox, so the
+    # warning fires whatever the data looks like and reports nothing about it.
+    # Real holes in a store are what `h2mare audit` is for, not this.
+    #
+    # Pinned to dask's module so h2mare's own 0/0 or x/0 still surfaces: the
+    # `_std` chain is lazy (see process_sst), so it is raised at compute time,
+    # far from the expression, and a local errstate around the call site would
+    # not catch it. `mean` is unaffected — dask guards that one already.
+    warnings.filterwarnings(
+        "ignore",
+        message="invalid value encountered in divide",
+        category=RuntimeWarning,
+        module=r"dask\.array\.numpy_compat",
+    )
+
 
 @app.callback()
 def _configure() -> None:
