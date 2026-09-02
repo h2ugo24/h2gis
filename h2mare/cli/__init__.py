@@ -1,6 +1,7 @@
 """H2GIS command-line interface."""
 
 import sys
+import warnings
 
 import typer
 
@@ -34,10 +35,39 @@ def _use_utf8_console() -> None:
             reconfigure(encoding="utf-8", errors="replace")
 
 
+def _silence_known_benign_warnings() -> None:
+    """Filter warnings that are noise for every h2mare command, by message.
+
+    Installed here rather than at module import: importing h2mare as a library
+    must leave the interpreter's filters untouched, which
+    ``tests/test_warning_filters.py`` enforces after six modules once installed
+    blanket ignores at import and swallowed the AVISO missing-credentials
+    warning. Each entry is pinned to an exact message so a *new* warning still
+    reaches the console. ``pyproject.toml``'s ``filterwarnings`` covers the same
+    ground under pytest; keep the two lists in step.
+    """
+    from zarr.errors import ZarrUserWarning
+
+    # zarr 3.x warns that consolidated metadata sits outside the Zarr v3 spec.
+    # It is raised from `consolidate_metadata`, so it is a write-path warning
+    # only: every `to_zarr` triggers it (xarray consolidates by default) and no
+    # read ever does. h2mare cannot be bitten by what it warns about, because
+    # every `open_zarr` call site passes `consolidated=False` and so never reads
+    # the consolidated block. Appends re-consolidate, so it cannot go stale for
+    # an outside reader either. Drops out if xarray stops consolidating by
+    # default or zarr folds this into the spec.
+    warnings.filterwarnings(
+        "ignore",
+        message="Consolidated metadata is currently not part in the Zarr format 3 specification",
+        category=ZarrUserWarning,
+    )
+
+
 @app.callback()
 def _configure() -> None:
     """Configure the console and logging once for every h2mare command."""
     _use_utf8_console()
+    _silence_known_benign_warnings()
     configure_logging()
 
 

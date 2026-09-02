@@ -74,3 +74,57 @@ class TestNoGlobalWarningSuppression:
             f"at import: {offenders}. Suppress specific warnings by message in "
             f"pyproject.toml, or fix the code that raises them."
         )
+
+
+# Writing any zarr trips zarr 3.x's "consolidated metadata is not in the v3 spec"
+# warning, once per to_zarr. The CLI silences it by message; these check the
+# suppression is real, is narrow, and is scoped to the CLI rather than to import.
+_ZARR_WRITE_PROBE = """
+import tempfile, warnings, os, sys
+import numpy as np, xarray as xr
+{setup}
+ds = xr.Dataset({{"v": (("time",), np.arange(3.0))}}, coords={{"time": np.arange(3)}})
+with tempfile.TemporaryDirectory() as d:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+{filters}
+        ds.to_zarr(os.path.join(d, "t.zarr"))
+        warnings.warn("canary-unrelated", UserWarning)
+print("CONSOLIDATED" if any(
+    "Consolidated metadata" in str(w.message) for w in caught) else "NO_CONSOLIDATED")
+print("CANARY" if any(
+    "canary-unrelated" in str(w.message) for w in caught) else "NO_CANARY")
+"""
+
+
+def _run(code: str) -> list[str]:
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.split()
+
+
+class TestCliSilencesZarrConsolidatedWarning:
+    """The CLI filter must silence that one warning and nothing else."""
+
+    def test_warning_fires_without_the_filter(self):
+        """Guard the guard: the probe must see the warning when unfiltered."""
+        out = _run(_ZARR_WRITE_PROBE.format(setup="", filters="        pass"))
+        assert out == ["CONSOLIDATED", "CANARY"], out
+
+    def test_cli_filter_suppresses_it_but_not_other_warnings(self):
+        out = _run(
+            _ZARR_WRITE_PROBE.format(
+                setup="from h2mare.cli import _silence_known_benign_warnings",
+                filters="        _silence_known_benign_warnings()",
+            )
+        )
+        assert out == ["NO_CONSOLIDATED", "CANARY"], out
+
+    def test_importing_the_cli_does_not_install_the_filter(self):
+        """The filter belongs to the CLI callback, not to importing h2mare."""
+        out = _run(
+            _ZARR_WRITE_PROBE.format(setup="import h2mare.cli", filters="        pass")
+        )
+        assert out == ["CONSOLIDATED", "CANARY"], out
