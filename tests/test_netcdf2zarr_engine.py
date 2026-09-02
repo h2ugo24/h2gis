@@ -167,3 +167,59 @@ def test_list_of_files_combined_by_coords(tmp_path):
     assert len(ds.time) == 6
     assert pd.Timestamp(ds.time.values[0]) == pd.Timestamp("2020-01-01")
     ds.close()
+
+
+# ---------------------------------------------------------------------------
+# data_vars is pinned, so xarray's coming default flip is a no-op
+# ---------------------------------------------------------------------------
+
+
+def _write_pair_with_static(tmp_path):
+    """Two daily files carrying a provider static (no time dim), like AVISO's.
+
+    xarray only warns when the choice actually changes something, which is
+    exactly when a data variable lacks the concat dim — so the static is what
+    makes these tests bite.
+    """
+    paths = []
+    for name, start, seed in (("a.nc", "2020-01-01", 1), ("b.nc", "2020-01-04", 2)):
+        ds = _make_ds(start, 3, seed=seed)
+        ds["crs"] = ((), 0.0)
+        paths.append(_write_nc(ds, tmp_path / name))
+    return paths
+
+
+def test_multi_file_convert_emits_no_futurewarning(tmp_path, recwarn):
+    """`data_vars` must be passed explicitly to open_mfdataset.
+
+    xarray warns that the default moves from "all" to None, which resolves to
+    "minimal" whenever the concat dim is present. Leaving it unset means a
+    future xarray silently changes what conversion writes.
+    """
+    a, b = _write_pair_with_static(tmp_path)
+
+    convert_netcdf_to_zarr([a, b], tmp_path / "out.zarr", name="adhoc")
+
+    offenders = [
+        str(w.message)
+        for w in recwarn
+        if issubclass(w.category, FutureWarning) and "data_vars" in str(w.message)
+    ]
+    assert not offenders, offenders
+
+
+def test_timeless_variable_stays_broadcast_along_time(tmp_path):
+    """Pinning "all" preserves today's behaviour, which the stores were written with.
+
+    Under the incoming default this variable would stay 0-d instead, so this
+    is what makes the pin a no-op rather than a silent format change.
+    """
+    a, b = _write_pair_with_static(tmp_path)
+
+    out = tmp_path / "out.zarr"
+    convert_netcdf_to_zarr([a, b], out, name="adhoc")
+
+    ds = xr.open_zarr(out)
+    assert "time" in ds["crs"].dims, ds["crs"].dims
+    assert len(ds.time) == 6
+    ds.close()

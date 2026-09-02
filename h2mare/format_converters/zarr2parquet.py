@@ -94,7 +94,12 @@ def convert_zarr_to_parquet(
         ds = xr.open_zarr(zarr_path, **(open_kwargs or {}))
     else:
         stores = [str(p) for p in zarr_path]
-        ds = xr.open_mfdataset(stores, engine="zarr", **(open_kwargs or {}))
+        # data_vars pinned for the reason netcdf2zarr pins it: xarray's
+        # default flips from "all" to "minimal" here, and these stores are
+        # read to be flattened into Parquet columns.
+        ds = xr.open_mfdataset(
+            stores, engine="zarr", **{"data_vars": "all", **(open_kwargs or {})}
+        )
 
     indexer = ParquetIndexer(Path(parquet_root), **(indexer_kwargs or {}))
 

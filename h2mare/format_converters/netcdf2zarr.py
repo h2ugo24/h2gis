@@ -142,13 +142,22 @@ def convert_netcdf_to_zarr(
         f"(engine={engine}, name={name!r})"
     )
 
+    # Explicit, for the reason ZarrReader pins it: xarray's default moves
+    # from data_vars="all" to data_vars=None, which resolves to "minimal"
+    # whenever the concat dim is present — as `time` always is here. That
+    # would stop broadcasting a time-less variable (a provider `crs`, say)
+    # along time, changing what this writes relative to every period
+    # already on disk. "all" is the current behaviour, pinned so the flip
+    # is a no-op. Switching to "minimal" is a deliberate call, not a
+    # default's to make, and it also cascades a second FutureWarning for
+    # `compat`.
     ds = xr.open_mfdataset(
         files,
         combine="by_coords",
         engine=engine,
         decode_timedelta=True,
         chunks={"time": 1, "depth": 1},
-        **(open_kwargs or {}),
+        **{"data_vars": "all", **(open_kwargs or {})},
     )
     try:
         if apply_rename:
@@ -836,12 +845,22 @@ class Netcdf2Zarr(BaseConverter):
             ds = cds.merge_time_step(ds)
             return cds._get_ds_for_month(ds)
 
+        # Explicit, for the reason ZarrReader pins it: xarray's default moves
+        # from data_vars="all" to data_vars=None, which resolves to "minimal"
+        # whenever the concat dim is present — as `time` always is here. That
+        # would stop broadcasting a time-less variable (a provider `crs`, say)
+        # along time, changing what this writes relative to every period
+        # already on disk. "all" is the current behaviour, pinned so the flip
+        # is a no-op. Switching to "minimal" is a deliberate call, not a
+        # default's to make, and it also cascades a second FutureWarning for
+        # `compat`.
         return xr.open_mfdataset(
             sorted(paths),
             combine="by_coords",
             engine=engine,
             decode_timedelta=True,
             chunks={"time": 1, "depth": 1},
+            data_vars="all",
             preprocess=(preprocess if self.var_config.merge_time_step else None),
         )
 
