@@ -141,6 +141,20 @@ class BaseDownloader(ABC):
         if self.download_dir.exists() and not any(self.download_dir.iterdir()):
             self.download_dir.rmdir()
 
+    def close(self) -> None:
+        """Release any connection the downloader holds open.
+
+        A no-op for the HTTP-based sources, which open a connection per request.
+        AVISO keeps one FTP control connection alive for the whole run and
+        overrides this.
+        """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
     @abstractmethod
     def run(self, *args, **kwargs) -> bool:
         """Execute the download. Returns True if files were downloaded, False otherwise."""

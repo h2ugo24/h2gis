@@ -104,6 +104,29 @@ class AVISODownloader(BaseDownloader):
         self._rep_availability = None
         self._nrt_availability = None
 
+    def close(self) -> None:
+        """Close the FTP control connection opened in __init__.
+
+        Without this the connection survives until the interpreter collects it,
+        which Python reports as ``ResourceWarning: unclosed <socket.socket ...>``
+        — invisible by default, since ResourceWarning is ignored unless asked
+        for. `quit()` sends QUIT and is the polite close, but it raises if the
+        server already went away, so fall back to `close()`, which only drops
+        the local handle. Idempotent: closing twice is not an error.
+        """
+        ftp = getattr(self, "ftp", None)
+        if ftp is None:
+            return
+        try:
+            ftp.quit()
+        except Exception:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+        finally:
+            self.ftp = None  # type: ignore[assignment]
+
     # ==================== FTP Connection ====================
     def get_all_files_recursively(self, path=""):
         """Recursively get all files using MLSD (more reliable if supported)"""
@@ -393,6 +416,15 @@ class AVISODownloader(BaseDownloader):
                 self.ftp.voidcmd("NOOP")
             except Exception:
                 logger.debug("FTP connection lost — reconnecting")
+                # Drop the dead socket before replacing it. `quit()` would try
+                # to QUIT over a connection that just failed NOOP, so close()
+                # is what actually releases the handle; without this each
+                # reconnect strands one more socket for the GC to complain
+                # about (ResourceWarning, hidden by default).
+                try:
+                    self.ftp.close()
+                except Exception:
+                    pass
                 self.ftp = self.connect_ftp()
                 dataset_id = getattr(self, "_current_dataset_id", None)
                 if dataset_id:
@@ -574,8 +606,10 @@ class AVISODownloader(BaseDownloader):
                     logger.error(f"❌ Failed to download {task.filepath}: {e}")
                     failed.append(task.filepath)
 
-        # Disconnect FTP
-        # self.ftp.quit()
+        # The FTP connection is *not* closed here: this object stays usable
+        # after a download (availability lookups re-use self.ftp), so the
+        # owner decides when it dies — see close(), which PipelineManager
+        # calls in a finally.
         # Written even on failure, and deliberately: the manifest records the
         # range that was *requested*, which is the only surviving statement of
         # what the store should contain once the raw files are archived or
