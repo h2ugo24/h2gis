@@ -142,15 +142,18 @@ def convert_netcdf_to_zarr(
         f"(engine={engine}, name={name!r})"
     )
 
-    # Explicit, for the reason ZarrReader pins it: xarray's default moves
-    # from data_vars="all" to data_vars=None, which resolves to "minimal"
-    # whenever the concat dim is present — as `time` always is here. That
-    # would stop broadcasting a time-less variable (a provider `crs`, say)
-    # along time, changing what this writes relative to every period
-    # already on disk. "all" is the current behaviour, pinned so the flip
-    # is a no-op. Switching to "minimal" is a deliberate call, not a
-    # default's to make, and it also cascades a second FutureWarning for
-    # `compat`.
+    # Explicit, for the reason ZarrReader pins it: xarray's default moves from
+    # data_vars="all" to data_vars=None, which resolves to "minimal" whenever
+    # the concat dim is present — as `time` always is here. The two differ only
+    # for a data variable carrying no time dim (AVISO's raw files ship `crs`,
+    # `lat_bnds`, `lon_bnds`): "all" broadcasts it along time, "minimal" leaves
+    # it alone.
+    #
+    # This engine applies only the `processor` its caller passes, which is
+    # often none, so here that difference reaches the store directly. "all" is
+    # the current behaviour, pinned so the flip is a no-op. Switching to
+    # "minimal" is a deliberate call, not a default's to make, and it cascades
+    # a second FutureWarning for `compat`.
     ds = xr.open_mfdataset(
         files,
         combine="by_coords",
@@ -847,13 +850,21 @@ class Netcdf2Zarr(BaseConverter):
 
         # Explicit, for the reason ZarrReader pins it: xarray's default moves
         # from data_vars="all" to data_vars=None, which resolves to "minimal"
-        # whenever the concat dim is present — as `time` always is here. That
-        # would stop broadcasting a time-less variable (a provider `crs`, say)
-        # along time, changing what this writes relative to every period
-        # already on disk. "all" is the current behaviour, pinned so the flip
-        # is a no-op. Switching to "minimal" is a deliberate call, not a
-        # default's to make, and it also cascades a second FutureWarning for
-        # `compat`.
+        # whenever the concat dim is present — as `time` always is here. The
+        # two differ only for a data variable carrying no time dim (AVISO's
+        # raw FSLE files ship `crs`, `lat_bnds`, `lon_bnds`): "all" broadcasts
+        # it along time, "minimal" leaves it alone.
+        #
+        # That difference does not reach any store today, so the pin is not
+        # protecting store contents — `process_dataset` runs after this and
+        # drops such variables (`process_fsle` selects `source_vars`), while
+        # the var_keys with no convert-time processor get raw files that
+        # already hold only what CMEMS `subset()` was asked for. What the pin
+        # protects is the dataset handed to `process_dataset`: a processor
+        # that indexes or merges by variable would see a different shape if
+        # xarray flipped the default under it. "all" is the current behaviour.
+        # Switching to "minimal" is a deliberate call, not a default's to
+        # make, and it cascades a second FutureWarning for `compat`.
         return xr.open_mfdataset(
             sorted(paths),
             combine="by_coords",

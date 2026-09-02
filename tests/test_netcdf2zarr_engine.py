@@ -209,10 +209,13 @@ def test_multi_file_convert_emits_no_futurewarning(tmp_path, recwarn):
 
 
 def test_timeless_variable_stays_broadcast_along_time(tmp_path):
-    """Pinning "all" preserves today's behaviour, which the stores were written with.
+    """Pinning "all" preserves what this engine hands back today.
 
-    Under the incoming default this variable would stay 0-d instead, so this
-    is what makes the pin a no-op rather than a silent format change.
+    Under the incoming default `crs` would stay 0-d instead. No configured
+    var_key writes such a variable to its store — the convert-time processors
+    drop them, and the sources without one deliver raw files that never held
+    them — but this engine applies only the `processor` its caller passes, so
+    here the difference is what lands on disk.
     """
     a, b = _write_pair_with_static(tmp_path)
 
