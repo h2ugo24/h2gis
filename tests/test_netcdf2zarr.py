@@ -572,6 +572,35 @@ class TestStagingSafety:
 
         assert (store / "nrt" / "old_20180101_20250101.nc").exists()
 
+    def test_staging_removes_the_spent_manifest(self, tmp_path):
+        """Regression: the manifest outlived the raw files and kept the folder alive."""
+        store = tmp_path / "store"
+        store.mkdir()
+        downloads = tmp_path / "downloads"
+        (downloads / "nrt").mkdir(parents=True)
+        (downloads / "nrt" / "new_20180101_20260713.nc").write_text("new")
+        (downloads / "h2mare_manifest.json").write_text("[]")
+
+        converter = _make_converter(tmp_path)
+        converter.store_root = store
+
+        converter._stage_eddies_to_store(downloads)
+
+        assert not (downloads / "h2mare_manifest.json").exists()
+        assert not any(downloads.rglob("*.nc"))
+
+    def test_manifest_kept_when_raw_already_lives_in_the_store(self, tmp_path):
+        """In-place layout: the raw files *are* the archive, manifest included."""
+        store = self._store_with_raw(tmp_path)
+        (store / "h2mare_manifest.json").write_text("[]")
+
+        converter = _make_converter(tmp_path)
+        converter.store_root = store
+
+        converter._stage_eddies_to_store(store)
+
+        assert (store / "h2mare_manifest.json").exists()
+
     def test_windowed_conversion_does_not_stage(self, tmp_path):
         """Staging is download cleanup; a re-conversion must not move raw files."""
         converter = _make_converter(tmp_path)
