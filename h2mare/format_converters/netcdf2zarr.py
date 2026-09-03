@@ -612,6 +612,9 @@ class Netcdf2Zarr(BaseConverter):
         Falls back to a flat move to ``store_root`` when no rep/nrt subfolders
         are present (backward compatibility).
 
+        The spent download manifest is deleted last, so the emptied folder can
+        be pruned after the run.
+
         Does nothing when the raw files already live in the store, i.e. when
         ``download_root`` and ``store_root`` are the same directory — which is
         the case whenever ``convert --in-dir`` is pointed at an ``archive_raw``
@@ -658,6 +661,17 @@ class Netcdf2Zarr(BaseConverter):
             paths = list(download_root.rglob("*.nc"))
             if paths:
                 safe_move_files(paths, self.store_root)
+
+        # EDDIESProcessor has already read the manifest for provenance by the
+        # time we stage, so it is spent. It is also the only non-".nc" file in
+        # download_root, and nothing else would ever remove it: run() returns
+        # early for a trajectory variable, so _cleanup_downloads — which drops
+        # the manifest along with the folder for every other variable — never
+        # runs, and the empty-dir prunes cannot fire while it sits there.
+        manifest_path = download_root / "h2mare_manifest.json"
+        if manifest_path.exists():
+            manifest_path.unlink()
+            logger.debug(f"Removed spent download manifest {manifest_path}")
 
     def _process_period(self, period, paths: list[Path]) -> None:
         logger.info(f"Processing period (year/year-month): {period}")
