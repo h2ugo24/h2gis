@@ -1,5 +1,6 @@
 """Tests for downloader/cds_downloader.py — CDSDownloader date logic and download_file."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import msgspec
@@ -177,3 +178,49 @@ class TestDownloadFile:
             dl.download_file(DateRange("2020-06-01", "2020-06-30"), output_dir=tmp_path)
             dataset_id = MockClient.return_value.retrieve.call_args[0][0]
         assert dataset_id == "reanalysis-era5-single-levels"
+
+
+# ---------------------------------------------------------------------------
+# Download manifest
+#
+# Netcdf2Zarr stamps source_datasets from this file and returns early without
+# one, which is why the ERA5 variables carried no provenance at all — not a
+# stale record but no record, in any year. CMEMS and AVISO have always written
+# one.
+# ---------------------------------------------------------------------------
+
+
+class TestManifest:
+    def _run(self, dl, tmp_path, start="2020-01-01", end="2020-03-31"):
+        with patch.object(dl, "download_file"):
+            dl.run(start_date=start, end_date=end, output_dir=tmp_path)
+        return json.loads((tmp_path / "h2mare_manifest.json").read_text())
+
+    def test_a_manifest_is_written(self, dl, tmp_path):
+        assert self._run(dl, tmp_path)
+
+    def test_one_record_per_download_window(self, dl, tmp_path):
+        records = self._run(dl, tmp_path)
+        assert [(r["start"], r["end"]) for r in records] == [
+            ("2020-01-01", "2020-01-31"),
+            ("2020-02-01", "2020-02-29"),
+            ("2020-03-01", "2020-03-31"),
+        ]
+
+    def test_every_record_names_the_reanalysis_product(self, dl, tmp_path):
+        """ERA5 has no rep/nrt handover — one product covers the lot."""
+        records = self._run(dl, tmp_path)
+        assert {r["dataset_id"] for r in records} == {"reanalysis-era5-single-levels"}
+        assert {r["dataset_type"] for r in records} == {"rep"}
+
+    def test_written_before_the_downloads_run(self, dl, tmp_path):
+        """A window that fails still has to say what was asked of it."""
+        seen = {}
+
+        def _spy(dt, output_dir=None):
+            seen["existed"] = (tmp_path / "h2mare_manifest.json").exists()
+
+        with patch.object(dl, "download_file", side_effect=_spy):
+            dl.run(start_date="2020-01-01", end_date="2020-01-31", output_dir=tmp_path)
+
+        assert seen["existed"]

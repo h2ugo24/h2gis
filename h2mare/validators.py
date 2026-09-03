@@ -11,7 +11,7 @@ from typing import Sequence
 import polars as pl
 
 from h2mare.config import AppConfig
-from h2mare.types import TimeResolution
+from h2mare.types import FilePeriod
 
 
 def validate_columns(
@@ -95,14 +95,14 @@ def validate_var_keys(var_keys: Sequence[str], config: AppConfig) -> None:
         )
 
 
-def validate_time_resolution(period: str | TimeResolution) -> TimeResolution:
+def validate_file_period(period: str | FilePeriod) -> FilePeriod:
     """
     Validate supported period granularity for data storage.
 
     Raises:
         ValueError: if period not 'year' or 'month'
     """
-    if isinstance(period, TimeResolution):
+    if isinstance(period, FilePeriod):
         return period
 
     # Validate string value
@@ -114,9 +114,9 @@ def validate_time_resolution(period: str | TimeResolution) -> TimeResolution:
     period_lower = period.lower()
 
     try:
-        return TimeResolution(period_lower)
+        return FilePeriod(period_lower)
     except ValueError:
-        valid_values = ", ".join(p.value for p in TimeResolution)
+        valid_values = ", ".join(p.value for p in FilePeriod)
         raise ValueError(f"Invalid period '{period}'. Must be one of: {valid_values}")
 
 

@@ -56,7 +56,6 @@ def compile(
     zarr_backup: bool = typer.Option(
         False,
         "--zarr-backup",
-        is_flag=True,
         help="Copy compiled zarr files to the local backup store after writing.",
     ),
     zarr_backup_dir: Optional[Path] = typer.Option(
@@ -98,8 +97,13 @@ def compile(
 
     from h2mare.processing.compiler import Compiler
 
+    # See Settings.override_store_root: applied at the source so the compiler's
+    # own per-variable catalogs follow it, not only the paths it is handed.
+    if store_path is not None:
+        get_settings().override_store_root(store_path)
+
     with logger.contextualize(var="h2ds"):
-        Compiler(remote_store_root=store_path or get_settings().STORE_ROOT).run(
+        Compiler(remote_store_root=get_settings().STORE_ROOT).run(
             start_date=start_date,
             end_date=end_date,
             var_keys=list(vars) if vars else None,

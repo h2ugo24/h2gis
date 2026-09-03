@@ -10,11 +10,11 @@ import pandas as pd
 from loguru import logger
 
 from h2mare.storage.zarr_catalog import get_zarr_time_coverage
-from h2mare.types import DateLike, DateRange, TimeResolution
+from h2mare.types import DateLike, DateRange, FilePeriod, to_datetime
 from h2mare.utils.datetime_utils import normalize_date
 
 
-def split_time_range(date_range: DateRange, split: TimeResolution) -> list[DateRange]:
+def split_time_range(date_range: DateRange, split: FilePeriod) -> list[DateRange]:
     """
     Split date range into chunks.
 
@@ -29,10 +29,10 @@ def split_time_range(date_range: DateRange, split: TimeResolution) -> list[DateR
     current = date_range.start
 
     while current <= date_range.end:
-        if split == TimeResolution.MONTH:
+        if split == FilePeriod.MONTH:
             # End of current month
             chunk_end = current + pd.offsets.MonthEnd(0)
-        elif split == TimeResolution.YEAR:
+        elif split == FilePeriod.YEAR:
             # End of current year
             chunk_end = pd.Timestamp(year=current.year, month=12, day=31)
         else:
@@ -49,25 +49,45 @@ def split_time_range(date_range: DateRange, split: TimeResolution) -> list[DateR
     return chunks
 
 
+#: Why the last coverage lookup for a var_key failed, when it failed by raising
+#: rather than by finding nothing. Read by :func:`resolve_date_range` to tell
+#: "no store" apart from "store unreadable" in the error it raises.
+#:
+#: Every lookup either sets or clears its own key, so an entry always describes
+#: the most recent attempt for that var_key and cannot go stale — a store that
+#: fails once and reads cleanly later leaves nothing behind. Callers other than
+#: get_store_coverage must not write to it.
+_UNREADABLE_STORES: dict[str, Exception] = {}
+
+
 def get_store_coverage(var_key: str) -> Optional[DateRange]:
     """
     Get time coverage of existing data in store.
 
+    An unreadable store is not an empty one. Both return ``None`` here — the
+    many callers that treat ``None`` as "nothing stored yet" depend on that —
+    but the reason is recorded in :data:`_UNREADABLE_STORES` so
+    :func:`resolve_date_range` can say which it was. A locked or damaged store
+    used to present as "no existing data found", sending the reader to look for
+    missing files while the real cause sat on a warning line above.
+
     Returns:
-        DateRange of stored data, or None if no data exists
+        DateRange of stored data, or None if no data exists or it is unreadable.
     """
     try:
         coverage = get_zarr_time_coverage(var_key)
-
-        if coverage is None:
-            logger.debug(f"No existing data found for {var_key}")
-            return None
-
-        return DateRange(start=coverage.start, end=coverage.end)
-
     except Exception as e:
-        logger.warning(f"Could not read store coverage: {e}")
+        logger.warning(f"Could not read store coverage for {var_key}: {e}")
+        _UNREADABLE_STORES[var_key] = e
         return None
+
+    _UNREADABLE_STORES.pop(var_key, None)
+
+    if coverage is None:
+        logger.debug(f"No existing data found for {var_key}")
+        return None
+
+    return DateRange(start=coverage.start, end=coverage.end)
 
 
 def resolve_date_range(
@@ -103,34 +123,50 @@ def resolve_date_range(
         ValueError: If no store exists and dates cannot be inferred, or
             if explicitly supplied dates produce start > end.
     """
-    start = normalize_date(start) if start else None
-    end = normalize_date(end) if end else None
-    inferred = start is None or end is None
+    # Separate locals from the DateLike parameters: past this point the values
+    # are always concrete datetimes, and reusing the parameter names would keep
+    # the broader declared type (which allows str) for the comparisons below.
+    start_ts = normalize_date(start) if start else None
+    end_ts = normalize_date(end) if end else None
+    inferred = start_ts is None or end_ts is None
 
     if inferred:
         store_coverage = get_store_coverage(var_key)
 
         if store_coverage is None:
+            read_error = _UNREADABLE_STORES.get(var_key)
+            if read_error is not None:
+                # The store exists and could not be read. Saying "no existing
+                # data" here sent the reader looking for missing files.
+                raise ValueError(
+                    f"Could not read the store for '{var_key}' to infer dates: "
+                    f"{type(read_error).__name__}: {read_error}. Fix the store, "
+                    f"or provide start and end dates explicitly to skip the "
+                    f"lookup."
+                ) from read_error
             raise ValueError(
                 f"No existing data found for '{var_key}'. "
                 f"Please provide start and end dates explicitly."
             )
 
-        if start is None:
-            start = store_coverage.end + pd.Timedelta(days=1)
-        if end is None:
-            end = pd.Timestamp.now().normalize()
+        if start_ts is None:
+            # to_datetime() is a pass-through for datetime inputs; it is here to
+            # pin the result to datetime, which the pandas stubs otherwise widen
+            # with NaT (unreachable — store_coverage.end is always a real date).
+            start_ts = to_datetime(store_coverage.end + pd.Timedelta(days=1))
+        if end_ts is None:
+            end_ts = pd.Timestamp.now().normalize()
 
         logger.info(
             f"Date range in store: {store_coverage.start.date()} -> {store_coverage.end.date()}"
         )
 
-    assert start is not None and end is not None
-    if start > end:
+    assert start_ts is not None and end_ts is not None
+    if start_ts > end_ts:
         if inferred:
             return None
         raise ValueError(
-            f"Invalid date range: start ({start.date()}) > end ({end.date()})"
+            f"Invalid date range: start ({start_ts.date()}) > end ({end_ts.date()})"
         )
 
-    return DateRange(start=start, end=end)
+    return DateRange(start=start_ts, end=end_ts)

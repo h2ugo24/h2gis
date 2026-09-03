@@ -105,7 +105,6 @@ def parquet(
     parquet_backup: bool = typer.Option(
         False,
         "--parquet-backup",
-        is_flag=True,
         help="Copy the Parquet output to the remote store.",
     ),
     parquet_backup_dir: Optional[Path] = typer.Option(
@@ -138,6 +137,13 @@ def parquet(
     if add_var_keys and var_keys:
         typer.echo("Error: --add-var and -v cannot be used together.", err=True)
         raise typer.Exit(code=1)
+
+    # See Settings.override_store_root. Applied here rather than handed to
+    # Zarr2Parquet, because an explicit store_root names *one* store's directory
+    # while this flag names the root above them all — passing it straight through
+    # sent every var_key looking in the root itself instead of its own folder.
+    if store_path is not None:
+        get_settings().override_store_root(store_path)
 
     available = set(get_settings().app_config.variables.keys())
 
@@ -176,7 +182,6 @@ def parquet(
                 converter = Zarr2Parquet(
                     var_key="h2ds",
                     parquet_root=parquet_base,
-                    store_root=store_path,
                 )
                 converter.run(
                     start_date=start_date,
@@ -187,6 +192,7 @@ def parquet(
                     converter.sync_data(remote_root=parquet_backup_dir)
         except ValueError as e:
             logger.error(f"add-var failed: {e}")
+            raise typer.Exit(code=1) from e
         return
 
     # ---- Standard mode: convert one or more var_keys ----
@@ -200,17 +206,30 @@ def parquet(
         )
         raise typer.Exit(code=1)
 
+    # One bad var_key must not stop the others — that is deliberate, and matches
+    # PipelineManager. But the command still has to *report* the failure: it used
+    # to log and return 0, so a script driving `h2mare parquet` saw success after
+    # every variable had failed. Same contract as `h2mare run`, which returns
+    # False from PipelineManager.run() and exits 1 in cli/main.py.
+    failed: list[str] = []
     for key in keys:
         try:
             with logger.contextualize(var=key):
                 converter = Zarr2Parquet(
                     var_key=key,
                     parquet_root=parquet_base,
-                    store_root=store_path,
                 )
                 converter.run(start_date=start_date, end_date=end_date, depth=depth)
                 if parquet_backup:
                     converter.sync_data(remote_root=parquet_backup_dir)
         except ValueError as e:
             logger.error(f"Skipping '{key}': {e}")
+            failed.append(key)
             continue
+
+    if failed:
+        logger.warning(
+            f"Parquet conversion failed for {len(failed)} of {len(keys)} "
+            f"variable(s): {', '.join(failed)}."
+        )
+        raise typer.Exit(code=1)

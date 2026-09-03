@@ -18,7 +18,7 @@ Compiler(
     app_config=None,
     remote_store_root=None,
     local_store_root=None,
-    time_resolution=TimeResolution.YEAR,
+    file_period=FilePeriod.YEAR,
     date_format="year",
 )
 ```
@@ -27,9 +27,9 @@ Compiler(
 |---|---|---|
 | `var_key` | `"h2ds"` | Output variable key (defines the target grid via `config.yaml`) |
 | `app_config` | settings | Override the application configuration |
-| `remote_store_root` | `STORE_ROOT` | Root directory where source Zarr stores live |
+| `remote_store_root` | `STORE_ROOT` | Default root for source Zarr stores. A source variable declaring its own `store_root` in `config.yaml` is read from there instead; see [Where a variable's store lives](../configuration.md#where-a-variables-store-lives) |
 | `local_store_root` | `ZARR_DIR` | Local copy destination for the compiled output |
-| `time_resolution` | `YEAR` | Output file granularity: `YEAR` or `MONTH` |
+| `file_period` | `YEAR` | Output file granularity: `YEAR` or `MONTH` |
 | `date_format` | `"year"` | Output filename date format: `"year"`, `"yearmonth"`, or `"date"` |
 
 ---

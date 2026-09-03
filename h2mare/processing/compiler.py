@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import shutil
 import time
-import warnings
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -18,25 +17,37 @@ from loguru import logger
 from h2mare.config import AppConfig, get_settings
 from h2mare.models import SYSTEM_VAR_KEYS
 from h2mare.storage.coverage import (
-    get_store_coverage,
     resolve_date_range,
     split_time_range,
 )
+from h2mare.storage.provenance import (
+    collect_source_datasets,
+    refresh_root_attrs,
+    write_compiled_provenance,
+)
 from h2mare.storage.recovery import recover_zarr_store
 from h2mare.storage.storage import write_append_zarr
-from h2mare.storage.xarray_helpers import chunk_dataset
+from h2mare.storage.xarray_helpers import apply_cf_attrs, chunk_dataset
 from h2mare.storage.zarr_catalog import ZarrCatalog
-from h2mare.types import BBox, DateLike, DateRange, TimeResolution
+from h2mare.types import BBox, DateLike, DateRange, FilePeriod
 from h2mare.utils.datetime_utils import normalize_date
+from h2mare.utils.paths import store_root_for
 from h2mare.utils.spatial import GridBuilder
-from h2mare.validators import validate_time_resolution, validate_var_key
-
-warnings.filterwarnings("ignore", category=RuntimeWarning)
+from h2mare.validators import validate_file_period, validate_var_key
 
 # Output grid resolution in degrees — matches the standard CMEMS/Copernicus
 # 0.25° daily grid used across all compiled h2ds variables.
 DX = 0.25
 DY = 0.25
+
+# How far back an incremental compile looks for a null day it could refill.
+# The check reads values, so it has to be bounded or every compile would walk
+# the whole store; 24 months covers damage from a run that failed recently,
+# which is the case worth automating. Older holes surface through
+# ``h2mare audit`` and are repaired with explicit dates, which bypass every
+# watermark. The Parquet layer runs the same idea at 400 days
+# (``zarr2parquet._BACKFILL_HOLE_LOOKBACK_DAYS``) over a cheaper store.
+_HOLE_LOOKBACK_DAYS = 730
 
 
 def calculate_moon_phase(
@@ -75,13 +86,27 @@ def postprocess_sst_fdist(ds: xr.Dataset, var_name: str = "sst_fdist") -> xr.Dat
 
 
 class Compiler:
+    """
+    Merges the per-variable Zarr stores into the compiled product (``h2ds``).
+
+    Each variable is read from its own native store, interpolated onto the
+    common 0.25° daily grid, and merged into one dataset written per period
+    (a file per year by default). What a given var_key contributes is decided
+    by ``compiler_registry.COMPILE_PROCESSORS``; anything unregistered goes
+    through ``compile_default``.
+
+    Compiling a subset (``run(var_keys=[...])``) writes only those variables'
+    columns. The rest are preserved rather than nulled — see
+    ``storage._append_data`` — and catch up on the next full compile.
+    """
+
     def __init__(
         self,
         var_key: str = "h2ds",
         app_config: Optional[AppConfig] = None,
         remote_store_root: Optional[Path] = None,
         local_store_root: Optional[Path] = None,
-        time_resolution: TimeResolution = TimeResolution.YEAR,
+        file_period: FilePeriod = FilePeriod.YEAR,
         date_format: Literal["year", "date", "yearmonth"] = "year",
     ):
         """
@@ -92,7 +117,7 @@ class Compiler:
             app_config (AppConfig, optional): Configuration data for var keys. Defaults to AppConfig.
             remote_store_root (Path, optional): Store directory where all environmental data lives (currently D:).
             local_store_root (Path], optional): Local data directory where compiled data lives (currently C:)
-            time_resolution: Temporal granularity ('year' or 'month') for file storage. Defaults to 'year'.
+            file_period: Temporal granularity ('year' or 'month') for file storage. Defaults to 'year'.
             date_format: string date format for output file name.
         """
         self.app_config = app_config or get_settings().app_config
@@ -115,10 +140,10 @@ class Compiler:
             )
         self.bbox = BBox.from_tuple(self.var_config.bbox)
 
-        self.time_resolution = validate_time_resolution(time_resolution)
+        self.file_period = validate_file_period(file_period)
         self.date_format: Literal["year", "date", "yearmonth"] = date_format
 
-        self.catalog = ZarrCatalog(self.var_key)
+        self.catalog = self._catalog_for(self.var_key)
         # Cache of per-variable non-null end dates in h2ds, filled lazily on the
         # first incremental range resolution (one store scan per run).
         self._nonnull_ends_cache: Optional[dict[str, pd.Timestamp]] = None
@@ -127,6 +152,30 @@ class Compiler:
         # compile (only the h2ds output is written), so re-scanning it per
         # chunk is wasted I/O.
         self._catalog_cache: dict[str, ZarrCatalog] = {}
+
+    def _catalog_for(self, var_key: str, **kwargs) -> ZarrCatalog:
+        """
+        Catalog for *var_key*, rooted under this compiler's ``remote_store_root``.
+
+        Built explicitly rather than left to resolve from settings so that a
+        relocated store root reaches the compiler's own reads. These catalogs
+        used to default to ``STORE_ROOT``, so a run pointed elsewhere wrote h2ds
+        to the override while reading its sources from the configured root.
+        Identical to the old behaviour whenever the two agree, which is every
+        run that does not relocate anything.
+
+        ``remote_store_root`` is the *default* root, not the final answer — a
+        source variable may name its own in config.yaml, and a compile has to
+        read each one where it actually lives. Variables naming none still
+        resolve under ``remote_store_root``, exactly as before.
+        """
+        var_config = self.app_config.variables[var_key]
+        root = store_root_for(var_config, self.remote_store_root)
+        return ZarrCatalog(
+            var_key,
+            store_root=root / var_config.local_folder,
+            **kwargs,
+        )
 
     def run(
         self,
@@ -190,7 +239,7 @@ class Compiler:
         self.base_grid = GridBuilder(self.bbox, dx, dy).generate_grid()
 
         # time chunks
-        chunks = split_time_range(requested_range, self.time_resolution)
+        chunks = split_time_range(requested_range, self.file_period)
 
         written_paths: list[Path] = []
 
@@ -200,6 +249,10 @@ class Compiler:
             )
 
             datasets = []
+            # var_key -> the source datasets that delivered this chunk's dates.
+            # Collected per chunk because a variable can switch from rep to nrt
+            # part-way through the archive, so it is not a property of the run.
+            provenance: dict[str, list[dict]] = {}
 
             for vkey in self.var_keys:
                 if vkey == self.var_key:
@@ -209,6 +262,11 @@ class Compiler:
                     ds = self._process_variable(vkey, chunk)
                 if ds is not None:
                     datasets.append(ds)
+                    # System variables (bathy, moon) have no store and no
+                    # catalog, so they contribute no provenance.
+                    if (catalog := self._catalog_cache.get(vkey)) is not None:
+                        if records := collect_source_datasets(catalog, chunk):
+                            provenance[vkey] = records
 
             if not datasets:
                 logger.warning(
@@ -227,6 +285,21 @@ class Compiler:
             )
             write_append_zarr(self.var_key, ds_final, path)
             written_paths.append(path)
+
+            try:
+                refresh_root_attrs(path, get_settings().global_attrs)
+            except Exception as e:
+                logger.warning(f"Could not refresh root attrs on {path.name}: {e}")
+
+            if provenance:
+                try:
+                    write_compiled_provenance(path, provenance)
+                except Exception as e:
+                    # Bookkeeping about a compile must not fail the compile that
+                    # already succeeded — the data is on disk by this point.
+                    logger.warning(
+                        f"Could not write compiled provenance for {path.name}: {e}"
+                    )
 
             logger.success(
                 f"Finished period {chunk.start.date()} -> {chunk.end.date()}"
@@ -248,17 +321,47 @@ class Compiler:
 
     # =========== DATE RANGE RESOLUTION ===========
     def _compute_source_coverage(self) -> dict[str, DateRange]:
-        """Return source catalog coverage for every non-system source variable."""
+        """
+        Return source catalog coverage for every non-system source variable.
+
+        Read through this compiler's own catalogs. The module-level
+        ``get_store_coverage`` builds a rootless ``ZarrCatalog``, resolving from
+        settings alone, so the compile *window* was computed from a different
+        root than the data was *read* from whenever the two disagreed — a
+        ``remote_store_root`` passed in, or a variable naming its own
+        ``store_root``. The mismatch never raised: it surfaced as "No source
+        coverage found — skipping", dropping a variable from the compile with a
+        warning that reads like an empty store.
+        """
         result: dict[str, DateRange] = {}
         for vkey in self.var_keys:
             if vkey == self.var_key or vkey in SYSTEM_VAR_KEYS:
                 continue
-            cov = get_store_coverage(vkey)
+            cov = self._read_source_coverage(vkey)
             if cov is not None:
                 result[vkey] = cov
             else:
                 logger.warning(f"No source coverage found for '{vkey}' — skipping.")
         return result
+
+    def _read_source_coverage(self, var_key: str) -> Optional[DateRange]:
+        """
+        Coverage of *var_key*'s own store, or None when it cannot be read.
+
+        Named apart from the ``_source_coverage`` dict this feeds — an instance
+        attribute of that name would otherwise shadow the method.
+
+        Shares ``_catalog_cache`` with the compile loop, so the scan this does
+        is the one that loop would have done anyway.
+        """
+        try:
+            catalog = self._catalog_cache.setdefault(
+                var_key, self._catalog_for(var_key, auto_refresh=False)
+            )
+            return catalog.get_time_coverage()
+        except Exception as e:
+            logger.warning(f"Could not read store coverage for '{var_key}': {e}")
+            return None
 
     def _h2ds_nonnull_ends(self) -> dict[str, pd.Timestamp]:
         """
@@ -312,6 +415,64 @@ class Compiler:
         cov = self.catalog.get_var_time_coverage(rep)
         return cov.end if cov is not None else None
 
+    def _fillable_hole_start(
+        self, vkey: str, src_cov: DateRange
+    ) -> Optional[pd.Timestamp]:
+        """
+        Earliest day inside the lookback where the source has data and h2ds does not.
+
+        Two conditions, and both matter:
+
+        * **h2ds is null there.** The compiled column has no usable value for
+          that day, whether the row is missing or NaN-padded.
+        * **the source has data there.** A day the source is null for cannot be
+          filled by recompiling it, and treating it as a hole would re-merge the
+          same window on every run without ever converging. chl's legitimate
+          all-null days are precisely this case, and they must not trigger work.
+
+        Bounded by :data:`_HOLE_LOOKBACK_DAYS` because it reads values. Older
+        holes are reported by ``h2mare audit`` and repaired with explicit
+        ``--start-date``/``--end-date``, which force a full recompile of the
+        range regardless of what the watermarks say.
+
+        Returns:
+            The earliest fillable date, or ``None`` when there is nothing to
+            backfill (the overwhelmingly common case).
+        """
+        var_config = self.app_config.variables.get(vkey)
+        cols = (var_config.compiled_vars if var_config else None) or []
+        if not cols:
+            return None
+        rep = cols[0]
+
+        end = min(src_cov.end, pd.Timestamp.now().normalize())
+        floor = max(src_cov.start, end - pd.Timedelta(days=_HOLE_LOOKBACK_DAYS))
+        if floor > end:
+            return None
+        window = DateRange(start=floor, end=end)
+
+        try:
+            h2ds_have = self.catalog.get_nonnull_days(window, [rep]).get(
+                rep, pd.DatetimeIndex([])
+            )
+            null_days = pd.date_range(floor, end, freq="D").difference(h2ds_have)
+            if len(null_days) == 0:
+                return None
+
+            source_have = self._catalog_for(vkey, auto_refresh=False).get_nonnull_days(
+                window
+            )
+            fillable = null_days.intersection(
+                source_have.get("__any__", pd.DatetimeIndex([]))
+            )
+        except Exception as e:
+            logger.warning(f"{vkey}: hole scan failed ({e}) — skipping backfill check.")
+            return None
+
+        if len(fillable) == 0:
+            return None
+        return pd.Timestamp(fillable.min())
+
     def _resolve_compile_range(
         self,
         start: Optional[pd.Timestamp],
@@ -358,6 +519,21 @@ class Compiler:
                 if h2ds_var_end is not None
                 else src_cov.start
             )
+
+            # The end alone cannot see a hole behind it. A variable compiled
+            # while its source lagged lands NaN-padded; once a later compile
+            # carries it, the non-null end jumps past the NaN stretch and an
+            # end-based window strands those days forever. sst 2026-07-31 is
+            # exactly this — h2ds has the day, the column is null, and the end
+            # sits at 2026-08-06.
+            hole = self._fillable_hole_start(vkey, src_cov)
+            if hole is not None and hole < var_start:
+                logger.info(
+                    f"{vkey}: backfilling from {hole.date()} — source has data "
+                    f"for days h2ds does not."
+                )
+                var_start = hole
+
             if var_start <= src_cov.end:
                 ranges.append(DateRange(start=var_start, end=src_cov.end))
                 compiling.append(f"{vkey} ({var_start.date()}→{src_cov.end.date()})")
@@ -389,14 +565,17 @@ class Compiler:
     # =========== DATASET ATTRIBUTES ===========
     def _set_attrs(self, ds: xr.Dataset) -> xr.Dataset:
         """Set global and variables attributes from yaml file.
+
+        Variable and coordinate metadata comes from ``apply_cf_attrs``, shared
+        with the convert path so a native store and h2ds cannot describe the
+        same quantity differently. No ``native_var_key`` here: this is the
+        compiled product, which takes the table as written.
+
         Args:
             ds: Dataset for atts assignment
         """
         ds.attrs = get_settings().global_attrs
-        for var in ds.data_vars:
-            var_info = get_settings().get_var_info(str(var))
-            ds[var].attrs.update({key: val for key, val in var_info.items()})
-        return ds
+        return apply_cf_attrs(ds)
 
     #  ============ PROCESSING ==================
     def _process_variable(
@@ -411,20 +590,18 @@ class Compiler:
             compile_default,
         )
 
-        is_system = var_key in SYSTEM_VAR_KEYS
+        # System variables (bathy, moon) are generated rather than read from a
+        # store, so they get no catalog and skip the overlap check.
         # auto_refresh=False: the source store is stable during a compile (see
         # _catalog_cache note in __init__), so skip the per-access change check
         # that would otherwise re-stat the store directory on every df access.
-        catalog = (
-            None
-            if is_system
-            else self._catalog_cache.setdefault(
-                var_key, ZarrCatalog(var_key, auto_refresh=False)
+        catalog: Optional[ZarrCatalog] = None
+        if var_key not in SYSTEM_VAR_KEYS:
+            catalog = self._catalog_cache.setdefault(
+                var_key, self._catalog_for(var_key, auto_refresh=False)
             )
-        )
-
-        if not is_system and not self._has_overlap(var_key, date_range, catalog):
-            return None
+            if not self._has_overlap(var_key, date_range, catalog):
+                return None
 
         processor = COMPILE_PROCESSORS.get(var_key, compile_default)
         return processor(self, catalog, date_range)
@@ -461,6 +638,10 @@ class Compiler:
         try:
             shutil.copytree(remote_path, local_path, dirs_exist_ok=True)
         except (PermissionError, OSError) as e:
+            # Return rather than fall through: the success line used to sit
+            # outside this handler, so a failed backup was logged as an error
+            # and then announced as "File copied!" on the very next line.
             logger.exception(f"Failed to copy {remote_path} to {local_path}: {e}")
+            return
 
         logger.success("File copied!")

@@ -14,6 +14,7 @@ Each key under `variables:` defines one data stream:
 variables:
   sst:
     local_folder: CMEMS_SST           # subdirectory under STORE_ROOT
+    store_root: /mnt/fast_ssd         # optional: this variable's own root
     source_vars: [analysed_sst, ...]  # variable names inside the source file
     dataset_id_rep: <cmems-id>        # reprocessed (multiyear) dataset ID
     dataset_id_nrt: <cmems-id>        # near-real-time dataset ID (optional)
@@ -23,34 +24,114 @@ variables:
     subset: true                      # CMEMS only: subset() vs get() download API
     bbox: [-80, 0, 10, 70]           # [xmin, ymin, xmax, ymax]
     depth_range: [0.0, 500.0]        # [min_depth, max_depth]
+
+  radiation:
+    local_folder: CDS_Radiation
+    source: cds
+    archive_raw: false
+    time_step: hourly                 # keep the source cadence; h2ds stays daily
+    store_dtype: int16                # scale/offset packed, ~2/3 the size
+    merge_time_step: true             # GRIB time x step grid
+    dataset_id_rep: reanalysis-era5-single-levels
 ```
+
+Both `time_step` and `store_dtype` are properties of the **store**, not of a run:
+each takes effect when a Zarr is created and an append inherits it, so changing
+either on an existing variable means re-converting it.
 
 | Field | Required | Description |
 |---|---|---|
-| `local_folder` | yes | Subdirectory under `STORE_ROOT` for this variable's Zarr files |
+| `local_folder` | yes | Subdirectory under `STORE_ROOT` (or `store_root`) for this variable's Zarr files |
+| `store_root` | no | Root holding this variable's `local_folder`, for stores that should not live under `STORE_ROOT` — e.g. the hourly ERA5 stores on one drive and the CMEMS dailies on another. Must be absolute (either `/data/store` or `D:\Data`; a relative path is rejected at config load because it would resolve against the current working directory). Defaults to `STORE_ROOT`. See [Where a variable's store lives](#where-a-variables-store-lives). |
 | `source_vars` | yes | Variable names to extract from source files |
 | `dataset_id_rep` | yes | Reprocessed dataset identifier |
 | `dataset_id_nrt` | no | Near-real-time dataset identifier. Omit for reanalysis-only products |
 | `source` | yes | Provider: `cmems`, `aviso`, or `cds` |
 | `archive_raw` | yes | Whether to keep this variable's raw NetCDF/GRIB files by moving them into the store after conversion (`true`), or delete them per-period once converted (`false`). |
-| `pattern` | download vars | Regex matched against each raw filename to extract date component(s). Its capture groups must agree with `filename_date_range`: with `true`, exactly **2** groups giving `(start, end)`; with `false`, the groups are joined with `-` and parsed as a single date (e.g. `(\d{8})` → `20210115`; `(\d{4})(\d{2})(\d{2})` → `2021-01-15`). Omit for derived/system variables (`bathy`, `moon`, `h2ds`) that are never matched against filenames. |
+| `pattern` | download vars | Regex matched against each raw filename to extract date component(s). Unmatched optional groups are dropped before parsing. Its capture groups must agree with `filename_date_range`: with `true`, up to **2** groups giving `(start, end)` — one group alone is read as a single day, which is why the shipped patterns make the range tail optional (`(\d{4}-\d{2}-\d{2})(?:-(\d{4}-\d{2}-\d{2}))?`); with `false`, the groups are joined with `-` and parsed as a single date (e.g. `(\d{8})` → `20210115`; `(\d{4})(\d{2})(\d{2})` → `2021-01-15`). Omit for derived/system variables (`bathy`, `moon`, `h2ds`) that are never matched against filenames. |
 | `subset` | CMEMS only | Chooses the CMEMS download API: `true` (default) uses `copernicusmarine.subset()` (spatial/variable subset honoring `bbox`/`source_vars`); `false` uses `copernicusmarine.get()` to fetch full original files. Ignored for non-CMEMS sources. |
 | `merge_time_step` | no | Set to `true` for CDS/ERA5 accumulated or averaged variables whose GRIB files have a 2-D `time × step` coordinate grid instead of a flat `time` axis (e.g. `atm-accum-avg`, `radiation`). Triggers a preprocess step that merges the two dimensions and trims overlapping timestamps at month edges. Default `false`. |
-| `filename_date_range` | no | Set to `true` when the `pattern` has two capture groups encoding a `(start, end)` date range (e.g. CMEMS/CDS files named `2021-01-01-2021-01-31.nc`). Leave `false` (default) when the pattern yields a single date (e.g. AVISO FSLE: `_20210115_`). Controls how `Netcdf2Zarr` expands filenames into daily time steps. |
+| `filename_date_range` | no | Set to `true` when the `pattern` captures a `(start, end)` date range (e.g. CMEMS/CDS files named `2021-01-01-2021-01-31.nc`). A **one-day** request is named with a single date instead (`2026-07-31.nc`), so make the second group optional and it will be read as that one day — without this a single-day repair download matches nothing and is discarded. Leave `false` (default) when the pattern yields a single date (e.g. AVISO FSLE: `_20210115_`). Controls how `Netcdf2Zarr` expands filenames into daily time steps. |
+| `known_gaps` | no | Days the provider never published, so they can never be downloaded, converted or backfilled. Each entry is a date (`2025-06-02`) or a closed interval (`2025-06-02/2025-06-05`). Excluded from the gap checks and from `h2mare audit`, which reports how many were suppressed. Needed because a source shipping one file per day leaves an *axis* hole when it skips one — AVISO has no `fsle` file for 2025-06-02 and its remote listing jumps `20250601` → `20250603` — which is otherwise indistinguishable from data the pipeline lost. Only for gaps confirmed absent at the source; anything else is a defect and belongs fixed, not listed. |
+| `time_step` | no | Cadence of this variable's own Zarr: `daily` (default) or `hourly`. An hourly store keeps the source's native axis and moves the daily reduction to compile time, so h2ds stays daily either way. Distinct from `file_period`, which is about the storage layout (one Zarr per year or per month) — a store can be hourly and still written one file per year. The gap checks read this so they compare a store against a calendar at its own resolution; a daily grid cannot see a missing hour, and an hourly grid over a daily store would report 23 phantom gaps a day. Flipping it on an existing store requires re-converting: the store is written at one cadence and the check expects the other, which fails the write verification rather than corrupting anything. It also changes where `Extractor` reads this variable from: with `hourly`, the daily values and the features derived from them are written only to the compiled h2ds, so a date-only extraction is answered from there and needs a current `compile`. Converting the same variable `daily` computes those up front and keeps everything in its own store, where `Extractor` finds them natively. See [Cadence](api/extractor.md#cadence). |
+| `store_dtype` | no | On-disk encoding: `float32` (default, byte-identical to what the pipeline has always written) or `int16`, which stores scale/offset-packed integers at roughly two thirds the size. Safe for ERA5, whose GRIB is already ~16-bit packed, so the packing discards quantisation noise rather than signal. The scale spans each variable's own measured range widened for headroom, so the encoding step makes one pass over the data before the first byte is written — expect a silent minutes-long pause on a large store. Applied only when a store is **created**; appends inherit whatever encoding the store already has, so changing this on an existing store does nothing until it is re-converted, and an append carrying values the frozen scale cannot represent is refused rather than wrapped. Safe for some variables and not others — see [Choosing `store_dtype`](#choosing-store_dtype). |
 | `raw_include` | no | Regex matched (via `re.search`) against each raw filename; only matching files are converted. Use when a download directory holds files the pipeline must not read — AVISO ships META3.2 eddy trajectories as `long`/`short`/`untracked` variants side by side, and only the long ones belong in the store (the `untracked` files carry no `track` variable at all). Omit (default) to convert every file the date `pattern` matches. |
 | `bbox` | no | Bounding box for subset. If omitted, the full available extent is downloaded |
 | `depth_range` | no | Depth range for 3D variables (e.g. `o2`) |
 | `data_file` | no | Filename of the static source file at the configured output resolution (e.g. 0.25°). Used by compile-only variables such as `bathy` |
 | `data_file_hires` | no | Filename of the high-resolution static source file. Used by `bathy` when extracting at full native resolution (e.g. from SHP geometries) |
 | `trajectory_format` | no | Set to `true` for trajectory-format datasets (e.g. `eddies`) that require spatial binning before they can be stored as a gridded Zarr. The standard `open_mfdataset` pipeline is bypassed entirely. Default `false`. |
-| `rename_lonlat` | no | Set to `true` for variables whose Zarr store uses `lon`/`lat` coordinate names that must be renamed to `x`/`y` before `rioxarray` clip during extraction (e.g. AVISO `fsle`, `eddies`). Default `false`. |
-| `extract_depth_slices` | no | Depth levels (metres) to extract when slicing a 3-D variable during `Extractor` runs. Each level becomes a separate output column (e.g. `[0, 100, 500]` → `o2_0`, `o2_100`, `o2_500`). **Applies only to variables with a `depth` dimension** (`thetao`, `o2`); omit for every 2-D variable, including static fields such as `bathy` whose hires file is used for geometry extraction but which carry no depth axis. |
-| `compile_depth_slices` | no | Depth levels (metres) to select when compiling a 3-D variable into h2ds. Each level becomes a separate output variable (e.g. `[0, 100, 500, 1000]` → `o2_0`, `o2_100`, `o2_500`, `o2_1000`). Same 3-D-only rule as `extract_depth_slices`; can differ from it. |
+| `rename_lonlat` | no | **No longer needed.** Geometry extraction now renames `lon`/`lat` to `x`/`y` for every variable, because `rioxarray`'s clip resolves spatial dims by name and only falls back to `lon`/`lat` when they carry CF attributes — which CMEMS and AVISO stores inherit from source but CDS stores and the compiled h2ds do not. Setting it changes nothing; it is kept so existing config files stay valid. Default `false`. |
+| `extract_depth_slices` | no | Depth levels (metres) to slice at during `Extractor` runs, when they should differ from `compile_depth_slices`. Each level becomes a separate output column (e.g. `[0, 100, 500]` → `o2_0`, `o2_100`, `o2_500`). **Omit it and extraction uses `compile_depth_slices`**, so a run returns exactly the columns the variable publishes and agrees with h2ds and Parquet — which is what every shipped variable now does. Set it only to deliberately narrow a variable to fewer levels than it compiles. **Applies only to variables with a `depth` dimension** (`thetao`, `o2`); omit for every 2-D variable, including static fields such as `bathy` whose hires file is used for geometry extraction but which carry no depth axis. A 3-D variable declaring neither key is refused rather than silently averaged over its whole depth range. |
+| `compile_depth_slices` | no | Depth levels (metres) to select when compiling a 3-D variable into h2ds. Each level becomes a separate output variable (e.g. `[0, 100, 500, 1000]` → `o2_0`, `o2_100`, `o2_500`, `o2_1000`), and these are the names that belong in `compiled_vars`. Same 3-D-only rule as `extract_depth_slices`, and the default for it: this is the single place a 3-D variable's levels are declared unless extraction is deliberately narrowed. Levels are matched to the store's own axis with `method="nearest"`, so a requested level deeper than the store carries is served by the deepest one it has while keeping the requested name (`o2_1000` off a 902 m axis). |
 | `compiled_vars` | no | Exact variable names as they appear in the compiled h2ds Zarr for this var_key, accounting for any renames or derived variables produced during the Convert step (e.g. `sst` → `[sst, analysis_error, sst_std, sst_fdist]`). Used by `h2mare parquet --add-var` to select only the relevant columns from the h2ds Zarr without the caller needing to know internal variable names. |
+
+### Choosing `store_dtype`
+
+`int16` packs each variable over 65,000 levels spanning its own measured
+min→max, for roughly two thirds the size of `float32`. Nothing validates the
+choice, so it is worth knowing when it is free and when it costs.
+
+**It is near-free where the source was already packed at similar precision, and
+adds real error where the pipeline computed the value itself.** ERA5's GRIB is
+already ~16-bit packed, which is why the CDS variables use it — the packing
+reproduces quantisation the data already carried. Several CMEMS products ship
+int16-packed netCDF too, recognisable by a `valid_min`/`valid_max` pair that is
+plainly an integer range rather than a physical one (`thetao`:
+`[-32766, 21306]` "degrees_C"; `analysis_error`: `[0, 32767]` "kelvin").
+Anything h2mare derives in float32 has no such floor to hide under.
+
+The cost also depends on the *distribution*, not the source. The scale spans
+min→max, so a long tail spends the levels where the data is not:
+
+| variable | step vs median | why |
+|---|---|---|
+| `adt`, `sst`, `ac_speedrad_km` | <0.01% | bounded and roughly symmetric |
+| `sst_std` | 0.17% | derived, small values |
+| `fsle_max`, `chl` | 0.5–0.6% | log-distributed; `chl` median 0.16 against max 65 |
+| `gke` | **1.5%** | squared quantity — median 0.004 against max 4.2 |
+
+**Never for identity or index fields.** The eddy trajectory ids span a range
+wider than 65,000 (`ac_track`: `[176122, 242079]`, giving a step of 1.01;
+`c_track`: 1.24), so packing them collapses distinct eddies onto the same value
+— a loss of identity, not of precision.
+
+!!! warning "`store_dtype` is ignored for `trajectory_format` variables"
+
+    The trajectory path (`eddies`) writes its Zarr without consulting the
+    encoding, so setting `store_dtype: int16` there is accepted by config and
+    silently has no effect. Given what packing would do to the track ids, the
+    no-op is the safer outcome — but do not read the setting as evidence that
+    the store is packed.
+
+!!! warning "A store's scale is fixed for its lifetime"
+
+    The scale is derived when the store is **created**, from the range of
+    whatever batch is written first, and every later append inherits it. A
+    value outside that range has no encoding — and it does not clip, it
+    overflows `int16` and wraps back into the middle of the range, which is
+    worse: a wrapped value lands inside the plausible band, so there are no
+    outliers to spot and no NaNs to count.
+
+    Two things guard against this. The scale is widened past the observed
+    range (`_INT16_HEADROOM`, currently 1.6×, leaving ~60% headroom on each
+    side at 1.6× coarser resolution — `msl` ~0.24 Pa, still far inside ERA5's
+    own precision). Anything outside even that is **refused** by
+    `storage._check_packed_range`, which names the variable and both windows
+    rather than writing. The fix when it fires is to re-convert the store, so
+    the scale is re-derived over the full range.
+
+    This is why the first conversion of a packed store matters more than the
+    ones after it: a store first built from a single calm month carries that
+    month's range forever. Prefer to create one from a representative span.
+
+Reasonable candidates are the bounded, already-packed fields: `sst`, `thetao`,
+`o2`, `mld`, `adt`. Leave `chl`, `gke` and the other derived variables on
+`float32`.
 
 ### Validation
 
-h2mare warns at load time if `config.yaml` contains top-level keys other than `variables`, `global_attrs`, and `variable_attrs`. Unknown keys are ignored, but the warning helps catch typos like `varibles:` before they cause a silent misconfiguration.
+h2mare warns at load time if `config.yaml` contains top-level keys other than `variables`, `global_attrs`, `variable_attrs`, and `native_attr_overrides`. Unknown keys are ignored, but the warning helps catch typos like `varibles:` before they cause a silent misconfiguration.
 
 ### The `h2ds` key
 
@@ -68,27 +149,164 @@ The `bbox` here sets the spatial extent of the compiled dataset.
 
 ---
 
+## Global attributes
+
+`global_attrs` becomes the root attributes of `h2ds`, following
+[ACDD](https://wiki.esipfed.org/Attribute_Convention_for_Data_Discovery_1-3).
+Everything in it is a *choice* — the title, the summary, who to contact, what
+may be done with the data.
+
+The facts about a given file are **not** in config and cannot be. `Conventions`,
+`product_version`, `history` and the geospatial/time extents are computed by
+`provenance.refresh_root_attrs` at compile and read off the store itself; a
+per-period store holds a different span in every file, so a value in config
+could only ever describe one of them correctly. `time_coverage_resolution` is
+inferred from the axis, so a daily store reports `P1DT0H0M0S` and an hourly one
+`P0DT1H0M0S` without either being told which it is.
+
+The native per-variable stores get `Conventions`, `product_version`, `history`
+and their own extents via `provenance.write_cf_root_attrs`, but **not** the
+fixed globals: those describe `h2ds` ("Integrated Geospatial Dataset
+Collection"), and a native store is one source's own data at its own cadence.
+That call updates rather than replaces, so the `source_datasets` provenance
+survives it.
+
+`license` deliberately does not claim the MIT terms the h2mare source carries —
+the data is not h2mare's to license, and each source product's terms travel with
+the values.
+
+---
+
+## Variable metadata
+
+`variable_attrs` entries become the attributes written onto each variable in the
+Zarr stores, and they follow [CF conventions](https://cfconventions.org) so the
+output is readable by CF-aware tooling (xarray, rioxarray, THREDDS, `cfchecks`).
+
+| Key | Required | Meaning |
+|---|---|---|
+| `long_name` | yes | Free-text label. Used by the plotting helpers. |
+| `units` | yes, unless the variable is a label | Must parse under **udunits2**. `m.s-1`, `W.m-2` and `mmol.m-3` are valid; a space means multiplication, so `degrees Celsius` parses as *angle × temperature* and is wrong — write `degree_C`. |
+| `standard_name` | when one fits | Must be a current entry in the [CF standard name table](https://cfconventions.org/Data/cf-standard-names/current/build/cf-standard-name-table.html), not a deprecated alias, and its canonical units must be convertible to `units`. Omit it rather than approximate: CF has no name for the front-distance, eddy, FSLE or Ekman-anomaly fields, and a wrong one is worse than none. |
+| `cell_methods` | for temporal reductions | How the value was reduced over the cell, e.g. `'time: mean'`, `'time: sum'`, `'time: maximum'`. Quote it — the colon would otherwise start a YAML mapping. |
+| `comment` | recommended | Prose description. Named `comment` because that is the attribute CF and ACDD recognise. |
+| `short_name` | no | Compact label for plot legends. Not a CF attribute. |
+| `product_id*` / `dataset_id*` | no | Provenance, carried through to the store. |
+
+Two entries — `thetao` and `o2` — describe the depth-resolved parent field held
+in the native store, which never reaches `h2ds`; the `thetao_*` / `o2_*` entries
+describe the depth slices cut from it at compile time.
+
+### Where the attributes are applied
+
+`apply_cf_attrs` (`storage/xarray_helpers.py`) is the single place both write
+paths take this metadata from — the convert step for the per-variable native
+stores, and the compile step for `h2ds` — so the two cannot drift into
+describing the same quantity differently. It also stamps the CF attributes on
+`lon`, `lat`, `time` and `depth`. That half is not cosmetic: `rio.clip` resolves
+spatial dims by name and only falls back to CF attributes when they are not
+called `x`/`y`, so on a store whose coordinates carry nothing it cannot find
+them at all, and geometry extraction clips to NaN.
+
+### `native_attr_overrides`
+
+A native store does not always hold what `h2ds` publishes, so where the two
+differ the delta lives under `native_attr_overrides`, keyed by var_key and then
+by variable name. A `null` value **removes** the attribute instead of setting it.
+
+```yaml
+native_attr_overrides:
+  atm-instante:
+    msl:
+      units: Pa           # hPa only after the compile converts
+      cell_methods: null  # hourly instantaneous, not a daily mean
+```
+
+Only the hourly CDS stores need entries, on two counts: they keep ERA5's own
+units, because the conversion happens on the way into `h2ds`, and they keep
+ERA5's hourly cadence, so a `cell_methods` naming a daily reduction does not
+describe them. `radiation` is deliberately absent — `hourly_radiation` converts
+J m⁻² to W m⁻² at both cadences, and each hourly value is a mean over its own
+interval, so both the units and `time: mean` still hold.
+
+### Sign conventions
+
+`bathy` keeps the ETOPO sign convention — `positive: up`, so sea-floor values are
+negative — and takes `standard_name: altitude` ("geometric height above the
+geoid") to match it. CF's `sea_floor_depth_below_geoid` would be the obvious
+choice but is defined positive-*down*, and `bedrock_altitude` claims the surface
+is bedrock, which the ETOPO *surface* grid does not guarantee over ice. The
+source's own `standard_name: height` is looser still: CF defines height as the
+distance above *the surface*, not above the geoid.
+
+---
+
+## Where a variable's store lives
+
+A variable's Zarr store is `<root>/<local_folder>/`. The root is chosen in this
+order, first match winning:
+
+1. `--store-path` on the command line — relocates the **whole run**, including
+   variables that name a root of their own.
+2. `store_root` in that variable's `config.yaml` entry.
+3. `STORE_ROOT` from `.env`.
+4. `data/processed/zarr/` under the project root, when `STORE_ROOT` is unset.
+
+Declaring nothing keeps the historical behaviour: every variable sits under
+`STORE_ROOT`. Spreading variables across drives is a matter of adding
+`store_root` to the entries that should move:
+
+```yaml
+variables:
+  sst:
+    local_folder: CMEMS_SST         # -> $STORE_ROOT/CMEMS_SST
+  radiation:
+    local_folder: CDS_Radiation
+    store_root: /mnt/bulk           # -> /mnt/bulk/CDS_Radiation
+```
+
+Only the Zarr stores follow this setting. Downloads stay under the project's
+`data/raw/`, and the Parquet store and `Climatology/` remain single shared trees
+under `STORE_ROOT` — they are not per-variable.
+
+Moving an existing store is a file move plus a config edit; nothing rewrites the
+data. The catalog sidecar under `data/processed/metadata/` still points at the
+old location, but it is detected as belonging to another root and rebuilt on the
+next read, so it does not need deleting by hand.
+
+---
+
 ## .env
 
 | Variable | Required | Description |
 |---|---|---|
-| `STORE_ROOT` | yes | Root path for Zarr output (can be an external drive) |
-| `H2MARE_ROOT` | no | Directory containing `config.yaml` and `.env`. Overrides the default auto-detection (walking up from the current working directory). Set it when running `h2mare` from an unrelated directory or when another project imports h2mare. See [Installation](installation.md#where-to-place-these-files). |
-| `CMEMS_USERNAME` | CMEMS only | Copernicus Marine account username |
-| `CMEMS_PASSWORD` | CMEMS only | Copernicus Marine account password |
+| `STORE_ROOT` | yes* | Root path for Zarr output (can be an external drive). *Required unless every variable declares its own `store_root` in `config.yaml`; it is the root for those that do not. |
+| `H2MARE_ROOT` | no | The project root. `data/` (raw, interim, processed) and `logs/` hang off it, and `config.yaml` / `.env` are read from it by default — so pointing it elsewhere moves the whole data tree, not just the config. Distinct from `STORE_ROOT`, which only locates the per-variable Zarr stores. Overrides the default auto-detection (walking up from the current working directory looking for `config.yaml`); the path is taken as given, so no `config.yaml` need exist there. Must be a real environment variable — the root is resolved before `.env` is loaded, so setting it inside `.env` has no effect. See [Installation](installation.md#where-to-place-these-files). |
 | `AVISO_USERNAME` | AVISO only | AVISO account username |
-| `AVISO_PASSWORD` | AVISO only | AVISO account password |
+| `AVISO_PASSWORD` | AVISO only | AVISO account password. **Sent in cleartext** — see the note below the table. |
 | `AVISO_FTP_SERVER` | AVISO only | FTP server hostname |
 
-CDS / ERA5 credentials are handled by the `cdsapi` package and stored in `~/.cdsapirc`.
+CMEMS credentials take no env var: the `copernicusmarine` CLI stores them itself (`copernicusmarine login`) and h2mare reads none. CDS / ERA5 credentials are handled by the `cdsapi` package and stored in `~/.cdsapirc`.
+
+!!! warning "AVISO traffic is unencrypted"
+
+    `ftp-access.aviso.altimetry.fr` supports plain FTP only. Its `FEAT` reply
+    advertises no `AUTH`, and an explicit `AUTH TLS` is refused with
+    `500 AUTH not understood` (checked 2026-09-01). `AVISODownloader` therefore
+    uses `ftplib.FTP`, and no setting changes that — the username, password and
+    the FSLE/eddy transfers all cross the network unencrypted.
+
+    Use a password unique to AVISO, and prefer downloading from a trusted
+    network. If AVISO enables AUTH TLS later, the change is small: `FTP_TLS`
+    in place of `FTP` in `connect_ftp`, plus `prot_p()` after login.
 
 ---
 
 ## Adding a new variable
 
-1. Add an entry under `variables:` in `config.yaml` with the correct `source`, `dataset_id_rep`, and `local_folder`.
-2. Add `variable_attrs` entries for each output variable name (used to set metadata in compiled Zarr files).
+1. Add an entry under `variables:` in `config.yaml` with the correct `source`, `dataset_id_rep`, and `local_folder`. Add `store_root` only if this variable's store should not sit under `STORE_ROOT` — see [Where a variable's store lives](#where-a-variables-store-lives).
+2. Add `variable_attrs` entries for each output variable name (used to set metadata in the Zarr stores). See [Variable metadata](#variable-metadata) for what each key must contain — `units` has to parse under udunits2 and any `standard_name` has to exist in the CF table.
 3. If the variable is a CDS/ERA5 accumulated or averaged product (GRIB files with a `time × step` structure), set `merge_time_step: true` in its config entry.
-4. If each downloaded file covers a date range encoded in its filename as two groups (e.g. `2021-01-01-2021-01-31.nc`), set `filename_date_range: true`. Leave it unset for variables whose filenames encode a single date (e.g. AVISO FSLE).
+4. If each downloaded file covers a date range encoded in its filename as two groups (e.g. `2021-01-01-2021-01-31.nc`), set `filename_date_range: true` and make the second group optional so a one-day download still parses. Leave it unset for variables whose filenames encode a single date (e.g. AVISO FSLE).
 5. If the variable is a trajectory dataset that requires spatial binning (observations indexed by `obs`, not a lat/lon/time grid), set `trajectory_format: true`.
 6. If the source is new, implement a downloader class inheriting from `BaseDownloader` and register it in `h2mare/cli/main.py`.

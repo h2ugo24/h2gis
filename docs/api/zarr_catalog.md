@@ -20,7 +20,7 @@ ds = catalog.open_dataset(
 ```python
 ZarrCatalog(
     var_key,
-    time_resolution=TimeResolution.YEAR,
+    file_period=FilePeriod.YEAR,
     app_config=None,
     store_root=None,
     metadata_root=None,
@@ -31,7 +31,7 @@ ZarrCatalog(
 | Parameter | Default | Description |
 |---|---|---|
 | `var_key` | — | Variable key; must exist in `config.yaml` |
-| `time_resolution` | `YEAR` | Granularity used for the `period` column in the index |
+| `file_period` | `YEAR` | Granularity used for the `period` column in the index |
 | `store_root` | `STORE_ROOT/<local_folder>` | Directory scanned for `.zarr` files |
 | `metadata_root` | `data/processed/metadata/` | Directory for the Parquet catalog file |
 | `auto_refresh` | `True` | Check for new/modified files on each `.df` access |
@@ -68,6 +68,8 @@ Issues a warning (but does not raise) when the requested range extends beyond wh
 | `refresh(force=False)` | Reload from disk; rescan if files have changed or `force=True` |
 | `reload()` | Force a full rescan unconditionally |
 | `get_time_coverage()` | Return `DateRange(min_start, max_end)` across all files |
+| `get_var_coverage(var)` | Return the dates *`var` itself* has data for — narrower than the above on a compiled store, where `xr.merge` pads each variable out to the union axis |
+| `get_vars_nonnull_start(vars)` / `get_vars_nonnull_end(vars)` | First / last date each variable holds non-null data; one pass for the whole batch |
 | `get_variables()` | Return the set of variable names across all files |
 | `get_bbox()` | Return the configured `BBox` for this variable |
 | `summary()` | Return a dict with file count, coverage, variables, and paths |

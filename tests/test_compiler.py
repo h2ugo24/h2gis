@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
+from loguru import logger
 
 from h2mare.models import AppConfig
 from h2mare.processing.compiler import (
@@ -124,7 +125,7 @@ class TestPostprocessSstFdist:
 # ---------------------------------------------------------------------------
 
 
-def _setup_compiler(compiler, source_coverage, h2ds_var_ends):
+def _setup_compiler(compiler, source_coverage, h2ds_var_ends, holes=None):
     """
     Inject source coverage and mock _get_h2ds_var_end to return
     the given per-variable h2ds end dates (None = never compiled).
@@ -132,6 +133,9 @@ def _setup_compiler(compiler, source_coverage, h2ds_var_ends):
     compiler.var_keys = list(source_coverage.keys()) + [compiler.var_key]
     compiler._source_coverage = source_coverage
     compiler._get_h2ds_var_end = lambda vkey: h2ds_var_ends.get(vkey)
+    # Hole detection reads values; these tests are about the frontier logic,
+    # so it is stubbed off unless a test opts in via `holes`.
+    compiler._fillable_hole_start = lambda vkey, src_cov: (holes or {}).get(vkey)
 
 
 class TestResolveCompileRange:
@@ -282,6 +286,87 @@ class TestGetH2dsVarEnd:
 # ---------------------------------------------------------------------------
 
 
+class TestCatalogsFollowTheStoreRoot:
+    """
+    Regression: the compiler's own catalogs resolved from settings rather than
+    from remote_store_root, so a run pointed at another root wrote h2ds to the
+    override while reading its sources from the configured root.
+    """
+
+    def test_output_and_source_catalogs_are_rooted_under_remote_store_root(
+        self, tmp_path
+    ):
+        with patch("h2mare.processing.compiler.ZarrCatalog") as MockCatalog:
+            c = Compiler(
+                var_key="h2ds",
+                app_config=_make_config(),
+                remote_store_root=tmp_path / "elsewhere",
+                local_store_root=tmp_path / "local",
+            )
+            c._catalog_for("sst", auto_refresh=False)
+
+        roots = [call.kwargs["store_root"] for call in MockCatalog.call_args_list]
+        assert roots == [
+            tmp_path / "elsewhere" / "h2ds",  # the compiled output
+            tmp_path / "elsewhere" / "sst",  # a source read
+        ]
+
+    def test_source_coverage_is_read_from_the_same_root_as_the_data(self, tmp_path):
+        """
+        Regression: _compute_source_coverage called the module-level
+        get_store_coverage, which builds a rootless ZarrCatalog and resolves
+        from settings. The compile *window* was therefore computed from a
+        different root than the data was *read* from, and the mismatch only
+        ever surfaced as "No source coverage found — skipping".
+        """
+        with patch("h2mare.processing.compiler.ZarrCatalog") as MockCatalog:
+            c = Compiler(
+                var_key="h2ds",
+                app_config=_make_config(),
+                remote_store_root=tmp_path / "elsewhere",
+                local_store_root=tmp_path / "local",
+            )
+            MockCatalog.reset_mock()
+            c.var_keys = ["sst"]
+            c._compute_source_coverage()
+
+        roots = [call.kwargs["store_root"] for call in MockCatalog.call_args_list]
+        assert roots == [tmp_path / "elsewhere" / "sst"]
+
+    def test_a_source_variable_is_read_from_its_own_store_root(self, tmp_path):
+        """
+        remote_store_root is the default, not the answer. A source naming its
+        own root has to be read from where it actually lives, or the compile
+        would silently merge nothing for it.
+        """
+        own = tmp_path / "other_drive"
+        cfg = msgspec.convert(
+            {
+                "variables": {
+                    "h2ds": _H2DS_ENTRY,
+                    "sst": {**_SST_ENTRY, "store_root": str(own)},
+                },
+                "secrets": {},
+            },
+            AppConfig,
+        )
+
+        with patch("h2mare.processing.compiler.ZarrCatalog") as MockCatalog:
+            c = Compiler(
+                var_key="h2ds",
+                app_config=cfg,
+                remote_store_root=tmp_path / "elsewhere",
+                local_store_root=tmp_path / "local",
+            )
+            c._catalog_for("sst", auto_refresh=False)
+
+        roots = [call.kwargs["store_root"] for call in MockCatalog.call_args_list]
+        assert roots == [
+            tmp_path / "elsewhere" / "h2ds",  # h2ds names no root — unchanged
+            own / "sst",  # sst is read where it lives
+        ]
+
+
 class TestHasOverlap:
     def test_returns_true_when_ranges_overlap(self, compiler):
         catalog = MagicMock()
@@ -340,3 +425,150 @@ class TestSyncData:
 
         compiler.sync_data(remote_dir / "chunk.zarr", backup_dir=backup_dir)
         assert (backup_dir / "chunk.zarr").exists()
+
+    def test_failed_copy_is_not_reported_as_success(self, compiler, tmp_path):
+        # Regression: the "File copied!" success line sat outside the except
+        # block, so a backup that raised was logged as an error and then
+        # announced as copied on the very next line.
+        source = tmp_path / "remote" / "data.zarr"
+        source.mkdir(parents=True)
+        compiler.local_store_root = tmp_path / "local"
+
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="DEBUG", format="{message}")
+        try:
+            with patch(
+                "h2mare.processing.compiler.shutil.copytree",
+                side_effect=PermissionError("destination is read-only"),
+            ):
+                compiler.sync_data(source)
+        finally:
+            logger.remove(sink)
+
+        text = "".join(messages)
+        assert "Failed to copy" in text
+        assert "File copied!" not in text
+
+
+# ---------------------------------------------------------------------------
+# Interior backfill
+#
+# The non-null end alone cannot see a hole behind it. A variable compiled while
+# its source lagged lands NaN-padded; once a later compile carries it, the end
+# jumps past the NaN stretch and an end-based window strands those days
+# forever. sst 2026-07-31 is exactly this — h2ds has the day, the column is
+# null, and the end sits at 2026-08-06, so nothing ever asks again.
+# ---------------------------------------------------------------------------
+
+
+class TestInteriorBackfill:
+    def test_a_hole_pulls_the_window_back(self, compiler):
+        _setup_compiler(
+            compiler,
+            source_coverage={"sst": DateRange("2000-01-01", "2026-08-06")},
+            h2ds_var_ends={"sst": pd.Timestamp("2026-08-06")},
+            holes={"sst": pd.Timestamp("2026-07-31")},
+        )
+
+        result = compiler._resolve_compile_range(None, None)
+
+        assert pd.Timestamp(result.start) == pd.Timestamp("2026-07-31")
+
+    def test_no_hole_leaves_the_frontier_window_alone(self, compiler):
+        _setup_compiler(
+            compiler,
+            source_coverage={"sst": DateRange("2000-01-01", "2026-08-06")},
+            h2ds_var_ends={"sst": pd.Timestamp("2026-08-01")},
+            holes={},
+        )
+
+        result = compiler._resolve_compile_range(None, None)
+
+        assert pd.Timestamp(result.start) == pd.Timestamp("2026-08-02")
+
+    def test_a_hole_later_than_the_frontier_does_not_narrow_it(self, compiler):
+        """The window may only widen; a hole inside it is already covered."""
+        _setup_compiler(
+            compiler,
+            source_coverage={"sst": DateRange("2000-01-01", "2026-08-06")},
+            h2ds_var_ends={"sst": pd.Timestamp("2026-07-01")},
+            holes={"sst": pd.Timestamp("2026-07-20")},
+        )
+
+        result = compiler._resolve_compile_range(None, None)
+
+        assert pd.Timestamp(result.start) == pd.Timestamp("2026-07-02")
+
+    def test_an_up_to_date_var_with_a_hole_is_no_longer_skipped(self, compiler):
+        """Without this the variable reports up to date and never recompiles."""
+        _setup_compiler(
+            compiler,
+            source_coverage={"sst": DateRange("2000-01-01", "2026-08-06")},
+            h2ds_var_ends={"sst": pd.Timestamp("2026-08-06")},
+            holes={"sst": pd.Timestamp("2026-07-31")},
+        )
+
+        assert compiler._resolve_compile_range(None, None) is not None
+
+
+class TestFillableHoleStart:
+    """The source-has-data condition is what keeps this from looping forever."""
+
+    def _wire(self, compiler, h2ds_days, source_days):
+        # The shared _SST_ENTRY declares no compiled_vars; the rep column is
+        # compiled_vars[0], so these tests have to supply one.
+        compiler.app_config.variables["sst"].compiled_vars = ["sst"]
+        compiler.catalog = MagicMock()
+        compiler.catalog.get_nonnull_days.return_value = (
+            {"sst": pd.DatetimeIndex(h2ds_days)} if h2ds_days is not None else {}
+        )
+        return patch(
+            "h2mare.processing.compiler.ZarrCatalog",
+            return_value=MagicMock(
+                get_nonnull_days=lambda *a, **kw: {
+                    "__any__": pd.DatetimeIndex(source_days)
+                }
+            ),
+        )
+
+    def test_returns_the_earliest_day_the_source_can_fill(self, compiler):
+        cov = DateRange("2026-08-01", "2026-08-06")
+        full = pd.date_range("2026-08-01", "2026-08-06")
+
+        with self._wire(compiler, full.drop(pd.Timestamp("2026-08-03")), full):
+            result = compiler._fillable_hole_start("sst", cov)
+
+        assert result == pd.Timestamp("2026-08-03")
+
+    def test_a_day_the_source_is_null_for_is_not_a_hole(self, compiler):
+        """chl's legitimate all-null days must not trigger work every run."""
+        cov = DateRange("2026-08-01", "2026-08-06")
+        full = pd.date_range("2026-08-01", "2026-08-06")
+        without = full.drop(pd.Timestamp("2026-08-03"))
+
+        with self._wire(compiler, without, without):
+            result = compiler._fillable_hole_start("sst", cov)
+
+        assert result is None
+
+    def test_complete_h2ds_has_no_hole(self, compiler):
+        cov = DateRange("2026-08-01", "2026-08-06")
+        full = pd.date_range("2026-08-01", "2026-08-06")
+
+        with self._wire(compiler, full, full):
+            assert compiler._fillable_hole_start("sst", cov) is None
+
+    def test_a_scan_failure_does_not_break_the_compile(self, compiler):
+        cov = DateRange("2026-08-01", "2026-08-06")
+        compiler.app_config.variables["sst"].compiled_vars = ["sst"]
+        compiler.catalog = MagicMock()
+        compiler.catalog.get_nonnull_days.side_effect = OSError("store unreadable")
+
+        assert compiler._fillable_hole_start("sst", cov) is None
+
+    def test_a_var_without_compiled_vars_is_skipped(self, compiler):
+        compiler.app_config.variables["sst"].compiled_vars = None
+        assert (
+            compiler._fillable_hole_start("sst", DateRange("2026-08-01", "2026-08-06"))
+            is None
+        )

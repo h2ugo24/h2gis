@@ -4,11 +4,14 @@ Extract data based on csv or shapefile format files from datasets in zarr format
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import cached_property
 from pathlib import Path
-from typing import Optional, Union, overload
+from typing import Literal, Optional, Sequence, Union, overload
 
 import ephem
 import geopandas as gpd
@@ -17,14 +20,38 @@ import pandas as pd
 import rioxarray  # noqa: F401  # registers .rio accessor on xarray objects
 import xarray as xr
 from loguru import logger
+from rasterio.errors import NotGeoreferencedWarning
 from scipy.spatial import KDTree
 
 from h2mare import AppConfig, get_settings
+from h2mare.models import step_freq
+from h2mare.storage.var_routing import compiled_var_key
 from h2mare.storage.zarr_catalog import ZarrCatalog
-from h2mare.types import BBox, DateRange
+from h2mare.types import BBox, DateRange, ReadFrom
+from h2mare.utils.datetime_utils import end_of_day
 from h2mare.utils.logging import configure_extraction_logging, log_time
-from h2mare.utils.paths import resolve_store_path
+from h2mare.utils.paths import store_root_for
 from h2mare.utils.spatial import sel_padded_bbox
+
+#: How the input's own timestamps are read. ``auto`` infers it from the data;
+#: ``daily`` and ``hourly`` state it outright. Purely about parsing ``time_col``
+#: — which store answers is :data:`~h2mare.types.ReadFrom`.
+TimeCadence = Literal["auto", "daily", "hourly"]
+
+#: Coordinate columns that ride out of ``to_dataframe()`` alongside the real
+#: values. Carried by every engine result, so they are stripped before a join
+#: and again from the final frame.
+_COORD_COLS = ["time", "lat", "lon", "geom"]
+
+#: Half-width added to a bbox axis that came out with no width. Only has to
+#: clear ``BBox``'s ``xmin < xmax`` check: the read pads by a whole grid cell on
+#: each side anyway (:func:`~h2mare.utils.spatial.sel_padded_bbox`), so the
+#: cells surrounding the point are in the subset either way. It does not make a
+#: one-point query identical to a wide one — a sample landing exactly halfway
+#: between two cell centres is a tie, and which of them the nearest-neighbour
+#: search returns depends on the subset it was given. That was already true of
+#: any two differently-sized bboxes.
+_DEGENERATE_BBOX_PAD = 1e-6
 
 # Module-level KDTree cache keyed on grid identity (shape + first/last values).
 # All var_keys produced by this pipeline share the same 0.25° grid, so the tree
@@ -37,24 +64,137 @@ def _keys_path(tmp_path: Path) -> Path:
     return tmp_path.with_suffix(".keys.json")
 
 
-def _save_completed_keys(tmp_path: Path, keys: set[str]) -> None:
+def input_fingerprint(data: pd.DataFrame, index_col: str) -> str:
+    """
+    Stable digest of the frame an extraction consumes.
+
+    The checkpoint lives at one fixed path, so the next run finds whatever the
+    last one left there. Without a fingerprint it is resumed on faith: a
+    different input of the same shape has its rows replayed from the previous
+    run, silently and with the right index. ``ensure_row_id`` makes that easy
+    to hit — its key is positional ``0..n-1``, so any two frames of the same
+    length collide perfectly.
+
+    Covers the key column's name and values plus every prepared column, since
+    those are exactly what extraction reads. Geometries go in as WKB, which
+    pandas can hash and shapely objects cannot.
+    """
+    parts: list[bytes] = [index_col.encode(), str(len(data)).encode()]
+
+    def digest(values) -> bytes:
+        return pd.util.hash_pandas_object(
+            pd.Series(list(values)), index=False
+        ).values.tobytes()
+
+    parts.append(digest(data.index))
+    for col in sorted(map(str, data.columns)):
+        parts.append(col.encode())
+        series = data[col]
+        if col == "geometry" and hasattr(series, "to_wkb"):
+            parts.append(digest(series.to_wkb()))
+        else:
+            parts.append(digest(series.astype(str)))
+
+    return hashlib.sha256(b"".join(parts)).hexdigest()
+
+
+def _save_completed_keys(tmp_path: Path, keys: set[str], fingerprint: str) -> None:
     dest = _keys_path(tmp_path)
     staging = dest.with_suffix(".tmp")
     with open(staging, "w") as f:
-        json.dump(list(keys), f)
+        json.dump({"fingerprint": fingerprint, "completed": sorted(keys)}, f)
     staging.replace(dest)
 
 
-def _load_completed_keys(tmp_path: Path) -> set[str]:
+def _load_completed_keys(tmp_path: Path, fingerprint: str) -> set[str] | None:
+    """
+    The var_keys already done for *fingerprint*, or None if the checkpoint is
+    not this input's.
+
+    None means "discard and start over": a sidecar that is missing, unreadable,
+    written by an older version without a fingerprint, or written for a
+    different input. Resuming across any of those replays another run's values.
+    """
     path = _keys_path(tmp_path)
     if not path.exists():
-        return set()
-    with open(path) as f:
-        return set(json.load(f))
+        return None
+
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(f"Checkpoint sidecar unreadable ({e}); starting over.")
+        return None
+
+    if not isinstance(payload, dict) or "fingerprint" not in payload:
+        logger.warning(
+            "Checkpoint predates input fingerprinting, so it cannot be matched "
+            "to this input; starting over."
+        )
+        return None
+
+    if payload["fingerprint"] != fingerprint:
+        logger.warning(
+            "Checkpoint was written for a different input — same path, "
+            "different data. Discarding it and starting over rather than "
+            "replaying that run's rows onto yours."
+        )
+        return None
+
+    return set(payload.get("completed", []))
+
+
+def null_summary_lines(result: pd.DataFrame, columns: list[str]) -> list[str]:
+    """
+    One line per extracted variable: its null count, and what share that is.
+
+    The share is shown only where something is actually null. A clean run
+    should read as a column of zeros rather than a column of "(0.0%)" to scan
+    past, and the point of the percentage is to tell a couple of stray
+    geometries from a variable that came back mostly empty.
+    """
+    total = len(result)
+    lines = []
+
+    for col, count in result[columns].isnull().sum().items():
+        share = f" ({count / total:.1%})" if count and total else ""
+        lines.append(f"  {col}: {count}{share}")
+
+    return lines
+
+
+def _warn_if_wholly_failed(result: pd.DataFrame, errors: list[Exception]) -> None:
+    """
+    Say something when *every* geometry came back empty.
+
+    A few NaN rows are ordinary — geometries outside the grid clip to nothing,
+    and that is data, not a fault. Every row failing is not: it means the
+    dataset could not be clipped at all, usually because rioxarray cannot
+    identify the spatial dims or there is no CRS. That used to surface only as
+    a DEBUG line per geometry, leaving an all-null column looking like absent
+    data rather than a broken precondition.
+    """
+    if result.empty or not errors:
+        return
+
+    values = result.select_dtypes("number")
+    if values.empty or not bool(values.isna().all().all()):
+        return
+
+    logger.warning(
+        f"Every geometry returned NaN across {len(result)} row(s) — the dataset "
+        f"could not be clipped at all, rather than the geometries falling "
+        f"outside it. First error: {type(errors[0]).__name__}: {errors[0]}"
+    )
 
 
 def _extract_geometry(
-    id: str, date, geom, ds: xr.DataArray | xr.Dataset, index_col: str
+    id: str,
+    date,
+    geom,
+    ds: xr.DataArray | xr.Dataset,
+    index_col: str,
+    errors: list[Exception] | None = None,
 ) -> dict:
     """
     Extract data and return as dictionary for a single geometry row.
@@ -97,8 +237,12 @@ def _extract_geometry(
 
     except (OSError, ValueError, RuntimeError) as e:
         # Per-geometry detail only — thousands of geometries would flood the
-        # log at ERROR. The end-of-run null summary carries the aggregate.
+        # log at ERROR. The end-of-run null summary carries the aggregate, and
+        # `errors` lets the caller tell "all of them failed" (a broken
+        # precondition) from "some fell outside the grid" (ordinary).
         logger.debug(f"Extraction failed for id={id}, date={date}: {e}")
+        if errors is not None:
+            errors.append(e)
 
     # --- Return NaNs for failed geometry to preserve structure ---
     nan_result: dict = {index_col: id}
@@ -162,6 +306,197 @@ def _extract_geometry_bathy(
     return nan_result
 
 
+def _declared_vars(var_config) -> list[str]:
+    """Variables this var_key publishes, per ``compiled_vars`` in config."""
+    return list(getattr(var_config, "compiled_vars", None) or [])
+
+
+def _widen_degenerate(
+    bounds: Sequence[float],
+) -> tuple[float, float, float, float]:
+    """
+    Nudge apart any axis of *bounds* whose min equals its max.
+
+    Only exact equality, so an inverted box still reaches ``BBox`` and is still
+    rejected — that one is a real defect, not a shape the input can take.
+    """
+    xmin, ymin, xmax, ymax = (float(v) for v in bounds)
+    if xmin == xmax:
+        xmin, xmax = xmin - _DEGENERATE_BBOX_PAD, xmax + _DEGENERATE_BBOX_PAD
+    if ymin == ymax:
+        ymin, ymax = ymin - _DEGENERATE_BBOX_PAD, ymax + _DEGENERATE_BBOX_PAD
+    return xmin, ymin, xmax, ymax
+
+
+def resolve_read_from(var_config, *, read_from: ReadFrom, subdaily_input: bool) -> str:
+    """
+    Which store answers this var_key.
+
+    ``native`` and ``compiled`` are honoured as given. ``auto`` decides per
+    var_key from the cadence the input asked for:
+
+    - A **daily** store holds everything its var_key publishes, so it always
+      answers for itself.
+    - An **hourly** store is the raw *source*: it holds neither the daily
+      reduction nor the features derived from it, and snapping a date-only row
+      to the nearest stored step lands it on one arbitrary hour. A date-only
+      query is therefore answered from the compiled store, where those numbers
+      actually live — the same ones ``ParquetIndexer.scan`` returns. A sub-daily
+      query reads the hourly store, since that is the only thing that has hours.
+
+    Returns:
+        ``"native"`` for the per-variable Zarr, ``"compiled"`` for h2ds.
+    """
+    if read_from != "auto":
+        return read_from
+    if step_freq(var_config) != "h":
+        return "native"
+    return "native" if subdaily_input else "compiled"
+
+
+def warn_on_subdaily_store(var_key: str, var_config, ds: xr.Dataset) -> None:
+    """
+    Say out loud that native hourly values do not read like daily ones.
+
+    Only fires when the hourly store is actually being served — a date-only
+    query routes to the compiled store (see :func:`resolve_read_from`), where the
+    semantics and units are the daily ones the caller already expects, so
+    warning there would be noise.
+
+    Each sample snaps to the nearest stored step, which here is one
+    instantaneous hour rather than the day's aggregate. Units differ too,
+    because an hourly store holds the raw source rather than the pipeline's
+    daily reduction (ERA5 ``msl`` is Pa here and hPa in h2ds) — so the stored
+    units are reported instead of being left for the caller to discover in the
+    numbers.
+    """
+    if step_freq(var_config) != "h":
+        return
+
+    units = {str(v): ds[v].attrs.get("units", "?") for v in ds.data_vars}
+    logger.warning(
+        f"[{var_key}] hourly store: each sample snaps to the nearest hour and "
+        f"returns that instantaneous value, NOT a daily aggregate. Units are "
+        f"the raw source's and may differ from the daily store: {units}"
+    )
+
+
+def split_vars_by_source(
+    requested: list[str] | None,
+    stored: list[str],
+    var_key: str,
+    var_config,
+    *,
+    has_depth: bool = False,
+) -> tuple[list[str], list[str]]:
+    """
+    Split a request into what the native store holds and what the compiled owes.
+
+    A var_key's ``compiled_vars`` are what it *publishes*. Whether its own store
+    holds all of that depends on its ``time_step``: converting at **daily**
+    cadence runs the reductions and the derived chain up front and writes them
+    alongside the raw fields, so the store is complete; converting at **hourly**
+    cadence keeps the raw source only and moves everything derived to compile
+    time, where it is written to the compiled store instead. The same var_key is
+    therefore complete in one deployment and thin in another — which is why the
+    gap is routed rather than refused.
+
+    ``requested=None`` means "everything this var_key publishes".
+
+    The rule, uniformly: absent where the design puts it elsewhere is a routing
+    decision; absent where the design says it should be present is a defect. A
+    daily store missing what it publishes is the second kind, so it raises here
+    rather than being quietly backfilled from the compiled store — that would
+    mask a hole in the store.
+
+    ``has_depth`` disables the reconciliation entirely, because for a 3-D
+    variable ``compiled_vars`` and the store are not comparable: the store holds
+    one variable on a ``depth`` axis (``thetao``) while ``compiled_vars`` names
+    the columns it becomes after slicing (``thetao_100``, …). Nor can the check
+    simply be deferred until after the expansion — extraction slices at
+    ``extract_depth_slices`` while ``compiled_vars`` follows
+    ``compile_depth_slices``, and config explicitly allows the two to differ
+    (``o2`` extracts 3 levels and compiles 4). There is nothing to reconcile;
+    :meth:`Extractor._preprocess_depth_slices` owns which levels appear.
+
+    Returns:
+        ``(from_native, from_compiled)``. For a daily store ``from_compiled`` is
+        always empty. With ``has_depth`` the request passes through untouched,
+        to be validated against the post-expansion names instead.
+
+    Raises:
+        ValueError: for names that belong to neither side, and for a daily store
+            that cannot satisfy what its own config publishes.
+    """
+    if has_depth:
+        return (list(requested) if requested is not None else []), []
+
+    declared = _declared_vars(var_config)
+    stored_set, declared_set = set(stored), set(declared)
+
+    wanted = list(requested) if requested is not None else (declared or list(stored))
+
+    unknown = sorted(v for v in wanted if v not in stored_set and v not in declared_set)
+    if unknown:
+        raise ValueError(
+            f"[{var_key}] cannot extract {unknown}: not variables of "
+            f"'{var_key}'. Store holds {sorted(stored)}"
+            + (f"; config publishes {sorted(declared)}." if declared else ".")
+        )
+
+    from_native = [v for v in wanted if v in stored_set]
+    from_compiled = [v for v in wanted if v not in stored_set]
+
+    if from_compiled and step_freq(var_config) != "h":
+        raise ValueError(
+            f"[{var_key}] daily store holds {sorted(stored)} but this variable "
+            f"publishes {sorted(declared)}. Absent: {sorted(from_compiled)}. A daily "
+            f"store is written with everything it publishes, so this is a gap in "
+            f"the store — re-run `uv run h2mare convert -v {var_key}`."
+        )
+
+    return from_native, from_compiled
+
+
+def resolve_compiled_vars(
+    available: list[str],
+    requested: list[str] | None,
+    var_key: str,
+    var_config,
+) -> list[str]:
+    """
+    The compiled-h2ds columns that belong to *var_key*.
+
+    ``compiled_vars`` is already the var_key -> h2ds-column mapping (it is what
+    ``h2mare parquet --add-var`` selects on), so it is reused here rather than
+    re-derived.
+
+    Raises:
+        ValueError: if the var_key publishes nothing, or if h2ds does not yet
+            hold a requested column — which means compile is behind convert, not
+            that the request was wrong.
+    """
+    declared = _declared_vars(var_config)
+    wanted = list(requested) if requested is not None else declared
+
+    if not wanted:
+        raise ValueError(
+            f"[{var_key}] declares no compiled_vars, so there is no mapping onto "
+            f"h2ds columns. Add compiled_vars to its config entry."
+        )
+
+    missing = sorted(v for v in wanted if v not in available)
+    if missing:
+        raise ValueError(
+            f"[{var_key}] the compiled h2ds is missing {missing}. These are "
+            f"derived at compile time from the hourly store, so compile is "
+            f"behind convert — run `uv run h2mare compile`. h2ds holds: "
+            f"{sorted(v for v in declared if v in available)}."
+        )
+
+    return wanted
+
+
 @log_time
 def load_dataset_to_memory(ds: xr.Dataset | xr.DataArray) -> xr.Dataset | xr.DataArray:
     return ds.compute()
@@ -211,6 +546,25 @@ def ensure_row_id(
 
 
 class Extractor:
+    """
+    Extracts values at points or geometries from the stores, for analysis.
+
+    A standalone tool, not part of the run/convert/compile flow. Takes a CSV,
+    shapefile, GeoDataFrame or DataFrame of locations and returns one row per
+    input row with a column per requested variable.
+
+    Two independent arguments decide where each value comes from:
+    ``time_cadence`` picks how the input's time column is read, and
+    ``read_from`` picks the store. Under ``auto`` a daily store answers for
+    itself, while an hourly one answers only sub-daily input — a date-only
+    query against it goes to the compiled ``h2ds``, which therefore needs to be
+    current. Units can differ between the two sources (``msl`` is Pa natively,
+    hPa in h2ds). See ``docs/api/extractor.md#cadence``.
+
+    A failed run leaves a checkpoint that a later run resumes from, keyed by a
+    fingerprint of the input.
+    """
+
     def __init__(
         self,
         file_path: Union[Path, gpd.GeoDataFrame, pd.DataFrame],
@@ -222,6 +576,8 @@ class Extractor:
         app_config: Optional[AppConfig] = None,
         store_root: Optional[Union[str, Path]] = None,
         crs: int | None = 4326,
+        time_cadence: TimeCadence = "auto",
+        read_from: ReadFrom = "auto",
         log_file: Optional[Union[str, Path]] = None,
     ):
         """
@@ -239,6 +595,24 @@ class Extractor:
             app_config (AppConfig, optional): Dataclass with environmental data specifics. Defaults to cfg.
             store_root (Union[str, Path], optional): Path for environmental data main folder. Defaults to STORE_ROOT.
             crs (int | None, optional): Projection EPSG code for geometry extraction. Defaults to 4326.
+            time_cadence ("auto" | "daily" | "hourly"): how ``time_col`` is read.
+                ``"auto"`` (default) infers it: a time component that *varies*
+                across rows means the caller wants hours; a date-only input, or
+                one stamped identically on every row (an export default rather
+                than a real hour), means days. ``"daily"`` truncates to midnight
+                regardless; ``"hourly"`` keeps whatever precision is there. This
+                only decides how the input is parsed — which store answers is
+                ``read_from``.
+            read_from ("auto" | "native" | "compiled"): which store each var_key
+                is read from. ``"native"`` is its own per-variable Zarr,
+                ``"compiled"`` is the h2ds every var_key is merged into, and
+                ``"auto"`` (default) picks per var_key: a daily store answers for
+                itself, while an hourly one answers only a sub-daily request and
+                otherwise defers to the compiled store, which is where its daily
+                values live. Note the two are not interchangeable — the compiled
+                store is on the 0.25° base grid and carries the pipeline's units
+                (ERA5 ``msl`` in hPa), while an hourly native store holds the raw
+                source as published (``msl`` in Pa).
             log_file (str | Path, optional): Extraction log file for this session.
                 Defaults to LOGS_DIR/extractor.log (first Extractor in the
                 process decides; subsequent values are ignored).
@@ -251,6 +625,8 @@ class Extractor:
         self.lon_col = lon_col if lon_col is not None else "lon"
         self.lat_col = lat_col if lat_col is not None else "lat"
         self.crs = crs
+        self.time_cadence: TimeCadence = time_cadence
+        self.read_from: ReadFrom = read_from
 
         self.app_config = app_config or get_settings().app_config
 
@@ -263,17 +639,41 @@ class Extractor:
         self.data = self._prepare_data(data_orig)
         self.data = self._resolve_time_col(self.data)
 
+    def _store_dir(self, var_config) -> Path:
+        """
+        This variable's own store directory under the root that applies to it.
+
+        ``self.store_root`` is a *root* holding one folder per variable, the
+        shape ``STORE_ROOT`` has in ``.env``, so it cannot be handed to a
+        catalog as-is — ``ZarrCatalog(store_root=...)`` means one store's exact
+        directory. It is also only the *default*: a variable naming its own
+        ``store_root`` in config.yaml is read from there, and ``--store-path``
+        outranks both. Same rule as ``PipelineManager._store_dir`` and
+        ``Compiler._catalog_for``.
+        """
+        return store_root_for(var_config, self.store_root) / var_config.local_folder
+
     # =================== DATA PREPARATION =====================
 
     def _resolve_time_col(self, data: pd.DataFrame) -> pd.DataFrame:
         """
         Resolve time column to date or datetime based on time variance.
 
-        Logic:
+        Logic (``time_cadence="auto"``):
             - If time_col strings contain no time component → keep as date.
             - If time_col contains datetimes:
                 - If time component is identical across all rows → truncate to date.
                 - If time component varies → keep full datetime.
+
+        ``"daily"`` always truncates; ``"hourly"`` never does, so a uniform
+        stamp is honoured as a real hour rather than read as a nominal one.
+
+        The verdict is kept on ``self.input_is_subdaily`` rather than thrown
+        away: with ``read_from="auto"`` it is what decides whether an hourly
+        var_key is served from its own store or the compiled one
+        (:func:`resolve_read_from`). Nothing else needs a second time column —
+        the branch below already leaves ``time`` at full precision exactly when
+        the sub-daily route wants it, and at midnight when the daily route does.
         """
         data = data.rename(columns={self.time_col: "time"})
 
@@ -283,16 +683,24 @@ class Extractor:
 
         data["time"] = pd.to_datetime(data["time"], utc=True).dt.tz_convert(None)
 
-        if has_time_component:
-            time_is_uniform = data["time"].dt.time.nunique() == 1
-            if time_is_uniform:
-                logger.debug("Uniform time component detected. Truncating to date.")
-                data["time"] = data["time"].dt.normalize()
-            else:
-                logger.debug("Variable time component detected. Keeping full datetime.")
+        if self.time_cadence == "daily":
+            subdaily = False
+        elif self.time_cadence == "hourly":
+            subdaily = bool(has_time_component)
+        elif has_time_component:
+            # A stamp identical on every row reads as nominal (someone's export
+            # default), not as a deliberate hour — hence uniform means daily.
+            subdaily = data["time"].dt.time.nunique() > 1
         else:
-            logger.debug("No time component detected. Keeping as date.")
+            subdaily = False
 
+        if subdaily:
+            logger.debug("Sub-daily input detected. Keeping full datetime.")
+        else:
+            logger.debug("Daily input detected. Truncating to date.")
+            data["time"] = data["time"].dt.normalize()
+
+        self.input_is_subdaily = subdaily
         return data
 
     def _resolve_file_format(
@@ -401,6 +809,13 @@ class Extractor:
     def _define_bbox(self, data: pd.DataFrame | gpd.GeoDataFrame) -> BBox:
         """
         Returns bbox from data according to input_type ('csv' or 'shp').
+
+        An extent with no width — every row on one point, or strung along one
+        parallel or meridian — is widened rather than refused. That shape is
+        ordinary input: a single sample, a transect, or whatever is left after
+        the coverage clip drops the rest. ``BBox`` goes on rejecting it, because
+        for a *store's* own extent a single cell really is an error; here it is
+        only a query, and the read pads it by a grid cell on each side anyway.
         """
         if self.input_type == "csv":
             bounds = (
@@ -416,27 +831,60 @@ class Extractor:
         else:
             raise ValueError(f"Unsupported input_type: {self.input_type!r}")
 
-        return BBox.from_tuple(bounds)
+        return BBox.from_tuple(_widen_degenerate(bounds))
 
-    def _resolve_coverage(self, catalog: ZarrCatalog) -> list[pd.Timestamp]:
+    def _resolve_coverage(
+        self, catalog: ZarrCatalog, source_key: str | None = None
+    ) -> list[pd.Timestamp]:
         """
         Resolve input/store data space/time coverage limits.
 
+        ``source_key`` names the var_key whose columns are being read out of
+        *catalog*, and narrows the time side to what that var_key actually has
+        there. It matters only on the compiled store, where every source is
+        padded out to the union axis by ``xr.merge``: the store ends where its
+        furthest-ahead source ends, and clipping against that lets every date in
+        a slower source's padding through, to be extracted as NaN, silently. A
+        var_key's compiled columns all come from one source and so share one
+        frontier, so the first one it publishes dates the group — the same
+        convention the compiler's own watermarks use.
+
+        Args:
+            catalog: Store to clip against.
+            source_key: var_key whose columns are being read. ``None`` uses the
+                store's own coverage, which is right for a native store — its
+                files end where its data does.
+
         Raises:
-            ValueError: if ``catalog.get_time_coverage()`` or ``get_bbox()`` returns None
+            ValueError: if the coverage lookup or ``get_bbox()`` returns None
 
         Returns:
             list[pd.Timestamp]: List of unique dates within store limits if out of range, else returns None.
         """
+        published = (
+            list(self.app_config.variables[source_key].compiled_vars or [])
+            if source_key is not None
+            else []
+        )
         # get storage coverage
-        store_dates = catalog.get_time_coverage()
+        store_dates = (
+            catalog.get_var_coverage(published[0])
+            if published
+            else catalog.get_time_coverage()
+        )
         store_bbox = catalog.get_bbox()
 
         if store_dates is None or store_bbox is None:
             raise ValueError(f"No coverage data for {catalog.var_key}")
 
+        # `end` names a calendar day, so the window runs to the *end* of that
+        # day. Compared bare against a full input timestamp it clips every
+        # sample stamped after midnight on the final covered day — 23 hours'
+        # worth against an hourly store, reported as "after store coverage".
+        # Every other date-bounded read pairs the bound with end_of_day; this
+        # one is the last that didn't.
         start_store = pd.Timestamp(store_dates.start)
-        end_store = pd.Timestamp(store_dates.end)
+        end_store = end_of_day(store_dates.end)
 
         # Input Data coverage
         dates = self._extract_unique_dates(self.data)
@@ -451,17 +899,23 @@ class Extractor:
         start_date = pd.to_datetime(max(start, start_store))
         end_date = pd.to_datetime(min(end, end_store))
 
+        # Name what was actually measured. Reporting these as the store's bounds
+        # would have the compiled store "ending" on a different day for every
+        # var_key routed through it.
+        label = f"{source_key} in {catalog.var_key}" if published else catalog.var_key
+        scope = "variable" if published else "store"
+
         if start < start_store:
             clipped = dates[dates < start_store]
             logger.warning(
-                f"{catalog.var_key}: {len(clipped)} date(s) before store coverage clipped "
-                f"({clipped.min().date()} -> {clipped.max().date()} | store starts {start_store.date()})"
+                f"{label}: {len(clipped)} date(s) before {scope} coverage clipped "
+                f"({clipped.min().date()} -> {clipped.max().date()} | {scope} starts {start_store.date()})"
             )
         if end > end_store:
             clipped = dates[dates > end_store]
             logger.warning(
-                f"{catalog.var_key}: {len(clipped)} date(s) after store coverage clipped "
-                f"({clipped.min().date()} -> {clipped.max().date()} | store ends {end_store.date()})"
+                f"{label}: {len(clipped)} date(s) after {scope} coverage clipped "
+                f"({clipped.min().date()} -> {clipped.max().date()} | {scope} ends {end_store.date()})"
             )
 
         return sorted(dates[(dates >= start_date) & (dates <= end_date)])
@@ -495,6 +949,14 @@ class Extractor:
         """
         vars = [vars] if isinstance(vars, str) else vars
 
+        # An empty list is the documented way to say "everything this var_key
+        # publishes" — `run({"seapodym": [], "radiation": ["tisr"]})` — not an
+        # explicit selection of nothing. Collapsed to None here so every
+        # helper downstream sees one sentinel for "all" instead of each having
+        # to remember there are two.
+        if not vars:
+            vars = None
+
         # Moon and bathy first since they do not need data from ZarCatalog
         if var_key == "moon":
             return self._extract_moon_phase(self.data)
@@ -502,44 +964,123 @@ class Extractor:
         if var_key == "bathy":
             return self._extract_bathy(self.data)
 
-        # Remaining Key Variable
-        vr_catalog = ZarrCatalog(var_key)
+        var_cfg = self.app_config.variables[var_key]
+        source = resolve_read_from(
+            var_cfg,
+            read_from=self.read_from,
+            subdaily_input=self.input_is_subdaily,
+        )
 
-        # Resolve coverage and subset data if necessary
+        if source == "compiled":
+            # Date-only query against an hourly var_key: the daily numbers it
+            # publishes live in the compiled store, not in its own.
+            return self._extract_compiled(var_key, vars, var_cfg, n_workers)
+
+        vr_catalog = ZarrCatalog(var_key, store_root=self._store_dir(var_cfg))
         dates_resolved = self._resolve_coverage(vr_catalog)
-        mask = self.data["time"].between(min(dates_resolved), max(dates_resolved))
-        data_resolved = self.data.loc[mask]
+        data_resolved = self._subset_to_coverage(dates_resolved)
         bounds = self._define_bbox(data_resolved)
 
-        logger.info(f"Extracting {var_key} data")
+        logger.info(f"Extracting {var_key} data from {vr_catalog.store_root}")
         logger.info(
             f"{data_resolved.shape[0]} samples | "
             f"{min(dates_resolved).date()} -> {max(dates_resolved).date()} | "
             f"{bounds}"
         )
 
-        ## Get datasets covering the dates values and bounds
         ds = vr_catalog.open_dataset(dates=dates_resolved, bbox=bounds)
 
-        if vars:
-            ds = ds[vars]
+        warn_on_subdaily_store(var_key, var_cfg, ds)
+        has_depth = "depth" in ds.dims
+        from_native, from_compiled = split_vars_by_source(
+            vars,
+            [str(v) for v in ds.data_vars],
+            var_key,
+            var_cfg,
+            has_depth=has_depth,
+        )
+
+        # Gated on the store's own dims rather than on the config key: a depth
+        # axis left in place is not an error, it is silently averaged away by
+        # the geometry engine's dimensionless .mean().
+        if has_depth:
+            ds = self._preprocess_depth_slices(ds, var_key, var_cfg)
+            if from_native:
+                ds = self._select_depth_columns(ds, from_native, var_key)
+        elif from_native:
+            ds = ds[from_native]
 
         ds = ds.sortby("time")
 
-        var_cfg = self.app_config.variables[var_key]
+        result = self._extract(data_resolved, ds, n_workers)
 
-        depth_slices = var_cfg.extract_depth_slices
-        if depth_slices is not None:
-            ds = self._preprocess_depth_slices(ds, var_key, depth_slices)
+        if from_compiled:
+            # Reached only when this var_key converts hourly, so its derived
+            # features were never written to its own store (converting the same
+            # variable daily computes them up front and this branch is dead).
+            # They are daily by construction — a 7-day rolling mean against a
+            # day-of-year climatology has no hourly value to give — so each
+            # sample takes the value for the day it falls in.
+            logger.warning(
+                f"[{var_key}] {sorted(from_compiled)} are not in the native "
+                f"store: this variable converts hourly, so they are derived at "
+                f"compile time. Reading them from the compiled store and "
+                f"broadcasting each day's value across that day's samples."
+            )
+            daily = self._extract_compiled(var_key, from_compiled, var_cfg, n_workers)
+            # Both engines carry the coordinate columns out of to_dataframe();
+            # keeping them on both sides would collide on join. _run_impl strips
+            # them from the final frame anyway, so the store side's copy stands.
+            result = result.join(
+                daily.drop(columns=_COORD_COLS, errors="ignore"), how="left"
+            )
 
+        return result
+
+    def _subset_to_coverage(self, dates_resolved: list[pd.Timestamp]):
+        """Rows of the input that fall inside the resolved coverage window."""
+        mask = self.data["time"].between(min(dates_resolved), max(dates_resolved))
+        return self.data.loc[mask]
+
+    def _extract(
+        self,
+        data_resolved,
+        ds: xr.Dataset,
+        n_workers: int,
+    ) -> pd.DataFrame:
+        """Run the point or geometry engine, whichever this input calls for."""
         if self.input_type == "shp":
             if not isinstance(data_resolved, gpd.GeoDataFrame):
                 raise TypeError("Data must be a GeoDataFrame for shapefile extraction")
 
-            ds = self.ensure_crs(data_resolved, ds)
+            # Unconditional, as extract_from_dataset already does and as
+            # extract_from_shp documents it needs: rio.clip resolves dims by
+            # name, and only falls back to lon/lat when they carry CF
+            # attributes. CMEMS and AVISO stores inherit those from source, so
+            # every var_key but fsle/eddies passed the precondition by luck;
+            # CDS stores and the compiled h2ds carry no coordinate attributes
+            # at all, and clipped to nothing but NaN.
+            rename = {
+                old: new for old, new in (("lon", "x"), ("lat", "y")) if old in ds.dims
+            }
+            if rename:
+                ds = ds.rename(rename)
 
-            if var_cfg.rename_lonlat:
-                ds = ds.rename({"lon": "x", "lat": "y"})
+            # Strictly before ensure_crs, as _extract_bathy and
+            # extract_from_dataset already are. write_crs names the grid-mapping
+            # coordinate after the one the variables' `grid_mapping` attribute
+            # already points at — but it can only find that attribute by walking
+            # variables that have resolvable spatial dims. On a store whose
+            # lon/lat carry no CF attributes (the compiled h2ds), that walk finds
+            # nothing before the rename, so the CRS lands on the default
+            # `spatial_ref` while CMEMS/AVISO variables keep pointing at the
+            # `crs` coordinate they inherited from source and that h2ds never
+            # carried. The dataset then reports a CRS while every variable in it
+            # reports none, and rio.clip raises MissingCRS per geometry — an
+            # all-NaN column for adt/sla/ugos/vgos/fsle_max under
+            # read_from="compiled", while variables without the attribute
+            # extracted fine.
+            ds = self.ensure_crs(data_resolved, ds)
 
             return self.extract_from_shp(
                 data_resolved, ds, self.index_col, n_workers=n_workers
@@ -549,6 +1090,101 @@ class Extractor:
             return self.extract_from_csv(data_resolved, ds, self.index_col)
 
         raise ValueError(f"Unsupported input_type: {self.input_type}")
+
+    @cached_property
+    def _compiled_var_key(self) -> str:
+        """
+        The var_key holding the compiled dataset, found by its ``source``.
+
+        Identified the same way :meth:`_normalize_var_dict` excludes it from
+        default runs — by ``source: h2mare`` rather than by the name ``h2ds`` —
+        so a deployment that names its compiled store differently still routes.
+        Cached here because ``run()`` can route several var_keys through it.
+        """
+        return compiled_var_key(self.app_config)
+
+    @cached_property
+    def _compiled_catalog(self) -> ZarrCatalog:
+        """
+        The compiled daily store, opened once per Extractor.
+
+        ``run()`` can route several var_keys here, so the catalog (and its index
+        scan) is cached rather than rebuilt per var_key.
+        """
+        var_cfg = self.app_config.variables[self._compiled_var_key]
+        return ZarrCatalog(
+            self._compiled_var_key,
+            app_config=self.app_config,
+            store_root=self._store_dir(var_cfg),
+        )
+
+    def _extract_compiled(
+        self,
+        var_key: str,
+        vars: list[str] | None,
+        var_cfg,
+        n_workers: int,
+    ) -> pd.DataFrame:
+        """
+        Extract *var_key*'s columns from the compiled daily store.
+
+        Coverage is resolved against the compiled store rather than the
+        per-variable one: the two do not move together, since each source lags
+        its provider differently and compile trails convert. Asking the native
+        store what is available would over-promise.
+
+        And asking the compiled store *as a whole* would over-promise the other
+        way. It reports the union of everything merged into it, so a var_key
+        whose source lags the furthest-ahead one is padded with NaN to that end
+        and reads as covered there. Coverage is therefore asked per variable,
+        keyed on the first column this var_key publishes — they all come from
+        one source and share one frontier.
+
+        Sample times are normalised to the day, because the compiled store is
+        daily and the caller may arrive here holding sub-daily stamps — either
+        via the broadcast path or by pinning ``read_from="compiled"``. Each
+        sample then takes the value for the day it falls in.
+
+        Depth slicing is skipped here: the compiled store
+        is lon/lat on the base grid, and it already holds depth levels as
+        separate variables (``o2_0``, ``o2_100``, …) rather than on a ``depth``
+        axis.
+        """
+        catalog = self._compiled_catalog
+        dates_resolved = self._resolve_coverage(catalog, var_key)
+        data_resolved = self._subset_to_coverage(dates_resolved).copy()
+
+        # Only for a pinned read_from: on the broadcast path the caller has
+        # already been told, in terms of the specific variables involved.
+        if self.input_is_subdaily and self.read_from == "compiled":
+            logger.warning(
+                f"[{var_key}] read_from='compiled' and the compiled store is "
+                f"daily: sub-daily samples take the value for the day they fall "
+                f"in, not the value for their hour."
+            )
+        data_resolved["time"] = data_resolved["time"].dt.normalize()
+        bounds = self._define_bbox(data_resolved)
+
+        logger.info(
+            f"Extracting {var_key} data from the compiled "
+            f"{self._compiled_var_key} at {catalog.store_root}"
+        )
+        logger.info(
+            f"{data_resolved.shape[0]} samples | "
+            f"{min(dates_resolved).date()} -> {max(dates_resolved).date()} | "
+            f"{bounds}"
+        )
+
+        ds = catalog.open_dataset(
+            dates=sorted({pd.Timestamp(d).normalize() for d in dates_resolved}),
+            bbox=bounds,
+        )
+        wanted = resolve_compiled_vars(
+            [str(v) for v in ds.data_vars], vars, var_key, var_cfg
+        )
+
+        ds = ds[wanted].sortby("time")
+        return self._extract(data_resolved, ds, n_workers=n_workers)
 
     def extract_from_dataset(
         self,
@@ -568,9 +1204,12 @@ class Extractor:
         ``self.data`` are reused as-is.
 
         Only the config-free prep is applied here. Config-driven steps that
-        :meth:`process_single_varkey` performs — depth-slice expansion
-        (``extract_depth_slices``), ``rename_lonlat``, and store date/bbox coverage
+        :meth:`process_single_varkey` performs — depth-slice expansion, store
+        selection (``read_from``) and store date/bbox coverage
         resolution — are the caller's responsibility: prepare ``ds`` beforehand.
+        A ``ds`` handed over with a ``depth`` axis still on it is extracted as-is,
+        which for geometry input means that axis is averaged away along with the
+        spatial one; slice it yourself first.
 
         Parameters:
             ds (xr.Dataset | xr.DataArray): gridded data with coords ``lon``, ``lat``
@@ -755,9 +1394,19 @@ class Extractor:
         var_dict = self._normalize_var_dict(var_dict)
 
         tmp_path = get_settings().INTERIM_DIR / "extraction_checkpoint.feather"
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if tmp_path.exists():
-            logger.warning(f"Found checkpoint file: {tmp_path}, resuming.")
+        fingerprint = input_fingerprint(self.data, self.index_col)
+        completed_keys = (
+            _load_completed_keys(tmp_path, fingerprint) if tmp_path.exists() else None
+        )
+
+        if completed_keys is not None:
+            logger.warning(
+                f"Found checkpoint for this input: {tmp_path}, resuming. "
+                f"Already done, and replayed rather than re-extracted: "
+                f"{sorted(completed_keys) or 'nothing yet'}."
+            )
             df_processed = pd.read_feather(tmp_path).set_index(self.index_col)
             if df_processed.index.duplicated().any():
                 logger.warning(
@@ -776,7 +1425,6 @@ class Extractor:
                     geometry=self.data.geometry.reindex(df_processed.index),
                     crs=self.data.crs,
                 )
-            completed_keys = _load_completed_keys(tmp_path)
         else:
             df_processed = self.data.copy()
             completed_keys = set()
@@ -796,7 +1444,7 @@ class Extractor:
                     )
 
                     result.drop(
-                        columns=["time", "lat", "lon", "geom"],
+                        columns=_COORD_COLS,
                         errors="ignore",
                         inplace=True,
                     )
@@ -805,14 +1453,39 @@ class Extractor:
                             f"Duplicate index values in '{var_key}' result — keeping first occurrence."
                         )
                         result = result[~result.index.duplicated(keep="first")]
+
+                    # A kill between the two checkpoint writes below leaves the
+                    # feather holding these columns while the sidecar still omits
+                    # the key, so the resume re-extracts and joins onto columns
+                    # already there — which pandas rejects, and the failure keeps
+                    # the checkpoint from being cleared, so every later run fails
+                    # identically. Dropping the stale copy makes re-extraction
+                    # idempotent. The caller's own input columns are left to
+                    # collide: overwriting those silently would be worse.
+                    stale = [
+                        c
+                        for c in result.columns
+                        if c in df_processed.columns and c not in self.data.columns
+                    ]
+                    if stale:
+                        logger.warning(
+                            f"'{var_key}' is already in the checkpoint but was not "
+                            f"recorded as done — the previous run was interrupted "
+                            f"mid-checkpoint. Replacing {stale} with the fresh values."
+                        )
+                        df_processed = df_processed.drop(columns=stale)
+
                     df_processed = df_processed.join(result)
 
-                    # Mark var_key as completed and save checkpoint atomically
+                    # Data first, then the key claiming it is there. Reversed, a
+                    # kill here would mark the var_key done with its columns
+                    # missing and the resume would skip it. This way the worst
+                    # case is repeated work, which the drop above absorbs.
                     completed_keys.add(var_key)
                     staging = tmp_path.with_suffix(".tmp")
                     df_processed.reset_index().to_feather(staging)
                     staging.replace(tmp_path)
-                    _save_completed_keys(tmp_path, completed_keys)
+                    _save_completed_keys(tmp_path, completed_keys, fingerprint)
                     logger.debug(f"Checkpoint saved to {tmp_path}")
 
                     logger.success(
@@ -829,8 +1502,8 @@ class Extractor:
         logger.info("=" * 60)
         logger.info("  Number of null values per variable:")
         result_cols = [c for c in df_processed.columns if c not in self.data.columns]
-        for col, count in df_processed[result_cols].isnull().sum().items():
-            logger.info(f"  {col}: {count}")
+        for line in null_summary_lines(df_processed, result_cols):
+            logger.info(line)
         logger.info("=" * 60)
 
         if all_succeeded:
@@ -881,9 +1554,23 @@ class Extractor:
 
         Picks whichever grid step (left or right of the insertion point) is
         closer, matching xarray's method='nearest' semantics exactly.
+
+        Both sides are pinned to nanoseconds before the integer cast. The two
+        arrive at different resolutions — a Zarr time axis decodes to
+        ``datetime64[ns]`` while pandas parses input strings to ``[us]`` (or
+        coarser, since pandas 2 stopped forcing nanoseconds) — and casting
+        those to int64 compares counts of different units. A microsecond query
+        reads as 1/1000th of its true instant, sorts before every stored step,
+        and every row silently lands on index 0: one arbitrary time returned
+        for the whole input, varying only by location.
         """
-        grid_times = ds.time.values.astype("int64")
-        q = pd.to_datetime(query_times).to_numpy().astype("int64")
+        grid_times = ds.time.values.astype("datetime64[ns]").astype("int64")
+        q = (
+            pd.to_datetime(query_times)
+            .to_numpy()
+            .astype("datetime64[ns]")
+            .astype("int64")
+        )
 
         right = np.searchsorted(grid_times, q).clip(0, len(grid_times) - 1)
         left = (right - 1).clip(0, len(grid_times) - 1)
@@ -1000,14 +1687,33 @@ class Extractor:
                 for id, geom in zip(data.index, data.geometry)
             ]
 
+        # rasterio builds a scratch in-memory raster per clip and reads its
+        # (not yet assigned) geotransform, warning about it inside its own
+        # `catch_warnings(...ignore)`. That suppression is global filter state,
+        # so with the thread pool below one worker's exit un-ignores it while
+        # another is mid-clip and the warning leaks — a handful per run, on
+        # correct data. A permanent filter has no such window: it is in the
+        # list every worker saves and restores. A real missing-geotransform
+        # would still surface, as the all-NaN columns _warn_if_wholly_failed
+        # and the null summary report.
+        warnings.filterwarnings(
+            "ignore", category=NotGeoreferencedWarning, module="rasterio"
+        )
+
         out = []
+        errors: list[Exception] = []
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = [executor.submit(_extract_geometry, *task) for task in tasks]
+            futures = [
+                executor.submit(_extract_geometry, *task, errors) for task in tasks
+            ]
             for future in as_completed(futures):
                 result = future.result()
                 if result is not None:
                     out.append(result)
-        return pd.DataFrame(out).set_index(index_col)
+
+        result_df = pd.DataFrame(out).set_index(index_col)
+        _warn_if_wholly_failed(result_df, errors)
+        return result_df
 
     def _extract_bathy(
         self, data: pd.DataFrame | gpd.GeoDataFrame, n_workers: int = 8
@@ -1018,7 +1724,7 @@ class Extractor:
         """
         vkey = "bathy"
         var_cfg = self.app_config.variables[vkey]
-        store_root = resolve_store_path(var_cfg)
+        store_root = self._store_dir(var_cfg)
 
         if self.input_type == "shp":
             if var_cfg.data_file_hires is None:
@@ -1037,9 +1743,15 @@ class Extractor:
             raise ValueError(f"Unsupported input_type: {self.input_type!r}")
 
         bounds = self._define_bbox(data)
-        logger.info(
-            f"Extracting {vkey.upper()} data | {self.data.shape[0]} rows | {bounds}"
-        )
+
+        # Same two lines the store-backed paths log, so a run reads the same
+        # whichever var_key produced it. The path carries the file name rather
+        # than stopping at the root: bathy is a single file picked by input type
+        # — the hi-res tiled zarr for geometries, the 0.25 deg netCDF for points
+        # — so the root alone would not say which of the two was read. There is
+        # no date range to report in its place; the layer is static.
+        logger.info(f"Extracting {vkey} data from {data_path}")
+        logger.info(f"{data.shape[0]} samples | static, no time axis | {bounds}")
 
         # The hi-res layer (shp path) is a spatially-tiled Zarr store; the 0.25°
         # layer (csv path) stays netCDF. Open by suffix so the bbox .sel() below
@@ -1106,10 +1818,68 @@ class Extractor:
             return pd.DataFrame(out).set_index(self.index_col)
         return out
 
+    @staticmethod
+    def _resolve_depth_slices(var_key: str, var_config) -> list[int]:
+        """
+        Depth levels to slice at, falling back to the compile-time ones.
+
+        ``extract_depth_slices`` is optional and several 3-D variables omit it
+        (``thetao``). Left unsliced, the ``depth`` axis survives into extraction
+        and the geometry engine's dimensionless ``.mean()`` silently averages it
+        away — a single 0-1000 m number reported under the plain variable name.
+        So fall back to ``compile_depth_slices``, which is the same variable's
+        own statement of which levels are worth publishing, and makes extraction
+        agree with the compiled store and Parquet.
+        """
+        levels = getattr(var_config, "extract_depth_slices", None)
+        if levels is not None:
+            return list(levels)
+
+        fallback = getattr(var_config, "compile_depth_slices", None)
+        if fallback is None:
+            raise ValueError(
+                f"[{var_key}] has a depth axis but declares no depth levels. "
+                f"Set extract_depth_slices (or compile_depth_slices) in its "
+                f"config entry — without them the depth axis would be averaged "
+                f"away into one value spanning the whole range."
+            )
+
+        logger.info(
+            f"[{var_key}] no extract_depth_slices; slicing at the "
+            f"compile_depth_slices levels instead: {list(fallback)}"
+        )
+        return list(fallback)
+
+    def _select_depth_columns(
+        self, ds: xr.Dataset, requested: list[str], var_key: str
+    ) -> xr.Dataset:
+        """
+        Subset an expanded 3-D dataset by the names the caller actually sees.
+
+        After expansion the columns are ``<var_key>_<level>``, so that is what
+        ``vars=`` names here. The bare ``var_key`` is accepted as "every level",
+        which is what asking for the variable itself means.
+        """
+        available = [str(v) for v in ds.data_vars]
+        wanted = [v for v in requested if v != var_key]
+        if not wanted:
+            return ds
+
+        missing = sorted(set(wanted) - set(available))
+        if missing:
+            raise ValueError(
+                f"[{var_key}] cannot extract {missing}: this variable is sliced "
+                f"by depth, and at the configured levels it yields {available}. "
+                f"Pass one of those, '{var_key}' for all of them, or change "
+                f"extract_depth_slices."
+            )
+        return ds[wanted]
+
     def _preprocess_depth_slices(
-        self, ds: xr.Dataset | xr.DataArray, var_key: str, depth_intervals: list[int]
+        self, ds: xr.Dataset | xr.DataArray, var_key: str, var_config
     ) -> xr.Dataset:
         """Slice a 3-D variable at configured depth levels, returning one column per depth."""
+        depth_intervals = self._resolve_depth_slices(var_key, var_config)
         da = ds[var_key].sel(depth=depth_intervals, method="nearest")
         ds_out = xr.Dataset(
             {

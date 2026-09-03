@@ -22,11 +22,6 @@ h2mare/
   └── utils/                # spatial (grids/masks), labels, logging, paths, datetime_utils
 ```
 
-The pipeline flows left-to-right through these packages: downloader/ fetches raw files → format_converters/ +
-processing/ regrid and preprocess into per-variable Zarr → processing/compiler.py merges into the unified h2ds →
-storage/ indexes it and exposes Parquet for analysis/visualization, all orchestrated by pipeline_manager.py and
-driven from cli/.
-
 ### Registry pattern
 
 Per-variable behavior is selected by `var_key` through three registries; the right way to add a new variable
@@ -43,6 +38,12 @@ is to register it, not to branch inside the pipeline:
 `config.yaml` (variables, dataset IDs, bbox) and `.env` (`STORE_ROOT`, AVISO creds) must both live in the working
 directory, or set `H2MARE_ROOT` to point at them. When dates are omitted, the pipeline infers what is missing from
 `ZarrCatalog` coverage and only fetches/processes the gap — this is what makes partial runs resumable.
+
+A variable's store is `<root>/<local_folder>/`, and the root is resolved by `utils/paths.py::store_root_for`:
+`--store-path` > the variable's own `store_root` in config.yaml > `STORE_ROOT` > `ZARR_DIR`. Declaring no
+`store_root` anywhere is the shipped setup and resolves exactly as it always has. Steps holding a root of their
+own (`PipelineManager.store_root`, `Compiler.remote_store_root`) pass it as `store_root_for`'s *default*, never
+as the answer. Only the Zarr stores follow it — downloads, `STORE_ROOT/parquet` and `Climatology/` do not.
 
 ## Tech Stack
 
@@ -63,7 +64,12 @@ uv run h2mare run -v sst --start-date 2021-01-01 --end-date 2021-12-31   # expli
 uv run h2mare convert -v sst                                             # convert downloaded raw data to zarr (-v required)
 uv run h2mare compile                                                    # merge Zarr stores; dates inferred
 uv run h2mare parquet                                                    # Zarr → Parquet; dates inferred
+uv run h2mare parquet2zarr                                               # rebuild per-period Zarr from Parquet
 uv run h2mare catalog sst                                                # inspect ZarrCatalog metadata
+
+# Audit the stores for silently-missing days (exits non-zero on findings)
+uv run h2mare audit --all                                                # axis check, whole store, ~1 min
+uv run h2mare audit chl --values --since 2020-01-01                      # also read data for empty days (slow)
 
 # Tests
 uv run pytest tests/
@@ -79,6 +85,12 @@ uv run ruff format h2mare/
 - `run -v X` compiles **only X's columns** into h2ds; other lagging variables catch up on the next full `uv run h2mare compile` (no `-v`).
 - Store repair: explicit dates re-read **all** variables and rewrite affected partitions wholesale — `uv run h2mare parquet --start-date ... --end-date ...`. Prefer whole-month windows.
 - Write-path merge semantics are deliberate and pinned by regression tests (`tests/test_storage.py`, `tests/test_parquet_store.py`): incoming data wins where it has rows (even when null); stored values survive outside its window; time-less statics (bathy) come from the fresh side; tails and absent variables are preserved. Read those tests before changing `storage.py::_append_data` or `parquet_store.py::resolve_dims_overlap`.
+- Extraction cadence: `Extractor` takes two independent args — `time_cadence` (`auto`/`daily`/`hourly`) reads `time_col`; `read_from` (`auto`/`native`/`compiled`) picks the store. Under `auto`: a daily store answers for itself, an **hourly** one answers only sub-daily input and a date-only query goes to **h2ds** — so extracting those at daily cadence needs a current `compile`. Compile-derived vars absent from an hourly store (ekman chain, `wind_*`) are always read from h2ds and broadcast per day, even under `read_from="native"`, because converting the same var_key daily writes them natively. A *daily* store missing what it publishes raises instead — routing is for what the design puts elsewhere, not for holes. Units differ between the two sources (`msl` is Pa native, hPa in h2ds). See `docs/api/extractor.md#cadence`.
+- Extraction checkpoint: `INTERIM_DIR/extraction_checkpoint.feather` survives only a *failed* run, and lives at one fixed path. It carries a fingerprint of the input, and a checkpoint written for a different one is discarded rather than resumed — otherwise a same-shape frame had the previous run's rows replayed onto it (`ensure_row_id` keys positionally, so equal-length frames align perfectly). A fingerprint match still cannot tell "resume" from "re-run after a fix", so delete `extraction_checkpoint.*` when the *code or config* changed rather than the input.
+- Geometry `_std` columns: the shp engine reduces a clip with `.mean()` only (`extractor.py::_extract_geometry`), so `sst_std`/`adt_std`/`sla_std` are the **polygon-mean of a stored layer**, not a std computed within the polygon — deliberate, since a within-polygon std is size-dependent (a haul touching one cell gives 0 or NaN) and would not compare across rows. `bathy_std` is the exception: `_extract_geometry_bathy` computes mean *and* std inside the geometry on 15″ data, so that one column is a different estimator. The layers are not on a common scale either (`sst_std` is a 3×3 window at 0.05°, sub-cell; `adt_std`/`sla_std` 3×3 at 0.125°, *wider* than the 0.25° cell), so don't compare their magnitudes across variables. See `docs/api/extractor.md#standard-deviation-columns`.
+- Axis drift: the same axis written on different occasions can disagree in the last float bits. Each file stays monotonic alone, so it only shows up when `open_mfdataset(combine="by_coords")` compares the arrays exactly — as *"does not have monotonic global indexes along dimension lon"*, or a silently doubled axis, for the axis being concatenated along; as *"cannot align objects with join='exact' … 'depth'"* for one that is not. `ZarrReader` snaps agreeing axes onto the earliest file's and warns; anything coarser still raises. Tolerances are per coordinate in `zarr_reader.AXIS_SNAP_TOL` because the units differ — `1e-9` for lat/lon in degrees, `1e-3` for depth in metres (o2's 2023+ files sit one float32 ULP, ~6e-5 m, off the older ones). `scripts/repair_axis_drift.py` imports that map rather than restating it. Repair with `uv run python scripts/repair_axis_drift.py <var_key> --apply` (dry run by default, rewrites coordinate arrays only). `--all` surveys every var_key.
+- Ragged variable sets: h2ds files need not all carry the same variables — `run -v X` compiles only X's columns, and a source that has not reached the current year (seapodym, `npp`/`zeu`/`zooc`) leaves that year's file short. `combine_by_coords` groups datasets *by their set of data variables* first, so such a store reached the final merge as two cubes over different periods and `join="exact"` refused them: *"cannot align objects … 'time'"*, naming the axis rather than the variables that split it. `ZarrReader._reference_data_vars` takes the union across the files being opened and `_pad_to_union` fills each short file with all-NaN placeholders, so everything combines as one group; the padded names are warned about once per read. Not a store defect — do not "fix" it by recompiling.
+- CF metadata: `apply_cf_attrs` (`storage/xarray_helpers.py`) is the single source of variable and coordinate attributes for *both* write paths — convert (native stores) and compile (h2ds) — reading `variable_attrs` plus, for a native store, that var_key's `native_attr_overrides` (`msl` is Pa natively and hPa in h2ds; `tp` is m vs mm; an hourly field drops the `cell_methods` naming a daily reduction). Coordinate attrs are not cosmetic: without them `rio.clip` cannot resolve lon/lat and geometry extraction returns all-NaN. Root attrs (`Conventions`, extents) are computed per file in `storage/provenance.py`, never config. An append never rewrites coordinates or variable attrs, so a store only picks up a table change when it is rewritten — the stores on disk were backfilled once, out of band, in Aug 2026. `tests/test_cf_compliance.py` validates the table against udunits2 and a vendored CF name snapshot.
 - Data quirks: `chl` has legitimate all-null days (~1999/2000 — the raw product never published them; the zarr is null too, so they are not backfillable). `seapodym` covers 2025 only.
 
 ## ParquetIndexer
@@ -118,34 +130,12 @@ extraction-chunked. See `docs/api/map_export.md`.
 
 ## Git workflow
 
-Follows the global Git Workflow (see `~/.claude/CLAUDE.md`).
+Follows the global Git Workflow verbatim (see `~/.claude/CLAUDE.md`) — branches, PR-only merges,
+conventional commits, branch protection. Only these two are additional here:
 
-**Branches**
-- `main` — production; stable, deployable, never commit directly.
-- `dev` — integration/staging; features land here first.
-- `feature/<name>` — one per feature, branched from `dev`, merged back to `dev`.
-
-**Per feature/fix**
-- Branch fresh: `git checkout dev && git pull origin dev && git checkout -b feature/<name>`.
-- Work, then `git add <file>` → `git commit -m "feat: ..."` → `git push -u origin feature/<name>`.
-- Resuming or dev moved? `git pull origin dev` *before* coding more — avoids most conflicts.
-
-**Merge via PR on GitHub (never local merge)**
-- Open PR (base `dev`), review the diff, approve, merge.
-- Clean up: `git checkout dev && git pull origin dev && git branch -d feature/<name>` and delete the remote branch.
-
-**Release**
-- PR `dev` → `main`, review, merge; then `git checkout main && git pull origin main`.
-- Optional tag: `git tag -a v1.0.0 -m "..." && git push origin v1.0.0`.
+- Merging requires 5 green checks on `dev` (`branch-name`, `commit-lint`, `quality`, `tests (3.12)`, `tests (3.13)`) **and** an up-to-date branch: `gh pr update-branch <#> --rebase`, wait for checks, then `gh pr merge <#> --merge --delete-branch`. `main` requires the same minus `branch-name`, which only runs for PRs into `dev`.
+- `typecheck (informational)` runs pyright but is not required — it reports the finding count so it cannot grow unnoticed. Promote it once that count reaches zero.
 - Bump `pyproject.toml` version + `uv lock` via a `chore/` PR into `dev` *before* the release PR.
-
-**Rules**
-- Always branch from the latest `dev` — *pull before you branch*.
-- Even small fixes get a branch (`fix/<name>`) — never merge directly.
-- Commit with a type: `feat:` / `fix:` / `docs:` / `chore:` / `perf:` / `refactor:`; say what changed and why.
-- Branch with a matching prefix: `feature/` / `fix/` / `docs/` / `chore/` / `perf/` / `refactor/`.
-- Protect `main` and `dev` (require PR review).
-- Merging requires 3 green checks (`branch-name`, `commit-lint`, `quality`) **and** an up-to-date branch: `gh pr update-branch <#> --rebase`, wait for checks, then `gh pr merge <#> --merge --delete-branch`.
 
 ## Coding Rules
 

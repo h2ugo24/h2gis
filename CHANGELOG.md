@@ -5,6 +5,144 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-03
+
+### Breaking
+
+- `TimeResolution` is renamed `FilePeriod`, and `time_resolution` is
+  `file_period` throughout. The old name described how often a file *sampled*
+  time, which stopped being true once a store could hold hourly data in monthly
+  files; it names the period a file spans. `h2mare.types.TimeResolution`
+  remains as an alias, but the package root now exports `FilePeriod` — `from
+  h2mare import TimeResolution` no longer resolves.
+- `validate_time_resolution` is renamed `validate_file_period`, with no alias.
+- A variable's `units` is no longer read from config. Variable and coordinate
+  attributes now come from one table in `storage/xarray_helpers.py`, so a
+  `units` left in config.yaml is inert — and, since unrecognised per-variable
+  keys are now warned about, noisy.
+
+### Added
+
+- **Hourly stores.** A variable declares `time_step: hourly` and converts at its
+  native cadence instead of being collapsed to daily on the way in. Four
+  var_keys now keep hourly Zarr stores — the three ERA5 ones (`atm-instante`,
+  `atm-accum-avg`, `radiation`) back to 1998, plus `waves` — and
+  `compile_default` reduces any hourly store to daily for h2ds. Gap checks run
+  at each store's own cadence.
+- `store_dtype: int16` opts a variable's store into scale/offset encoding,
+  roughly halving it against float32. The scale is computed once from the
+  source and frozen; an append the frozen scale cannot represent is refused
+  rather than silently clipped.
+- **`h2mare audit`** finds days missing from a store's interior — the gaps a
+  resumable pipeline will not notice, because coverage only tracks its ends.
+  `--all` sweeps every var_key on the time axis in about a minute; `--values`
+  also reads data to catch days present but empty. Exits non-zero on findings.
+- `known_gaps` records days a provider never published (`chl` has 11), so the
+  audit stays credible instead of reporting the same known holes every run.
+  Suppressed days are listed, not just counted.
+- **CF/ACDD metadata.** `apply_cf_attrs` applies variable and coordinate
+  attributes from one table on both write paths, with `native_attr_overrides`
+  for the cases where a native store and h2ds legitimately differ (`msl` is Pa
+  natively, hPa in h2ds). Root attributes declare `Conventions` and compute
+  ACDD extents per file. Coordinate attributes are load-bearing, not cosmetic:
+  without them `rio.clip` cannot resolve lon/lat and geometry extraction
+  returns all-NaN. An append never rewrites attributes, so the existing stores
+  were backfilled once out of band; the one-off script has since been removed.
+- **Provenance** now means dates *covered* rather than dates requested, carries
+  per-source rep/nrt lineage through to h2ds, and survives appends instead of
+  being wiped by them. `refresh_provenance` repairs records narrower than the
+  file they describe.
+- A variable can declare its own `store_root`, resolved by
+  `utils/paths.py::store_root_for` as `--store-path` > the variable's
+  `store_root` > `STORE_ROOT` > `ZARR_DIR`. Declaring none anywhere resolves
+  exactly as before.
+- **Cadence-aware extraction.** `Extractor` takes `time_cadence`
+  (`auto`/`daily`/`hourly`) for how `time_col` is read and `read_from`
+  (`auto`/`native`/`compiled`) for which store answers — two independent axes,
+  because an hourly store can serve sub-daily input while a date-only query
+  against the same var_key belongs to h2ds.
+- An incremental compile can backfill an interior hole rather than only
+  extending the ends.
+- `h2mare catalog` reports the store bbox; the end-of-run tally reports the
+  share of rows null.
+- A minimal example config to start from, and docstrings on the public surface
+  people meet first.
+
+### Changed
+
+- `expect_daily` was renamed `expect_contiguous_time` and then removed
+  outright — it was an escape hatch nothing ever used.
+- Unrecognised per-variable config keys are warned about instead of ignored.
+- `ZarrCatalog`'s repr says which cadence it is reporting.
+- Runtime dependencies that were only ever installed transitively are now
+  declared; the docs tooling is no longer shipped to consumers.
+- CI checks formatting, lints `scripts/`, tests on 3.12 and 3.13, fails when
+  `uv.lock` has drifted from `pyproject.toml`, and runs pyright as an
+  informational job so the finding count cannot grow unnoticed.
+- `copernicusmarine` bumped to 2.4.1, dropping the `sparse` constraint.
+
+### Fixed
+
+- Zarr stores with drifted coordinate axes are readable again. The same axis
+  written on different occasions can disagree in the last float bits, which
+  `open_mfdataset(combine="by_coords")` compares exactly; agreeing axes are
+  snapped onto the earliest file's, with per-coordinate tolerances because the
+  units differ. Ragged variable sets are padded to the union so a store whose
+  files carry different variables still combines as one group.
+  `scripts/repair_axis_drift.py` rewrites drifted coordinates in place.
+- A disjoint backfill no longer duplicates the whole Zarr file.
+- A stale backup is cleared before the swap, so a failed write can actually
+  roll back; a failed h2ds backup copy is no longer reported as a success.
+- Write-path overlap boundaries resolve by instant rather than by whole day, an
+  overlapping rewrite against a sub-daily axis is refused, and whole calendar
+  days are read so an hourly store is not truncated.
+- ERA5 radiation accumulations that are already hourly are no longer
+  differenced again, and the store stops advertising rates as accumulations.
+- Wave direction is averaged and interpolated as a circle, not a line.
+- The Ekman climatology aligns to the calendar rather than to `dayofyear`,
+  rolling features seed with 20 days, the curl stencil keeps lat/lon
+  contiguous, and upwelling events are not counted before their window is full.
+- CMEMS hourly subsets request the whole final day, a trailing day the provider
+  is still publishing is held back, and four date-bounded time slices cover the
+  whole last day.
+- Extraction: a checkpoint written for a different input is discarded rather
+  than replayed onto it; an extraction interrupted mid-checkpoint recovers;
+  every depth level a 3-D variable publishes is extracted, and those levels are
+  no longer reported as a gap; `vars=[]` reads as "everything"; the CRS is set
+  after renaming lon/lat, not before; a store lacking compile-derived variables
+  says so instead of returning nulls.
+- `--store-path` reaches every pipeline step, `Extractor`'s `store_root` reaches
+  the reads, source coverage is read from the root the compile reads from, and
+  a catalog sidecar belonging to another store root triggers a rescan.
+- A variable is routed to the store that actually holds it and dated per
+  variable, rather than per source.
+- Appending outside the store's date range registers new columns.
+- A Parquet string time column is parsed instead of cast to null; the CLI exits
+  non-zero when conversion fails; a Parquet null finding names the file it
+  refers to.
+- Partial AVISO downloads are surfaced instead of swallowed, the FTP connection
+  is closed rather than leaked, and the spent eddies download manifest is
+  deleted after staging.
+- One-day downloads are converted instead of silently discarded, and the
+  downloads folder is only removed once a run has consumed it.
+- The raw dataset is closed so `archive_raw` can move files on Windows, and the
+  raw-archive period folder is built with a portable separator.
+- Importing h2mare no longer creates `data/` and `logs/` trees or suppresses
+  every warning process-wide.
+- `UnicodeEncodeError` on non-UTF-8 consoles.
+- `join="exact"` and `data_vars` are pinned on the reader's `open_mfdataset`, so
+  xarray's changing defaults stay no-ops.
+- Missing dates and coordinates are rejected at the boundary instead of passed
+  on as `NaT`/`NaN`.
+- Two failures that hid their real cause now report it; the Zarr → Parquet step
+  is named in the log and reports how long it took.
+
+### Performance
+
+- The hourly ekman source is reduced in slabs over the store rather than
+  materialised whole.
+- int16 encoding ranges are found in one pass over the source.
+
 ## [0.7.0] - 2026-08-05
 
 ### Breaking
@@ -303,6 +441,11 @@ anyone running 0.3.x or earlier should upgrade.
 - Numerous correctness fixes in the fronts processor, FSLE processing
   (bbox handling), extraction (NaN coordinates), and Parquet schema unioning.
 
+[0.8.0]: https://github.com/h2ugoparra/h2mare/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/h2ugoparra/h2mare/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/h2ugoparra/h2mare/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/h2ugoparra/h2mare/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/h2ugoparra/h2mare/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/h2ugoparra/h2mare/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/h2ugoparra/h2mare/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/h2ugoparra/h2mare/compare/v0.1.1...v0.2.0

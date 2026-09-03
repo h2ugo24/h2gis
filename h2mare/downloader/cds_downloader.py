@@ -1,14 +1,14 @@
 """
-Download climate data from Copernicus ECMWF CLimate Data Store (CLS)
+Download climate data from the Copernicus Climate Data Store (CDS), operated by ECMWF.
 Go to https://cds.climate.copernicus.eu/datasets to check API request code
 
 """
 
 from __future__ import annotations
 
+import json
 import sys
 import time
-import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -19,14 +19,25 @@ from loguru import logger
 from h2mare.config import AppConfig
 from h2mare.downloader.base import BaseDownloader
 from h2mare.storage import get_store_coverage, split_time_range
-from h2mare.types import BBox, DateLike, DateRange, TimeResolution
+from h2mare.types import BBox, DateLike, DateRange, FilePeriod
 from h2mare.utils.datetime_utils import normalize_date
 from h2mare.utils.labels import create_filename_label
 
-warnings.filterwarnings("ignore")
-
 
 class CDSDownloader(BaseDownloader):
+    """
+    Downloads ERA5 reanalysis from the Copernicus Climate Data Store.
+
+    Registered for ``source: cds``. Requests go through the ``cdsapi`` client,
+    which reads its own credentials file — nothing here consults ``.env`` for
+    them. CDS queues and builds each request server-side, so a call can sit
+    pending for a long time before any bytes arrive.
+
+    These are the hourly variables: the store keeps ERA5's native cadence and
+    the daily reduction happens at compile time, which is why several of their
+    derived fields exist only in ``h2ds``.
+    """
+
     def __init__(
         self,
         var_key: str,
@@ -57,7 +68,7 @@ class CDSDownloader(BaseDownloader):
         end_date: Optional[DateLike] = None,
         output_dir: Optional[Path] = None,
         dry_run: bool = False,
-        time_split: TimeResolution = TimeResolution.MONTH,
+        time_split: FilePeriod = FilePeriod.MONTH,
     ) -> bool:
         """
         Run download for specified date range.
@@ -99,6 +110,8 @@ class CDSDownloader(BaseDownloader):
             self._cleanup_empty_download_dir()
             return False
 
+        self._write_manifest(splits, output_dir or self.download_dir)
+
         t0 = time.perf_counter()
         for dt in splits:
             dt = DateRange(start=dt.start, end=dt.end)
@@ -111,6 +124,37 @@ class CDSDownloader(BaseDownloader):
             f"in {time.perf_counter() - t0:.1f}s"
         )
         return True
+
+    def _write_manifest(self, splits: list[DateRange], output_dir: Path) -> None:
+        """
+        Record which dataset covered which window, for ``Netcdf2Zarr`` to stamp
+        onto the store as ``source_datasets``.
+
+        Without this the ERA5 variables had no provenance at all — not a stale
+        record but no record, in any year — because the convert step returns
+        early when there is no manifest to read. CMEMS and AVISO have always
+        written one.
+
+        ERA5 publishes one reanalysis product per variable, so unlike CMEMS
+        there is no rep/nrt handover to describe: every window names the same
+        dataset id, and the records merge into a single span.
+
+        Written before the downloads run, as the other two do, so a window that
+        fails still says what was asked of it.
+        """
+        records = [
+            {
+                "dataset_id": self.var_config.dataset_id_rep,
+                "dataset_type": "rep",
+                "start": pd.Timestamp(dt.start).strftime("%Y-%m-%d"),
+                "end": pd.Timestamp(dt.end).strftime("%Y-%m-%d"),
+            }
+            for dt in splits
+        ]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = output_dir / "h2mare_manifest.json"
+        manifest_path.write_text(json.dumps(records, indent=2))
+        logger.debug(f"Wrote download manifest to {manifest_path}")
 
     def _resolve_date_range(
         self,

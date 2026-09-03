@@ -16,13 +16,46 @@ import xarray as xr
 from loguru import logger
 
 from h2mare.storage.xarray_helpers import snap_grid_coords
-from h2mare.types import BBox, DateRange
+from h2mare.types import BBox
+
+
+def _read_root_attrs(path: Path) -> dict:
+    """Zarr root-group attributes, or ``{}`` when unreadable."""
+    try:
+        import zarr
+
+        return dict(zarr.open_group(str(path), mode="r").attrs)
+    except Exception as e:
+        logger.debug(f"Could not read root attrs of {path.name}: {e}")
+        return {}
+
+
+def _restore_root_attrs(path: Path, preserved: dict) -> None:
+    """
+    Put back root attributes the write dropped, without clobbering new ones.
+
+    Only keys absent after the write are restored, so a value the write
+    deliberately set still wins.
+    """
+    if not preserved:
+        return
+    try:
+        import zarr
+
+        root = zarr.open_group(str(path), mode="r+")
+        missing = {k: v for k, v in preserved.items() if k not in root.attrs}
+        if missing:
+            root.attrs.update(missing)
+            logger.debug(f"Restored {sorted(missing)} on {path.name} after append")
+    except Exception as e:
+        logger.warning(f"Could not restore root attrs on {path.name}: {e}")
 
 
 def write_append_zarr(
     var_key: str,
     ds: xr.Dataset,
     path: Path,
+    encoding: Optional[dict] = None,
 ) -> None:
     """
     Write dataset, checking temporal overlap and appending data if path exists.
@@ -31,6 +64,10 @@ def write_append_zarr(
         var_key: Variable key, must exist in app_config.variables (used for overlap resolution)
         ds: New dataset to write/append
         path: Destination zarr path, built by the caller via ``ZarrCatalog.build_file_path()``
+        encoding: Per-variable zarr encoding, applied only when *path* does not
+            exist yet. An existing store keeps the encoding it was created with:
+            appends inherit it from disk, and passing one to an append is an
+            error. None (the default) writes exactly what it always has.
     """
     # Canonicalize grid labels before any write/append so float-noise drift —
     # between a source's reprocessed periods, or between new data and a legacy
@@ -49,7 +86,26 @@ def write_append_zarr(
     if path.exists():
         # No log here: each append path announces itself (in-place append,
         # variable-addition, or overlap merge).
+        #
+        # The in-place fast path ends in to_zarr(append_dim="time"), which
+        # rewrites the group attrs from the incoming dataset — and that carries
+        # none, so the store's own metadata was wiped. The rewrite paths keep
+        # them (xr.concat/merge carry ds_old's attrs through), which is why this
+        # only ever bit strictly-after appends: the common case.
+        #
+        # source_datasets is the casualty that matters. Provenance stamped by
+        # one run vanished on the next, so merge_records never found anything to
+        # merge with and backfill_provenance's "skip files that already have the
+        # attr" was undone by the following append.
+
+        # Before anything is written: a packed store's scale was fixed at
+        # creation and an append inherits it, so data outside that range has no
+        # encoding and would wrap rather than clip. No-op for float32 stores.
+        _check_packed_range(ds, path)
+
+        preserved = _read_root_attrs(path)
         _append_data(var_key, ds, path)
+        _restore_root_attrs(path, preserved)
 
     else:
         logger.info(f"Saving new dataset at {path}")
@@ -61,7 +117,7 @@ def write_append_zarr(
         tmp_path = path.with_name(path.name + ".tmp")
         shutil.rmtree(tmp_path, ignore_errors=True)
         try:
-            ds.to_zarr(tmp_path)
+            ds.to_zarr(tmp_path, encoding=encoding or None)
             xr.open_zarr(tmp_path, consolidated=False).close()
         except Exception as e:
             shutil.rmtree(tmp_path, ignore_errors=True)
@@ -91,6 +147,106 @@ def _restore_orphaned_backup(path: Path) -> None:
         shutil.move(str(backup_path), str(path))
 
 
+# Smallest step pandas can represent at datetime64[ns], so `t - _ONE_TICK` is
+# the largest instant strictly before t. Used to make a window boundary
+# exclusive without assuming anything about the axis's cadence.
+_ONE_TICK = pd.Timedelta(nanoseconds=1)
+
+
+def _time_bounds(ds: xr.Dataset) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """First and last actual timestamps on *ds*'s time axis."""
+    times = ds.time.values
+    return pd.Timestamp(times[0]), pd.Timestamp(times[-1])
+
+
+def _check_packed_range(ds_new: xr.Dataset, path: Path) -> None:
+    """
+    Refuse an append whose values the store's frozen packing cannot represent.
+
+    A scale/offset store fixes ``scale_factor`` and ``add_offset`` when it is
+    *created*, from the range of whatever batch was written first, and every
+    later append inherits them (see :func:`write_append_zarr`'s ``encoding``
+    argument). Nothing re-derives them, so a value outside that first batch's
+    range has no encoding — and it does not clip, it overflows the integer
+    dtype and wraps back into the middle of the range. A store scaled for msl
+    99000-102000 Pa, appended with a storm year reaching 92000 Pa, read back
+    with a 9074 Pa error and no warning: the wrapped values land *inside* the
+    plausible band, so there are no outliers to notice and no NaNs to count.
+
+    Failing loudly here turns that into an ordinary operational error. The fix
+    when it fires is to re-convert the store, which re-derives the scale over
+    the full range.
+
+    Costs one pass over *ds_new* to find its bounds, and only for stores that
+    are actually packed — a float32 store returns before reading anything.
+    Every variable's min and max go into a single graph, so the source is
+    decoded once rather than twice per variable.
+
+    Note this checks the representable *range* only. A value that happens to
+    encode exactly onto ``_FillValue`` still reads back as NaN; that is a far
+    rarer single-value collision, not the systematic wraparound above.
+
+    Raises:
+        ValueError: If any variable in *ds_new* falls outside what the store's
+            packing can represent, naming the variable and both windows.
+    """
+    import dask
+
+    ds_old = xr.open_zarr(path, consolidated=False)
+    try:
+        packed = {}
+        for name in ds_new.data_vars:
+            if name not in ds_old.data_vars:
+                continue
+            enc = ds_old[name].encoding
+            scale = enc.get("scale_factor")
+            dtype = np.dtype(enc.get("dtype", "f4"))
+            if scale is None or dtype.kind not in "iu":
+                continue
+            packed[name] = (float(scale), float(enc.get("add_offset", 0.0)), dtype)
+    finally:
+        ds_old.close()
+
+    if not packed:
+        return
+
+    logger.info(
+        f"Checking {len(packed)} packed variable(s) against {path.name}'s stored "
+        "scale (one pass over the incoming data)"
+    )
+    bounds: dict[tuple[str, str], xr.DataArray] = {}
+    for name in packed:
+        bounds[(str(name), "lo")] = ds_new[name].min()
+        bounds[(str(name), "hi")] = ds_new[name].max()
+    (computed,) = dask.compute(bounds)
+
+    problems: list[str] = []
+    for name, (scale, offset, dtype) in packed.items():
+        lo = float(computed[(str(name), "lo")])
+        hi = float(computed[(str(name), "hi")])
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            # All-NaN increment: nothing to encode, nothing to overflow.
+            continue
+        info = np.iinfo(dtype)
+        repr_lo = offset + info.min * scale
+        repr_hi = offset + info.max * scale
+        if lo < repr_lo or hi > repr_hi:
+            problems.append(
+                f"  {name} ({dtype.name}): incoming [{lo:.6g}, {hi:.6g}] is "
+                f"outside the representable [{repr_lo:.6g}, {repr_hi:.6g}]"
+            )
+
+    if problems:
+        raise ValueError(
+            f"{path.name} is scale/offset-packed with a scale fixed when it was "
+            f"created, and cannot represent the incoming data:\n"
+            + "\n".join(problems)
+            + f"\nAppending would silently wrap these values back into range. "
+            f"Re-convert this store so the scale is re-derived over the full "
+            f"range (delete {path.name} and re-run the convert step for it)."
+        )
+
+
 def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
     """
     Append new data to existing zarr file, handling two distinct cases:
@@ -113,9 +269,6 @@ def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
         var_key: The key for the variable to be processed and must exist in app_config.variables
         ds_new: New dataset to append.
         path: file path created by ``ZarrCatalog(var_key).build_file_path()``
-
-    Raises:
-        ValueError: If corrupted dataset is detected with unique values after concatenation.
     """
     ds_old = xr.open_zarr(path, consolidated=False)
     ds_old_vars = set(ds_old.data_vars)
@@ -181,7 +334,10 @@ def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
         # file that extends through June) would otherwise drop April-June.
         new_end = pd.Timestamp(ds_new.time.values[-1])
         ds_old_tail = xr.open_zarr(path, consolidated=False)
-        tail = ds_old_tail.sel(time=slice(new_end + pd.Timedelta(days=1), None))
+        # Strictly after the incoming window's last instant. A `+ 1 day` bound
+        # here would skip every stored step falling later the same day as
+        # new_end — 23 of them on an hourly axis.
+        tail = ds_old_tail.sel(time=slice(new_end + _ONE_TICK, None))
         if tail.sizes.get("time", 0):
             parts.append(_shared_time_vars(snap_grid_coords(tail)))
             src_to_close.append(ds_old_tail)
@@ -254,6 +410,20 @@ def _append_data(var_key: str, ds_new: xr.Dataset, path: Path) -> None:
     # Backup-swap: keep original until new file is confirmed in place
     backup_path = path.with_name(path.name + ".bak")
     logger.debug(f"Atomic swap: {path.name}")
+    # Clear a stale backup first. A crash between the tmp → path move below and
+    # the rmtree that follows it leaves *both* path and path.bak present, and
+    # _restore_orphaned_backup only handles the other direction (path missing).
+    # shutil.move onto an existing directory moves *into* it rather than
+    # replacing it, so without this the store lands at path.bak/<name>.zarr and
+    # the rollback branch restores a directory mixing stale files with a nested
+    # store — losing the history in the one branch that exists to preserve it.
+    # Reaching here means path exists, so any surviving backup is known-stale.
+    if backup_path.exists():
+        logger.warning(
+            f"Discarding stale backup {backup_path.name} left by an earlier "
+            "interrupted append."
+        )
+        shutil.rmtree(backup_path, ignore_errors=True)
     shutil.move(str(path), str(backup_path))
     try:
         shutil.move(str(tmp_path), str(path))
@@ -303,7 +473,9 @@ def _try_append_fast_path(ds_new: xr.Dataset, path: Path) -> bool:
             return False
 
         old_n = ds_old.sizes["time"]
-        chunk_sizes = {dim: sizes[0] for dim, sizes in ds_old.chunksizes.items()}
+        chunk_sizes: dict[str, int] = {
+            str(dim): sizes[0] for dim, sizes in ds_old.chunksizes.items()
+        }
     finally:
         ds_old.close()
 
@@ -321,7 +493,9 @@ def _try_append_fast_path(ds_new: xr.Dataset, path: Path) -> bool:
         time_chunks.append(min(tchunk, remaining))
         remaining -= time_chunks[-1]
 
-    target = {d: c for d, c in chunk_sizes.items() if d != "time" and d in ds_new.dims}
+    target: dict[str, int | tuple[int, ...]] = {
+        d: c for d, c in chunk_sizes.items() if d != "time" and d in ds_new.dims
+    }
     target["time"] = tuple(time_chunks)
     ds_append = ds_new.chunk(target)
     # Stale chunk encodings from whatever store ds_new was read from would
@@ -394,8 +568,12 @@ def _resolve_overlap(ds_new: xr.Dataset, path: Path) -> Optional[xr.Dataset]:
                 f"{len(only_in_old)} not in new data."
             )
 
-    daterange_old = DateRange.from_dataset(ds_old)
-    daterange_new = DateRange.from_dataset(ds_new)
+    # Boundaries come from the actual timestamps, not from DateRange, which
+    # normalizes both ends to midnight. Day-granular boundaries silently drop
+    # data whenever a store's stamps are not at midnight: 23 hours per boundary
+    # on an hourly axis, and the whole preceding day on a noon-stamped daily one.
+    old_first, old_last = _time_bounds(ds_old)
+    new_first, new_last = _time_bounds(ds_new)
 
     if not BBox.from_dataset(ds_old).overlaps(BBox.from_dataset(ds_new)):
         # A plain ValueError (not assert — assertions vanish under `python -O`)
@@ -410,26 +588,31 @@ def _resolve_overlap(ds_new: xr.Dataset, path: Path) -> Optional[xr.Dataset]:
             "bbox changed since this store was written?"
         )
 
-    if daterange_old == daterange_new and ds_old_vars == ds_new_vars:
+    if (old_first, old_last) == (new_first, new_last) and ds_old_vars == ds_new_vars:
         logger.info(f"Full overlap with {path.name} — replacing entirely.")
         ds_old.close()
         return None
 
-    if daterange_old.overlaps(daterange_new):
+    if old_first <= new_last and old_last >= new_first:
         logger.debug(f"Temporal overlap with {path.name} — merging.")
 
-        if (
-            daterange_new.start <= daterange_old.start
-            and daterange_new.end >= daterange_old.end
-        ):
+        if new_first <= old_first and new_last >= old_last:
             logger.info("New data fully contains existing data — replacing entirely.")
             ds_old.close()
             return None
 
-        # Keep the non-overlapping head of ds_old — slice directly, no second zarr open
-        cutoff_date = daterange_new.start - pd.Timedelta(days=1)
-        start_date = min(daterange_old.start, daterange_new.start)
-        ds_subset = ds_old.sel(time=slice(start_date, cutoff_date))
-        return ds_subset if len(ds_subset.time) > 0 else None
-
-    return ds_old
+    # Keep the head of ds_old that sits strictly before the incoming window
+    # — slice directly, no second zarr open. The bound is one tick short of
+    # new_first rather than a day short, so a step on the same day as the
+    # incoming start but earlier than it is retained rather than discarded.
+    #
+    # Disjoint windows land here too, and must: returning ds_old whole for them
+    # put it in the head *and* in the tail _append_data selects after ds_new,
+    # so a store holding June-December that was backfilled with January came
+    # back with June-December written twice and a non-monotonic time axis. When
+    # ds_new is the earlier side this slice is empty (None) and the tail alone
+    # contributes ds_old; when it is the later side the slice is all of ds_old
+    # and the tail is empty. One expression covers overlap and disjoint alike,
+    # which is what keeps the two from drifting apart again.
+    ds_subset = ds_old.sel(time=slice(None, new_first - _ONE_TICK))
+    return ds_subset if len(ds_subset.time) > 0 else None

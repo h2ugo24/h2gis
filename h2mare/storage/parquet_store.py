@@ -138,16 +138,6 @@ class ParquetStore:
             path = path / f"{col}={val}"
         return path
 
-    def _partition_filter_sql(self, pairs: list[tuple]) -> str:
-        clauses = []
-        for vals in pairs:
-            parts = [
-                f"{col} = '{v}'" if isinstance(v, str) else f"{col} = {v}"
-                for col, v in zip(self._partition_by, vals)
-            ]
-            clauses.append(f"({' AND '.join(parts)})")
-        return " OR ".join(clauses)
-
     def _partition_filter_expr(self, partition: tuple) -> pl.Expr:
         exprs = [pl.col(col) == val for col, val in zip(self._partition_by, partition)]
         return exprs[0] if len(exprs) == 1 else pl.all_horizontal(exprs)
@@ -358,14 +348,26 @@ class ParquetStore:
         time_mode: Literal["date", "datetime"] = "date",
         fmt: str | None = None,
     ) -> pl.DataFrame:
+        """
+        Normalise the time column to a date (or datetime) in place.
+
+        Strings are *parsed*, not cast. ``cast(pl.Datetime)`` on a Utf8 column
+        is not a parse in polars 1.x — it fails for every value, and with
+        ``strict=False`` that failure is a silent null, so a frame of
+        well-formed ISO dates came back with the whole column nulled. Polars'
+        own error text for the strict version points at ``str.to_datetime``,
+        which is what this uses; it infers the format and raises on input it
+        cannot read.
+        """
         dtype = df[self.time_col].dtype
         expr = pl.col(self.time_col)
 
         if dtype == pl.Utf8:
-            if fmt is not None:
-                expr = expr.str.to_datetime(format=fmt)
-            else:
-                expr = expr.cast(pl.Datetime, strict=False)
+            expr = (
+                expr.str.to_datetime(format=fmt)
+                if fmt is not None
+                else expr.str.to_datetime()
+            )
         else:
             if fmt is not None:
                 raise ValueError("`fmt` is only valid when time column is Utf8")
@@ -422,6 +424,20 @@ class ParquetStore:
 
         df = self._resolve_time_col(df, time_mode=time_mode, fmt=fmt)
 
+        # Check the resolved time column before anything reaches disk. The
+        # partition values are derived from it, so a null time lands the row in
+        # year=__HIVE_DEFAULT_PARTITION__ — and the write below runs before the
+        # metadata step that would notice, leaving that junk partition behind
+        # for the store-wide rglob('*.parquet') scans to pick up as data.
+        n_null = df[self.time_col].null_count()
+        if n_null:
+            raise ValueError(
+                f"'{self.time_col}' has {n_null} null value(s) of {len(df)} after "
+                f"resolving to {time_mode}. Rows with no time cannot be "
+                f"partitioned. Check the column's dtype, or pass fmt= if it holds "
+                f"strings in a format polars cannot infer."
+            )
+
         custom_cols = set(self._partition_by) - _TIME_COMPONENTS
         missing_partition_cols = custom_cols - set(df.columns)
         if missing_partition_cols:
@@ -445,6 +461,14 @@ class ParquetStore:
                 self._extend_dataset_metadata(df)
                 return
             logger.debug("Appending non-overlapping data.")
+            # Register any brand-new column before aligning. resolve_dims_overlap
+            # only reaches _update_physical_schema when it actually merges; every
+            # path that returns None (no temporal overlap, no coverage yet) skips
+            # it, and _align_to_schema then rejects the column as "detected but
+            # physical schema was not updated". That made adding a new variable
+            # for dates outside the store's range — seapodym, which is 2025-only —
+            # a hard failure rather than an append.
+            self._update_physical_schema(df)
             df = self._align_to_schema(df)
         else:
             logger.debug("Creating new parquet dataset.")

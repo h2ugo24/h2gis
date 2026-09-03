@@ -1,6 +1,7 @@
 """Tests for AVISODownloader.get_rep_availability and get_nrt_availability."""
 
 import json
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import msgspec
@@ -349,15 +350,17 @@ def _eddies_app_config() -> AppConfig:
     )
 
 
-def _run_download(downloader, tasks):
+def _run_download(downloader, tasks, failed=None):
     """Drive run() with the FTP layer stubbed, returning the manifest contents.
 
     The manifest must land in ``download_dir`` — the same directory
     ``Netcdf2Zarr._read_manifest`` looks in — not the download root.
+
+    ``failed`` is the list ``download_parallel`` reports back as undownloadable.
     """
     with (
         patch.object(downloader, "_create_download_tasks", return_value=tasks),
-        patch.object(downloader, "download_parallel"),
+        patch.object(downloader, "download_parallel", return_value=failed or []),
         patch.object(
             downloader,
             "get_rep_availability",
@@ -465,3 +468,160 @@ class TestWriteManifest:
         _, records = _run_download(dl_no_nrt, tasks)
 
         assert [r["dataset_type"] for r in records] == ["rep"]
+
+
+# ---------------------------------------------------------------------------
+# Partial-download detection
+#
+# download_parallel used to log a failed transfer and carry on, after which
+# run() wrote the manifest for every planned task and reported success with the
+# *requested* file count. The missing day then vanished: store coverage is a
+# min/max watermark a one-day hole cannot move, and convert derives what to
+# write from the files that did arrive. AVISO_FSLE 1999 and 2025-06-02 are what
+# that looks like months later.
+# ---------------------------------------------------------------------------
+
+
+class TestPartialDownloadIsReported:
+    def test_run_raises_when_a_file_fails(self, dl):
+        tasks = [
+            FTPDownloadTask(filepath="fsle_20200105.nc", source="rep"),
+            FTPDownloadTask(filepath="fsle_20200106.nc", source="rep"),
+        ]
+
+        with pytest.raises(RuntimeError, match="Download incomplete"):
+            _run_download(dl, tasks, failed=["fsle_20200106.nc"])
+
+    def test_error_names_the_failed_file(self, dl):
+        tasks = [FTPDownloadTask(filepath="fsle_20200105.nc", source="rep")]
+
+        with pytest.raises(RuntimeError, match="fsle_20200105.nc"):
+            _run_download(dl, tasks, failed=["fsle_20200105.nc"])
+
+    def test_manifest_still_written_when_a_file_fails(self, dl):
+        """The requested span must survive so convert can detect the gap."""
+        tasks = [FTPDownloadTask(filepath="fsle_20200105.nc", source="rep")]
+
+        with pytest.raises(RuntimeError):
+            _run_download(dl, tasks, failed=["fsle_20200105.nc"])
+
+        manifest = dl.download_dir / "h2mare_manifest.json"
+        assert manifest.exists()
+        assert json.loads(manifest.read_text())[0]["start"] == "2020-01-05"
+
+    def test_run_succeeds_when_nothing_fails(self, dl):
+        tasks = [FTPDownloadTask(filepath="fsle_20200105.nc", source="rep")]
+
+        _run_download(dl, tasks, failed=[])  # must not raise
+
+
+class TestDownloadParallelCollectsFailures:
+    @contextmanager
+    def _dl_with_failing_paths(self, dl, bad: set[str]):
+        """Make connect_ftp succeed, but RETR raise for paths in *bad*.
+
+        ``_retry_call`` is stubbed to a single immediate attempt — its
+        exponential backoff sleeps 10-60s between tries, and the retry policy
+        is not what these tests are about.
+        """
+
+        def _connect():
+            ftp = MagicMock()
+            ftp.size.side_effect = Exception("no size")
+
+            def _retr(cmd, _callback):
+                path = cmd.split(" ", 1)[1]
+                if path in bad:
+                    raise OSError(f"connection reset for {path}")
+
+            ftp.retrbinary.side_effect = _retr
+            return ftp
+
+        with (
+            patch.object(dl, "connect_ftp", side_effect=_connect),
+            patch.object(dl, "_retry_call", side_effect=lambda fn, *a, **kw: fn(*a)),
+        ):
+            yield
+
+    def test_returns_the_failed_paths(self, dl, tmp_path):
+        with self._dl_with_failing_paths(dl, {"b.nc"}):
+            failed = dl.download_parallel(
+                ["a.nc", "b.nc"], dataset_id="/d", output_dir=tmp_path
+            )
+
+        assert failed == ["b.nc"]
+
+    def test_returns_empty_when_all_succeed(self, dl, tmp_path):
+        with self._dl_with_failing_paths(dl, set()):
+            failed = dl.download_parallel(
+                ["a.nc", "b.nc"], dataset_id="/d", output_dir=tmp_path
+            )
+
+        assert failed == []
+
+    def test_successful_file_is_renamed_into_place(self, dl, tmp_path):
+        with self._dl_with_failing_paths(dl, set()):
+            dl.download_parallel(["a.nc"], dataset_id="/d", output_dir=tmp_path)
+
+        assert (tmp_path / "a.nc").exists()
+        assert not (tmp_path / "a.nc.part").exists()
+
+    def test_failed_transfer_leaves_no_partial_nc_behind(self, dl, tmp_path):
+        """A truncated *.nc would be globbed by convert as if it were complete."""
+        with self._dl_with_failing_paths(dl, {"b.nc"}):
+            dl.download_parallel(["b.nc"], dataset_id="/d", output_dir=tmp_path)
+
+        assert not (tmp_path / "b.nc").exists()
+        assert not (tmp_path / "b.nc.part").exists()
+
+
+# ---------------------------------------------------------------------------
+# FTP connection lifecycle
+#
+# The control connection opened in __init__ used to be left for the garbage
+# collector ("# self.ftp.quit()" sat commented out), which Python reports as
+# ResourceWarning: unclosed <socket.socket ...>. ResourceWarning is ignored by
+# default, so it only showed up under PYTHONWARNINGS=always.
+# ---------------------------------------------------------------------------
+
+
+class TestFtpConnectionLifecycle:
+    def test_close_quits_the_connection(self, dl):
+        ftp = dl.ftp
+        dl.close()
+        ftp.quit.assert_called_once()
+
+    def test_close_falls_back_to_close_when_quit_raises(self, dl):
+        """A server that already dropped the link makes QUIT raise."""
+        ftp = dl.ftp
+        ftp.quit.side_effect = OSError("connection reset")
+        dl.close()
+        ftp.close.assert_called_once()
+
+    def test_close_is_idempotent(self, dl):
+        dl.close()
+        dl.close()  # must not raise
+
+    def test_context_manager_closes(self, tmp_path):
+        with patch.object(AVISODownloader, "connect_ftp", return_value=MagicMock()):
+            with AVISODownloader(
+                "fsle",
+                app_config=_make_app_config(_ENTRY),
+                store_root=tmp_path,
+                download_root=tmp_path,
+            ) as d:
+                ftp = d.ftp
+        ftp.quit.assert_called_once()
+
+    def test_reconnect_releases_the_dead_socket(self, dl, tmp_path):
+        """Each reconnect used to strand the previous socket."""
+        dead = dl.ftp
+        dead.voidcmd.side_effect = OSError("connection lost")
+        fresh = MagicMock()
+
+        with patch.object(AVISODownloader, "connect_ftp", return_value=fresh):
+            with patch("h2mare.downloader.aviso_downloader._download_to_part"):
+                dl.download_file("/dataset/fsle/rep/a.nc", tmp_path)
+
+        dead.close.assert_called_once()
+        assert dl.ftp is fresh

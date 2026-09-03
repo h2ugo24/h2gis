@@ -2,9 +2,55 @@
 Classes representing Data models for spatial and variable configurations.
 """
 
+from enum import Enum
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Optional
 
 import msgspec
+
+
+class TimeStep(str, Enum):
+    """
+    Native cadence of a variable's stored Zarr — how far apart its time steps are.
+
+    Distinct from :class:`h2mare.types.FilePeriod`, which is about the storage
+    layout rather than the data: a store can be hourly and still be written one
+    file per year.
+    """
+
+    DAILY = "daily"
+    HOURLY = "hourly"
+
+
+class StoreDtype(str, Enum):
+    """
+    On-disk encoding for a variable's Zarr.
+
+    ``FLOAT32`` (the default) writes what the pipeline has always written and is
+    byte-identical to it. ``INT16`` stores scale/offset-packed integers instead,
+    matching the ~16-bit packing ERA5's GRIB already uses — so it discards
+    quantisation noise rather than signal, at roughly two thirds the size.
+
+    Opt-in per variable: a store keeps whatever encoding it was created with,
+    and appends inherit it.
+    """
+
+    FLOAT32 = "float32"
+    INT16 = "int16"
+
+
+def step_freq(var_config) -> str:
+    """
+    Pandas frequency alias matching a variable's cadence — ``"h"`` or ``"D"``.
+
+    Used by the gap checks so they compare a store against a calendar at its own
+    resolution: a daily grid cannot see a missing hour, and an hourly grid built
+    for a daily store would report 23 phantom gaps per day.
+
+    Takes any object with a ``time_step`` attribute and defaults to daily, so
+    stand-in configs and entries predating the field keep the old behaviour.
+    """
+    return "h" if getattr(var_config, "time_step", None) is TimeStep.HOURLY else "D"
 
 
 class KeyVarConfigEntry(msgspec.Struct):
@@ -73,18 +119,63 @@ class KeyVarConfigEntry(msgspec.Struct):
     # Set True for variables whose Zarr store uses lon/lat coordinate names that
     # must be renamed to x/y before rioxarray clip (e.g. AVISO fsle, eddies).
     rename_lonlat: bool = False
-    # Depth levels (metres) to extract when slicing a 3-D variable during
-    # Extractor runs. Each level becomes a separate output column
-    # (e.g. [0, 100, 500] → o2_0, o2_100, o2_500). None = no depth slicing.
+    # Depth levels (metres) to slice at during Extractor runs, when they should
+    # differ from compile_depth_slices. Each level becomes a separate output
+    # column (e.g. [0, 100, 500] → o2_0, o2_100, o2_500). None (the default, and
+    # what every shipped variable uses) falls back to compile_depth_slices, so
+    # extraction returns what the variable publishes; set it only to narrow a
+    # variable to fewer levels than it compiles.
     extract_depth_slices: Optional[list[int]] = None
     # Depth levels (metres) to select when compiling a 3-D variable into h2ds.
     # Each level becomes a separate output variable (e.g. [0, 100, 500, 1000]
     # → o2_0, o2_100, o2_500, o2_1000). None = no depth slicing in compiler.
+    # Also the default for extract_depth_slices, so this is the single place a
+    # 3-D variable's levels are declared unless extraction is narrowed.
     compile_depth_slices: Optional[list[int]] = None
     # Exact variable names as they appear in the compiled h2ds Zarr for this
     # var_key. Used to select only these columns when adding a variable to an
     # existing Parquet store (--add-var). None means not yet declared.
     compiled_vars: Optional[list[str]] = None
+    # Cadence of this variable's stored Zarr. DAILY (the default, and what every
+    # existing store is) means one step per calendar day. HOURLY keeps the
+    # source's sub-daily axis instead of aggregating it away at convert time —
+    # for ERA5 that preserves the native resolution the raw GRIB already has.
+    #
+    # Read paths normalize a DAILY store's stamps to midnight (sources often
+    # publish at 12:00); doing that to an HOURLY store would collapse 24 steps
+    # onto one timestamp, so the normalization is skipped for it.
+    time_step: TimeStep = TimeStep.DAILY
+    # On-disk encoding. Default writes exactly what it always has; INT16 packs
+    # to scale/offset integers (see StoreDtype). Only consulted when a store is
+    # first created — an existing store keeps its own encoding through appends.
+    store_dtype: StoreDtype = StoreDtype.FLOAT32
+    # Days the provider never published, which therefore cannot be downloaded,
+    # converted or backfilled. Each entry is either "YYYY-MM-DD" or a closed
+    # interval "YYYY-MM-DD/YYYY-MM-DD".
+    #
+    # Needed because a source that ships one file per day produces an *axis*
+    # hole when it skips one, which is otherwise indistinguishable from data
+    # the pipeline lost — AVISO simply has no fsle file for 2025-06-02, and its
+    # remote listing jumps 20250601 → 20250603. Without somewhere to record
+    # that, the gap checks would report it on every run forever, and a check
+    # that cries wolf is one people stop reading.
+    #
+    # Only for gaps confirmed absent at the source. Anything else is a defect
+    # and belongs fixed, not listed.
+    known_gaps: Optional[list[str]] = None
+    # Root holding this variable's ``local_folder``, for stores that should not
+    # live under STORE_ROOT — one drive for the hourly ERA5 stores, another for
+    # the CMEMS dailies. None (the default, and what every shipped variable
+    # uses) falls back to STORE_ROOT, so a config that declares none resolves
+    # exactly as it always has.
+    #
+    # Must be absolute: ``resolve_store_path`` calls ``.resolve()`` on the
+    # joined path, so a relative value would silently resolve against whatever
+    # directory the process happened to start in.
+    #
+    # Outranked by ``--store-path``, which relocates a whole run on purpose.
+    # See ``h2mare.utils.paths.store_root_for`` for the full precedence.
+    store_root: Optional[str] = None
 
     def __post_init__(self):
         if self.bbox is not None:
@@ -119,6 +210,26 @@ class KeyVarConfigEntry(msgspec.Struct):
                     "filename_date_range=True requires `pattern` to have exactly 2 "
                     f"capture groups (start, end); got {ngroups} in {self.pattern!r}"
                 )
+
+        # A relative store_root would resolve against the process cwd, so the
+        # same config would point somewhere different depending on where the
+        # command was run from. Fail at config load rather than write a store
+        # somewhere nobody meant.
+        #
+        # Checked against both flavours rather than the running platform's:
+        # "/data/store" is not absolute to PureWindowsPath (no drive) and
+        # "D:\\data" is not absolute to PurePosixPath, so using plain Path here
+        # would reject a config merely for having been written on the other OS.
+        # What must be caught is a *relative* path, which neither accepts.
+        if self.store_root is not None and not (
+            PurePosixPath(self.store_root).is_absolute()
+            or PureWindowsPath(self.store_root).is_absolute()
+        ):
+            raise ValueError(
+                f"store_root must be an absolute path; got {self.store_root!r}. "
+                "It is the root *above* local_folder — the same shape STORE_ROOT "
+                "has in .env, not a single store's directory."
+            )
 
 
 class SecretsConfig(msgspec.Struct):

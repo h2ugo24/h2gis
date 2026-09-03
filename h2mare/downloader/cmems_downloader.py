@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import sys
 import time
-import warnings
 from datetime import timedelta
 from pathlib import Path
 from typing import Optional
@@ -19,11 +18,11 @@ from loguru import logger
 from h2mare import AppConfig
 from h2mare.downloader.base import BaseDownloader
 from h2mare.downloader.cmems_utils import CMEMSAPIError, get_dataset_time_range
+from h2mare.models import step_freq
 from h2mare.storage import split_time_range
 from h2mare.storage.coverage import resolve_date_range
-from h2mare.types import DateLike, DateRange, DownloadTask, TimeResolution
-
-warnings.filterwarnings("ignore")
+from h2mare.types import DateLike, DateRange, DownloadTask, FilePeriod
+from h2mare.utils.datetime_utils import end_of_day
 
 
 def download_subset(
@@ -43,8 +42,11 @@ def download_subset(
 
     Args:
         dataset_id:  CMEMS dataset ID (e.g. 'METOFFICE-GLO-SST-L4-REP-OBS-SST').
-        start:       Start date.
-        end:         End date.
+        start:       Start datetime, sent to the API as given.
+        end:         End datetime, sent to the API as given — it is *not*
+                     widened to cover the day. On a sub-daily dataset a
+                     midnight-stamped end therefore delivers only that day's
+                     00:00 step; pass ``end_of_day(end)`` to get all 24.
         output_dir:  Directory to write the downloaded file.
         variables:   Variable name(s) to download. None downloads all.
         bbox:        (xmin, ymin, xmax, ymax). None = full geographic extent.
@@ -234,6 +236,23 @@ def download_original(
 
 
 class CMEMSDownloader(BaseDownloader):
+    """
+    Downloads Copernicus Marine products via the ``copernicusmarine`` client.
+
+    Registered for ``source: cmems``, and the source behind most variables.
+    Credentials are held by the ``copernicusmarine`` CLI (``copernicusmarine
+    login``); nothing here reads them.
+
+    A variable's ``subset`` flag picks the API: ``subset()`` honours the
+    configured bbox and ``source_vars``, while ``get()`` fetches whole original
+    files. Where a variable configures both a reprocessed (REP) and a
+    near-real-time (NRT) dataset id, the recent tail comes from NRT and is
+    superseded by REP once that catches up.
+
+    Downloads are recorded in a manifest the convert step reads to stamp
+    provenance onto the resulting Zarr.
+    """
+
     def __init__(
         self,
         var_key: str,
@@ -267,11 +286,47 @@ class CMEMSDownloader(BaseDownloader):
 
     # ==================== Dates and data coverage Resolution ====================
 
+    def _last_complete_day(
+        self, start: pd.Timestamp, end: pd.Timestamp
+    ) -> pd.Timestamp:
+        """
+        Day-level availability end: the last day the provider has published whole.
+
+        A trailing *partial* day is the one case where taking the day the last
+        stamp falls in loses data for good. Store coverage is day-granular, so a
+        day ingested six hours old counts as covered and its remaining eighteen
+        hours are never requested again. Held back, it is fetched whole once the
+        provider finishes publishing it.
+
+        Only the tail behaves this way. A partial *first* day is partial at the
+        source forever, so it is taken as it is rather than skipped — hence the
+        clamp to *start*, which also keeps a product whose entire history is one
+        partial day from resolving to an empty range.
+
+        Daily variables are unaffected: one step per day means the day holding
+        the last stamp is complete by definition.
+        """
+        day = end.normalize()
+        if step_freq(self.var_config) != "h":
+            return day
+
+        # Complete when the day's final step is present. Written against the
+        # cadence rather than as a bare `hour == 23` so that adding a TimeStep
+        # member — a 3-hourly product, say — has to come back through here.
+        last_step_of_day = day + pd.Timedelta(hours=23)
+        if end >= last_step_of_day:
+            return day
+        logger.info(
+            f"[{self.var_key}] {day.date()} is still being published "
+            f"(last stamp {end}); holding it back until it is complete."
+        )
+        return max(day - pd.Timedelta(days=1), start.normalize())
+
     def _get_dataset_availability(self, dataset_id: str) -> DateRange:
         """Query CMEMS API for dataset time range."""
         try:
             start, end = get_dataset_time_range(dataset_id)
-            return DateRange(start=start, end=end)
+            return DateRange(start=start, end=self._last_complete_day(start, end))
         except CMEMSAPIError as e:
             logger.error(f"Failed to get dataset availability: {e}")
             raise
@@ -364,7 +419,7 @@ class CMEMSDownloader(BaseDownloader):
         end_date: Optional[DateLike] = None,
         output_dir: Optional[Path] = None,
         dry_run: bool = False,
-        time_split: TimeResolution = TimeResolution.MONTH,
+        time_split: FilePeriod = FilePeriod.MONTH,
     ) -> bool:
         """
         Run download for specified date range.
@@ -455,7 +510,7 @@ class CMEMSDownloader(BaseDownloader):
     def _execute_task(
         self,
         task: DownloadTask,
-        time_split: TimeResolution,
+        time_split: FilePeriod,
         output_dir: Optional[Path] = None,
     ) -> None:
         """
@@ -497,7 +552,24 @@ class CMEMSDownloader(BaseDownloader):
         end: pd.Timestamp,
         output_dir: Optional[Path] = None,
     ) -> None:
-        """Download using copernicusmarine.subset, deriving spatial/variable config from var_config."""
+        """
+        Download using copernicusmarine.subset, deriving spatial/variable config
+        from var_config.
+
+        *end* is a date, and the toolbox reads it as an instant. On an hourly
+        variable that means the last day of every chunk arrives as its 00:00
+        step alone and the other 23 hours are simply never requested — a whole-
+        month split loses 23 hours per month, quietly: the loss sits at the tail
+        of the converted span, where ``_verify_written_dates`` only warns.
+        Widening the bound to the end of the day is what makes a chunk boundary
+        land between two days instead of inside one.
+
+        Left untouched on a daily variable, whose stores were all written under
+        the midnight bound and whose one step per day it already covers.
+        """
+        if step_freq(self.var_config) == "h":
+            end = end_of_day(end)
+
         download_subset(
             dataset_id=dataset_id,
             start=start,

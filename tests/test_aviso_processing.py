@@ -17,7 +17,7 @@ from h2mare.processing.core.aviso import (
     find_nearest_vectorized,
     process_fsle,
 )
-from h2mare.types import DateRange, TimeResolution
+from h2mare.types import DateRange, FilePeriod
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -120,14 +120,14 @@ class TestFindNearestVectorized:
 class TestGroupDates:
     def test_year_grouping_covers_all_dates(self):
         dates = pd.date_range("2020-01-01", "2021-12-31", freq="D")
-        groups = dict(_group_dates(dates, TimeResolution.YEAR))
+        groups = dict(_group_dates(dates, FilePeriod.YEAR))
         assert 2020 in groups and 2021 in groups
         total = sum(len(v) for v in groups.values())
         assert total == len(dates)
 
     def test_month_grouping_separates_months(self):
         dates = pd.date_range("2020-01-01", "2020-03-31", freq="D")
-        groups = dict(_group_dates(dates, TimeResolution.MONTH))
+        groups = dict(_group_dates(dates, FilePeriod.MONTH))
         assert (2020, 1) in groups
         assert (2020, 2) in groups
         assert (2020, 3) in groups
@@ -136,12 +136,12 @@ class TestGroupDates:
 
     def test_year_group_key_is_integer(self):
         dates = pd.date_range("2021-06-01", "2021-06-30", freq="D")
-        groups = dict(_group_dates(dates, TimeResolution.YEAR))
+        groups = dict(_group_dates(dates, FilePeriod.YEAR))
         assert isinstance(list(groups.keys())[0], int)
 
     def test_month_group_key_is_tuple(self):
         dates = pd.date_range("2021-06-01", "2021-06-30", freq="D")
-        groups = dict(_group_dates(dates, TimeResolution.MONTH))
+        groups = dict(_group_dates(dates, FilePeriod.MONTH))
         assert isinstance(list(groups.keys())[0], tuple)
 
 

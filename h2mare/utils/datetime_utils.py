@@ -13,10 +13,40 @@ from h2mare.types import to_datetime as to_datetime
 if TYPE_CHECKING:
     from h2mare.types import DateLike
 
+_LAST_INSTANT_OF_DAY = pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+
 
 def normalize_date(date: DateLike) -> pd.Timestamp:
-    """Normalize a single date to a Timestamp at midnight."""
-    return pd.Timestamp(date).normalize()
+    """
+    Normalize a single date to a Timestamp at midnight.
+
+    Raises:
+        ValueError: If *date* is None, NaT, or anything else pandas reads as
+            missing. ``pd.Timestamp`` returns NaT for those, and NaT has no
+            ``.normalize()`` — so this used to surface as ``AttributeError:
+            'NaTType' object has no attribute 'normalize'``, which names
+            neither the argument nor the caller's mistake.
+    """
+    ts = pd.Timestamp(date)
+    if ts is pd.NaT:
+        raise ValueError(f"Not a usable date: {date!r}")
+    return cast(pd.Timestamp, ts).normalize()
+
+
+def end_of_day(date: DateLike) -> pd.Timestamp:
+    """
+    Last representable instant of *date*'s calendar day.
+
+    One nanosecond short of the next midnight — pandas' datetime64[ns]
+    resolution, so nothing can fall between this and the following day.
+
+    Turns a date-level upper bound into one that covers the whole day. Every
+    date the pipeline passes around is a midnight-stamped ``Timestamp``, which
+    on a sub-daily axis names that day's *first* step: used verbatim as an
+    inclusive end bound it keeps one step of the final day and drops the other
+    23, whether the bound is slicing a store or being sent to a provider.
+    """
+    return normalize_date(date) + _LAST_INSTANT_OF_DAY
 
 
 def normalize_dates(dates: DateLike | Sequence[DateLike]) -> list[pd.Timestamp]:
@@ -27,8 +57,11 @@ def normalize_dates(dates: DateLike | Sequence[DateLike]) -> list[pd.Timestamp]:
     re-check what came back (the old scalar-or-list return forced isinstance
     guards at every such call site).
     """
+    # Each element goes through normalize_date rather than being normalized
+    # inline, so one unusable entry in a list is reported the same way as a
+    # lone one instead of raising AttributeError on NaT.
     if isinstance(dates, (list, tuple)):
-        return [pd.Timestamp(d).normalize() for d in dates]
+        return [normalize_date(d) for d in dates]
     return [normalize_date(cast("DateLike", dates))]
 
 

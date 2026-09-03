@@ -18,6 +18,13 @@ dist/
 # MkDocs build output
 site/
 
+# Test / lint artifacts. .pytest_cache and .ruff_cache each write their own
+# internal .gitignore, so they are already excluded; .coverage is not, and was
+# committed as a 53 KB binary until now.
+.coverage
+.coverage.*
+htmlcov/
+
 # Knowledge-graph output (generated, rebuildable)
 graphify-out/
 

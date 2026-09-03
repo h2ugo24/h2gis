@@ -11,9 +11,27 @@ from loguru import logger
 from h2mare import SYSTEM_VAR_KEYS, AppConfig, get_settings
 from h2mare.format_converters.netcdf2zarr import Netcdf2Zarr
 from h2mare.utils.files_io import prune_empty_dirs
+from h2mare.utils.paths import store_root_for
 
 
 class PipelineManager:
+    """
+    Orchestrates Download → Convert → Compile → Parquet for a set of variables.
+
+    One instance runs the whole pipeline. Per-variable behaviour is not branched
+    on here — it is selected through the registries (``DOWNLOADER_REGISTRY`` by
+    source, ``processing.registry`` and ``compiler_registry`` by var_key), so
+    adding a variable means registering it, not editing this class.
+
+    Failures are contained per variable: a download or convert that raises is
+    logged with its traceback, marks the run failed, and the next variable
+    proceeds. :meth:`run` returns False if anything failed, which the CLI turns
+    into a non-zero exit.
+
+    The compile and parquet steps run once at the end, over all variables, and
+    are skipped when the corresponding ``no_*`` flag is set or under ``dry_run``.
+    """
+
     def __init__(
         self,
         app_config: AppConfig,
@@ -44,6 +62,22 @@ class PipelineManager:
         self.h2ds_parquet_backup = h2ds_parquet_backup
         self.zarr_backup_dir = zarr_backup_dir
         self.parquet_backup_dir = parquet_backup_dir
+
+    def _store_dir(self, var_config) -> Path:
+        """
+        This variable's own directory under the root that applies to it.
+
+        ``store_root`` is a *root* holding one folder per variable, the shape
+        ``STORE_ROOT`` has in ``.env``. The ``store_root`` argument taken by
+        downloaders and converters means the opposite — one store's exact
+        directory — so the two are not interchangeable, and handing the root
+        straight to a downloader pointed every variable at the same place.
+
+        The manager's own root is the *default*, not the answer: a variable may
+        name its own root in config.yaml. Variables that name none resolve to
+        ``self.store_root`` exactly as before.
+        """
+        return store_root_for(var_config, self.store_root) / var_config.local_folder
 
     def run(self, variables: Optional[List[str]] = None) -> bool:
         """Run the full pipeline. Returns True if all steps succeeded, False if any failed."""
@@ -93,7 +127,7 @@ class PipelineManager:
                 downloader = DownloaderClass(
                     var_key=var_key,
                     app_config=self.app_config,
-                    store_root=self.store_root,
+                    store_root=self._store_dir(var_config),
                 )
 
                 try:
@@ -108,12 +142,21 @@ class PipelineManager:
                     )
                     _failed = True
                     continue
+                finally:
+                    # One downloader per variable, so its connection dies with
+                    # the iteration. Must be a finally: every branch below can
+                    # `continue`. No-op for the HTTP sources.
+                    downloader.close()
 
                 if self.no_convert or self.dry_run or not downloaded:
                     continue
 
                 try:
-                    Netcdf2Zarr(var_key).run()
+                    Netcdf2Zarr(
+                        var_key,
+                        app_config=self.app_config,
+                        store_root=self._store_dir(var_config),
+                    ).run()
                 except Exception as e:
                     logger.opt(exception=True).error(
                         f"Processing failed for '{var_key}': {e}"
@@ -143,12 +186,11 @@ class PipelineManager:
             from h2mare.format_converters.zarr2parquet import Zarr2Parquet
 
             try:
-                h2ds_local_folder = self.app_config.variables["h2ds"].local_folder
                 with logger.contextualize(var="h2ds"):
                     converter = Zarr2Parquet(
                         var_key="h2ds",
                         parquet_root=get_settings().PARQUET_DIR,
-                        store_root=self.store_root / h2ds_local_folder,
+                        store_root=self._store_dir(self.app_config.variables["h2ds"]),
                     )
                     converter.run(
                         start_date=self.start_date,

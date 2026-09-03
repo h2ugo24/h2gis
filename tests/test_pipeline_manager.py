@@ -98,6 +98,71 @@ class TestDownloadFailureIsolation:
         assert MockConverter.return_value.run.call_count == 2
 
 
+class TestStoreRootReachesEveryStep:
+    """
+    The manager's store_root is a *root* holding one folder per variable, the
+    shape STORE_ROOT has in .env. Regression: it was handed to the downloader
+    unchanged — pointing every variable at the root itself — and not handed to
+    Netcdf2Zarr at all, so `--store-path` relocated the download and Parquet
+    steps while convert stayed on the configured root.
+    """
+
+    def test_downloader_gets_the_variable_subfolder_not_the_bare_root(self, tmp_path):
+        cfg = _make_config("sst", "chl")
+        manager, downloader_cls = _make_manager(cfg, tmp_path)
+
+        with patch("h2mare.pipeline_manager.Netcdf2Zarr"):
+            manager.run()
+
+        roots = {
+            c.kwargs["var_key"]: c.kwargs["store_root"]
+            for c in downloader_cls.call_args_list
+        }
+        assert roots == {"sst": tmp_path / "sst", "chl": tmp_path / "chl"}
+
+    def test_a_variable_with_its_own_root_lands_there_instead(self, tmp_path):
+        """
+        The manager's root is the default, not the answer: a variable naming a
+        store_root of its own is fetched and converted onto that drive, while
+        its neighbours stay under the manager's root.
+        """
+        elsewhere = tmp_path / "other_drive"
+        variables = {
+            "sst": {**_ENTRY, "local_folder": "sst"},
+            "chl": {**_ENTRY, "local_folder": "chl", "store_root": str(elsewhere)},
+        }
+        cfg = msgspec.convert({"variables": variables, "secrets": {}}, AppConfig)
+        manager, downloader_cls = _make_manager(cfg, tmp_path)
+
+        with patch("h2mare.pipeline_manager.Netcdf2Zarr") as MockConverter:
+            manager.run()
+
+        roots = {
+            c.kwargs["var_key"]: c.kwargs["store_root"]
+            for c in downloader_cls.call_args_list
+        }
+        assert roots == {"sst": tmp_path / "sst", "chl": elsewhere / "chl"}
+
+        # Netcdf2Zarr takes var_key positionally.
+        convert_roots = {
+            c.args[0]: c.kwargs["store_root"] for c in MockConverter.call_args_list
+        }
+        assert convert_roots == {"sst": tmp_path / "sst", "chl": elsewhere / "chl"}
+
+    def test_converter_is_given_the_same_root_as_the_downloader(self, tmp_path):
+        cfg = _make_config("sst")
+        manager, downloader_cls = _make_manager(cfg, tmp_path)
+
+        with patch("h2mare.pipeline_manager.Netcdf2Zarr") as MockConverter:
+            manager.run()
+
+        assert MockConverter.call_args.kwargs["store_root"] == tmp_path / "sst"
+        assert (
+            MockConverter.call_args.kwargs["store_root"]
+            == downloader_cls.call_args.kwargs["store_root"]
+        )
+
+
 # ---------------------------------------------------------------------------
 # dry_run flag
 # ---------------------------------------------------------------------------
@@ -314,3 +379,41 @@ class TestCleanup:
 
         d._cleanup_empty_download_dir()
         assert not empty_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Downloader connections are released per variable
+#
+# AVISO holds one FTP control connection for the whole run. Every branch after
+# run() can `continue`, so the close has to sit in a finally or the connection
+# leaks for the rest of the process (ResourceWarning: unclosed socket).
+# ---------------------------------------------------------------------------
+
+
+class TestDownloaderIsClosed:
+    def test_closed_after_a_successful_download(self, tmp_path):
+        cfg = _make_config("sst")
+        manager, cls = _make_manager(cfg, tmp_path, no_convert=True)
+        cls.return_value.run.return_value = True
+
+        manager.run()
+
+        cls.return_value.close.assert_called_once()
+
+    def test_closed_when_the_download_raises(self, tmp_path):
+        cfg = _make_config("sst")
+        manager, cls = _make_manager(cfg, tmp_path, no_convert=True)
+        cls.return_value.run.side_effect = RuntimeError("ftp exploded")
+
+        manager.run()
+
+        cls.return_value.close.assert_called_once()
+
+    def test_closed_once_per_variable(self, tmp_path):
+        cfg = _make_config("sst", "chl", "mld")
+        manager, cls = _make_manager(cfg, tmp_path, no_convert=True)
+        cls.return_value.run.return_value = True
+
+        manager.run()
+
+        assert cls.return_value.close.call_count == 3

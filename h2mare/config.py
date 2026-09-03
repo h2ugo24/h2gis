@@ -14,7 +14,7 @@ import yaml
 from dotenv import load_dotenv
 from loguru import logger
 
-from h2mare.models import AppConfig
+from h2mare.models import AppConfig, KeyVarConfigEntry
 
 
 class Settings:
@@ -49,17 +49,21 @@ class Settings:
 
         # External Storage (where all data lives)
         self.STORE_ROOT = self._get_store_dir()
+        # Whether STORE_ROOT was set by --store-path rather than read from .env.
+        # A variable may name its own root in config.yaml, and that root beats
+        # the configured STORE_ROOT — but not an operator who explicitly asked
+        # this run to go somewhere else. See utils.paths.store_root_for.
+        self._store_root_overridden = False
 
-        # Only create directories when running inside an h2mare project (config.yaml found).
-        # When h2mare is used as a library dependency, skip directory creation so we don't
-        # pollute the consuming project with data/ and logs/ folders.
-        if self._project_mode:
-            self.ensure_directories()
+        # No directories are created here: Settings() runs on any import, and
+        # BASE_DIR may be a directory that merely contains a config.yaml. Writers
+        # mkdir their own parents.
 
         # Application config (lazy loaded)
         self._app_config: Optional[AppConfig] = None
         self._global_attrs = None
         self._variable_attrs = None
+        self._native_attr_overrides = None
 
     def _find_project_root(self) -> tuple[Path, bool]:
         """Find the h2mare project root and whether we are in project mode.
@@ -98,6 +102,42 @@ class Settings:
             return Path(store_dir).resolve()
         return None
 
+    def override_store_root(self, store_root: Path) -> None:
+        """
+        Point ``STORE_ROOT`` somewhere else for the rest of this process.
+
+        Backs the ``--store-path`` flag. Every store location in h2mare is
+        resolved from this one value through ``resolve_store_path``, including
+        places nothing threads an argument to — the per-variable catalogs the
+        compiler opens, ``cds.get_previous_dates_da``, the eddies processor. So
+        the override is applied at the source rather than passed down: a flag
+        handed step by step reaches only the steps someone remembered to change,
+        which is exactly how ``--store-path`` came to relocate the download and
+        Parquet steps while convert and compile stayed on the configured root.
+
+        Call once, from a CLI entry point, before any work begins. The value is
+        a *root* holding one subdirectory per variable (``local_folder``), the
+        same shape ``STORE_ROOT`` has in ``.env`` — not a single store's path.
+
+        It also outranks a per-variable ``store_root`` from ``config.yaml``:
+        relocating a run is something an operator asks for deliberately, and a
+        flag that moved only the variables which had not opted out would be a
+        partial relocation nobody could reason about. That is why the override
+        is recorded as such rather than just written into ``STORE_ROOT`` — the
+        resolver has to tell "the configured root" apart from "the root this
+        run was told to use".
+        """
+        resolved = Path(store_root).resolve()
+        if self.STORE_ROOT != resolved:
+            logger.info(f"Store root overridden: {resolved}")
+        self.STORE_ROOT = resolved
+        self._store_root_overridden = True
+
+    @property
+    def store_root_overridden(self) -> bool:
+        """True when ``STORE_ROOT`` came from ``--store-path``, not from ``.env``."""
+        return self._store_root_overridden
+
     @property
     def CLIMATOLOGY_DIR(self) -> Path | None:
         if self.STORE_ROOT is None:
@@ -105,7 +145,7 @@ class Settings:
         return self.STORE_ROOT / "Climatology"
 
     def ensure_directories(self):
-        """Create necessary directories on first run."""
+        """Scaffold the project directory tree under BASE_DIR. Opt-in, not automatic."""
         dirs = [
             self.DOWNLOADS_DIR,
             self.INTERIM_DIR,
@@ -145,7 +185,12 @@ class Settings:
             config_dict = yaml.safe_load(f) or {}
 
         # Warn on unrecognised top-level keys — catches typos like "varibles:"
-        _KNOWN_KEYS = {"variables", "global_attrs", "variable_attrs"}
+        _KNOWN_KEYS = {
+            "variables",
+            "global_attrs",
+            "variable_attrs",
+            "native_attr_overrides",
+        }
         unknown = set(config_dict) - _KNOWN_KEYS
         if unknown:
             logger.warning(
@@ -154,9 +199,28 @@ class Settings:
                 f"Expected keys: {sorted(_KNOWN_KEYS)}."
             )
 
+        # Warn on unrecognised per-variable keys — catches "store_roots:" or
+        # "local_foldr:". msgspec structs here do not set forbid_unknown_fields,
+        # so an unknown key is dropped in silence and the variable keeps the
+        # default the author meant to override. Warn rather than raise: the
+        # top-level check above warns too, and a config that has been loading
+        # for months should not start failing over a key that was already
+        # being ignored.
+        _VAR_FIELDS = set(KeyVarConfigEntry.__struct_fields__)
+        for var_key, entry in (config_dict.get("variables") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            unknown_fields = set(entry) - _VAR_FIELDS
+            if unknown_fields:
+                logger.warning(
+                    f"config.yaml variable '{var_key}' has unrecognised key(s): "
+                    f"{sorted(unknown_fields)} — these will be ignored."
+                )
+
         # Extract global and variable metadata (not part of AppConfig)
         self._global_attrs = config_dict.get("global_attrs", {})
         self._variable_attrs = config_dict.get("variable_attrs", {})
+        self._native_attr_overrides = config_dict.get("native_attr_overrides", {})
 
         # Add secrets from environment
         secrets_dict = {
@@ -225,6 +289,19 @@ class Settings:
         if self._variable_attrs is None:
             self.load_app_config()
         return self._variable_attrs or {}
+
+    @property
+    def native_attr_overrides(self) -> dict:
+        """
+        Per-var_key attribute deltas for the native stores, ``{var_key: {var: attrs}}``.
+
+        Empty for most variables: a native store usually publishes exactly what
+        h2ds does. It is the hourly CDS stores that differ, holding ERA5's own
+        units and cadence while h2ds holds the converted daily reduction.
+        """
+        if self._native_attr_overrides is None:
+            self.load_app_config()
+        return self._native_attr_overrides or {}
 
     @property
     def app_config(self) -> AppConfig:

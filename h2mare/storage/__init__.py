@@ -10,11 +10,11 @@ from .parquet_indexer import ParquetIndexer
 from .parquet_store import ParquetStore, iter_store_parquet_files
 from .recovery import recover_parquet_store, recover_zarr_store
 from .storage import write_append_zarr
+from .var_routing import catalog_for_var, compiled_var_key, coverage_for_var
 from .xarray_helpers import (
     chunk_dataset,
     convert360_180,
     ds_float64_to_float32,
-    have_vars_unique_values,
     rename_dims,
     unified_time_chunk,
     xr_float64_to_float32,
@@ -32,6 +32,9 @@ __all__ = [
     "ParquetIndexer",
     "ParquetStore",
     "ParquetCatalog",
+    "catalog_for_var",
+    "compiled_var_key",
+    "coverage_for_var",
     "get_store_coverage",
     "split_time_range",
     "aggregate_by_space_time",
@@ -39,7 +42,6 @@ __all__ = [
     "aggregate_by_time_stats",
     "polars_float64_to_float32",
     "chunk_dataset",
-    "have_vars_unique_values",
     "rename_dims",
     "unified_time_chunk",
     "xr_float64_to_float32",

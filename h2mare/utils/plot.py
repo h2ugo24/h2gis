@@ -17,13 +17,13 @@ import pandas as pd
 import plotly.express as px
 import polars as pl
 import xarray as xr
-from IPython.display import clear_output, display
 from loguru import logger
 
 from h2mare.config import get_settings
+from h2mare.storage.var_routing import catalog_for_var
 from h2mare.storage.zarr_catalog import ZarrCatalog
-from h2mare.types import BBox
-from h2mare.validators import validate_columns
+from h2mare.types import BBox, ReadFrom
+from h2mare.validators import validate_columns, validate_var_key
 
 _PANEL_WIDTH = 3.0  # inches per panel column
 _WSPACE = -0.15  # fractional horizontal gap between panels
@@ -337,7 +337,16 @@ def animate_vars(
         dim: Dimension to animate over. Defaults to 'time'.
         time_idx: Time index used as the fixed time step when dim='depth'. Defaults to 0.
         depth_idx: Depth index used as the fixed depth level when dim='time'. Defaults to 0.
+
+    Note:
+        Renders through ``IPython.display``, so it only animates inside a
+        notebook. The import is function-local: this is the only thing in the
+        package that needs IPython, and at module scope it made a heavyweight
+        notebook-only dependency a hard requirement of importing any plotting
+        helper.
     """
+    from IPython.display import clear_output, display
+
     if isinstance(data, xr.Dataset):
         if var_name is None:
             raise ValueError("var_name must be provided when input is a Dataset")
@@ -542,6 +551,65 @@ def plot_interactive_map(
     fig.show()
 
 
+def _default_var_for(var_key: str) -> str:
+    """The variable to plot when the caller names none.
+
+    ``compiled_vars[0]`` by config convention: the first name the var_key
+    publishes, and one :func:`catalog_for_var` can route. A var_key publishing
+    nothing (the compiled store itself) has no such list, so its own store
+    answers instead.
+    """
+    app_config = get_settings().app_config
+    var_key = validate_var_key(var_key, app_config)
+    declared = list(getattr(app_config.variables[var_key], "compiled_vars", None) or [])
+    if declared:
+        return declared[0]
+
+    stored = sorted(ZarrCatalog(var_key).get_variables())
+    if not stored:
+        raise ValueError(
+            f"'{var_key}' declares no compiled_vars and its store holds nothing, "
+            f"so there is no variable to default to — pass var explicitly."
+        )
+    return stored[0]
+
+
+def field_for_plot(ds: xr.Dataset, var: str) -> tuple[xr.DataArray, str]:
+    """One 2-D field for *var*, plus a note on how its time axis was collapsed.
+
+    ``open_dataset(dates=...)`` selects by calendar day, so an hourly store
+    returns all 24 steps for a date and the array reaching ``.plot()`` is 3-D.
+    They are averaged into the day's field here rather than left to raise, and
+    the note says so — silently plotting one arbitrary hour, or averaging
+    without saying it, is how a diagnostic starts lying about what it shows.
+
+    Args:
+        ds: Dataset for a single date.
+        var: Data variable to draw.
+
+    Returns:
+        ``(field, note)``. *note* is empty when nothing was collapsed.
+
+    Raises:
+        KeyError: if *var* is absent from *ds* — reachable even after routing,
+            since a store's early files can predate a variable added later.
+    """
+    if var not in ds.data_vars:
+        raise KeyError(
+            f"'{var}' is not in this file: it holds {sorted(map(str, ds.data_vars))}. "
+            f"The store as a whole lists it, so it was likely added to the store "
+            f"after the file covering this date was written."
+        )
+
+    da = ds[var]
+    if "time" in da.dims and da.sizes["time"] > 1:
+        n = da.sizes["time"]
+        return da.mean("time", keep_attrs=True), f"{var}: mean of {n} steps"
+    if "time" in da.dims:
+        da = da.isel(time=0)
+    return da, ""
+
+
 def plot_records_on_field(
     data: pd.DataFrame | gpd.GeoDataFrame,
     var_key: str,
@@ -552,6 +620,7 @@ def plot_records_on_field(
     offset: float = 1.0,
     max_plots: int = 12,
     title_fn: Callable[[pd.Series], str] | None = None,
+    read_from: ReadFrom = "auto",
 ) -> None:
     """Plot the variable field around each record, with the location overlaid.
 
@@ -568,21 +637,29 @@ def plot_records_on_field(
     Args:
         data: Records to plot. If a GeoDataFrame, its active geometry is used (and
             reprojected to WGS84); otherwise ``lon_col``/``lat_col`` are used.
-        var_key: Variable key storage (passed to ``ZarrCatalog``).
-        var: Data variable name within the dataset. Defaults to the first data variable
-            in the ``var_key`` store (names need not match the key).
+        var_key: Variable key the variable belongs to.
+        var: Data variable name. Defaults to the first name ``var_key`` publishes.
+            Need not live in ``var_key``'s own store — see ``read_from``.
         time_col: Name of the date column.
         lon_col, lat_col: Coordinate columns, used only when ``data`` has no geometry.
         offset: Half-width (in degrees) of the bbox drawn around each location.
         max_plots: Maximum number of records to plot.
         title_fn: Optional callable mapping a row to a plot title. Defaults to the date.
+        read_from: Which store to read ``var`` from. ``"auto"`` routes to whichever
+            one holds the name (see :func:`~h2mare.storage.var_routing.catalog_for_var`),
+            so a daily h2ds column of an hourly var_key plots the daily field that
+            extraction returned. ``"native"`` pins the var_key's own store, which
+            is how you look at the raw hourly field behind such a column.
     """
-    cat = ZarrCatalog(var_key)
+    if var is None:
+        var = _default_var_for(var_key)
+        logger.info(f"var not set; plotting '{var}' for '{var_key}'.")
+
+    cat = catalog_for_var(var, var_key, read_from=read_from)
     is_geo = isinstance(data, gpd.GeoDataFrame)
     if is_geo:
         data = _to_wgs84(data)
 
-    announced = False
     for _, row in data.head(max_plots).iterrows():
         date = row[time_col]
 
@@ -593,25 +670,24 @@ def plot_records_on_field(
             miny = maxy = row[lat_col]
         bbox = (minx - offset, miny - offset, maxx + offset, maxy + offset)
 
-        ds = cat.open_dataset(dates=date, bbox=bbox, variables=var)  # type: ignore[arg-type]
-        if ds is None:
-            logger.warning(f"No data for record at {date}; skipping.")
+        try:
+            ds = cat.open_dataset(dates=date, bbox=bbox, variables=var)  # type: ignore[arg-type]
+        except FileNotFoundError:
+            # open_dataset raises for a date the store has no file for; it never
+            # returns None, so the check that used to stand here was unreachable
+            # and the first uncovered record ended the loop instead of being
+            # skipped. Not re-raised with the original message: it lists every
+            # date the file does hold, which is a year of them.
+            logger.warning(
+                f"[{cat.var_key}] no data for {pd.to_datetime(date).date()}; "  # type: ignore[arg-type]
+                f"skipping this record."
+            )
             continue
 
-        # Resolve the data variable; when unset, fall back to the first one and tell the
-        # user the full list (logged once) so they can pick a specific var and re-run.
-        field = var
-        if field is None:
-            field = next(iter(ds.data_vars))
-            if not announced:
-                logger.info(
-                    f"var not set; plotting '{field}'. Available vars for '{var_key}': "
-                    f"{list(ds.data_vars)}"
-                )
-                announced = True
+        field, note = field_for_plot(ds, var)
 
         fig, ax = plt.subplots()
-        ds[field].plot(ax=ax)  # type: ignore
+        field.plot(ax=ax)  # type: ignore
         if is_geo:
             gpd.GeoSeries([row.geometry], crs=data.crs).plot(
                 ax=ax, color="red", markersize=10, zorder=5
@@ -620,6 +696,6 @@ def plot_records_on_field(
             ax.scatter(row[lon_col], row[lat_col], color="red", s=10, zorder=5)
 
         title = title_fn(row) if title_fn else str(pd.to_datetime(date).date())  # type: ignore
-        ax.set_title(title)
+        ax.set_title(f"{title}\n{note}" if note else title)
         plt.show()
         plt.close(fig)

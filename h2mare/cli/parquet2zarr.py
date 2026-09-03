@@ -54,8 +54,11 @@ def parquet2zarr(
         "-v",
         help="Variable column(s) to read (repeat for multiple). Defaults to all.",
     ),
-    time_resolution: str = typer.Option(
+    file_period: str = typer.Option(
         "month",
+        "--file-period",
+        # Kept so existing scripts and cron entries keep working; --file-period
+        # is the name shown in help.
         "--time-resolution",
         help="Read/append chunk granularity: 'year' or 'month'. Default 'month'.",
     ),
@@ -108,7 +111,7 @@ def parquet2zarr(
             name=name,
             start_date=start_date,
             end_date=end_date,
-            time_resolution=time_resolution,
+            file_period=file_period,
             date_format=date_format,  # type: ignore[arg-type]
             variables=list(var_keys) if var_keys else None,
             layout=layout,  # type: ignore[arg-type]

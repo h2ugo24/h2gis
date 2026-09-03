@@ -4,9 +4,9 @@ import msgspec
 import pytest
 
 from h2mare.models import AppConfig
-from h2mare.types import TimeResolution
+from h2mare.types import FilePeriod
 from h2mare.validators import (
-    validate_time_resolution,
+    validate_file_period,
     validate_var_key,
     validate_var_keys,
 )
@@ -43,23 +43,23 @@ class TestValidateVarKeys:
         validate_var_keys([], _CONFIG)
 
 
-class TestValidateTimeResolution:
+class TestValidateFilePeriod:
     def test_enum_passthrough(self):
-        assert validate_time_resolution(TimeResolution.MONTH) is TimeResolution.MONTH
+        assert validate_file_period(FilePeriod.MONTH) is FilePeriod.MONTH
 
     def test_string_month(self):
-        assert validate_time_resolution("month") == TimeResolution.MONTH
+        assert validate_file_period("month") == FilePeriod.MONTH
 
     def test_string_year(self):
-        assert validate_time_resolution("year") == TimeResolution.YEAR
+        assert validate_file_period("year") == FilePeriod.YEAR
 
     def test_string_case_insensitive(self):
-        assert validate_time_resolution("MONTH") == TimeResolution.MONTH
+        assert validate_file_period("MONTH") == FilePeriod.MONTH
 
     def test_invalid_string_raises(self):
         with pytest.raises(ValueError, match="Invalid period"):
-            validate_time_resolution("daily")
+            validate_file_period("daily")
 
     def test_non_string_non_enum_raises(self):
         with pytest.raises(ValueError, match="Period must be"):
-            validate_time_resolution(42)  # type: ignore[arg-type]
+            validate_file_period(42)  # type: ignore[arg-type]

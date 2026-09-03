@@ -52,7 +52,11 @@ H2MARE requires two configuration files in your working directory before first u
 
 ### 1. `config.yaml`
 
-Defines variables, dataset IDs, bounding boxes, and processing parameters. Copy the [template from the repository](https://github.com/h2ugoparra/h2mare/blob/main/config.yaml) as a starting point and edit it to match your needs.
+Defines variables, dataset IDs, bounding boxes, and processing parameters.
+
+Start from [`config.example.yaml`](https://github.com/h2ugoparra/h2mare/blob/main/config.example.yaml) — copy it to `config.yaml` and edit. It holds four entries chosen to cover the shapes you are likely to need: a plain 2-D daily variable, a 3-D one with depth levels, an hourly packed ERA5 one, and the `h2ds` entry the compile step writes to.
+
+The repository's own [`config.yaml`](https://github.com/h2ugoparra/h2mare/blob/main/config.yaml) configures 16 variables and is a **reference**, not a starting point — useful for seeing how a particular source is wired up, too heavy to copy wholesale. Every field is documented in the [configuration reference](https://h2ugoparra.github.io/h2mare/configuration/).
 
 ### 2. `.env`
 
@@ -65,6 +69,8 @@ AVISO_USERNAME=your_username
 AVISO_PASSWORD=your_password
 AVISO_FTP_SERVER=ftp-access.aviso.altimetry.fr
 ```
+
+> **AVISO credentials cross the network in cleartext.** The AVISO server offers plain FTP only — it refuses `AUTH TLS` ("500 AUTH not understood", checked 2026-09-01) — so there is no FTPS option to enable. Use a password unique to AVISO, and prefer running downloads from a trusted network.
 
 CMEMS credentials are configured via the `copernicusmarine` client. ERA5 / CDS credentials are configured via the `cdsapi` client. See the [CDS documentation](https://cds.climate.copernicus.eu/how-to-api) for setup.
 
@@ -90,7 +96,15 @@ uv run h2mare run -v sst --dry-run
 
 # Process all configured variables
 uv run h2mare run
+
+# Check the stores for days that went missing without failing anything
+uv run h2mare audit --all
 ```
+
+Coverage elsewhere in the pipeline is a frontier — a start date and an end date — so a year holding
+January 1st and December 31st reports itself complete however much is missing in between. `audit`
+reads the time axes and reports the holes. See [the CLI docs](https://h2ugoparra.github.io/h2mare/cli/)
+for the value check and for `known_gaps`, which excludes days the provider never published.
 
 ## Development
 

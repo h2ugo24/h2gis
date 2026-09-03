@@ -16,9 +16,6 @@ resolution-markers = [
     "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
-[manifest]
-constraints = [{ name = "sparse", specifier = "==0.14.0" }]
-
 [[package]]
 name = "affine"
 version = "2.4.0"
@@ -197,6 +194,23 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/25/ee/6caf7a40c36a1220410afe15a1cc64993a1f864871f698c0f93acb72842a/certifi-2026.4.22.tar.gz", hash = "sha256:8d455352a37b71bf76a79caa83a3d6c25afee4a385d632127b6afb3963f1c580", size = 137077, upload-time = "2026-04-22T11:26:11.191Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/22/30/7cd8fdcdfbc5b869528b079bfb76dcdf6056b1a2097a662e5e8c04f42965/certifi-2026.4.22-py3-none-any.whl", hash = "sha256:3cb2210c8f88ba2318d29b0388d1023c8492ff72ecdde4ebdaddbb13a31b1c4a", size = 135707, upload-time = "2026-04-22T11:26:09.372Z" },
+]
+
+[[package]]
+name = "cf-units"
+version = "3.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cftime" },
+    { name = "jinja2" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/22/30/27509046e69457605e6eefa4ad7866fcdb6182b1a4f9b9d8404a28e3eb50/cf_units-3.3.1.tar.gz", hash = "sha256:84339f582994ae32ca5c472075c1e603a89f6c6f5a96cc1031bb5da700a14f3a", size = 311647, upload-time = "2026-01-16T15:09:38.423Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2f/1d/b3147f81febf89ea14697f48cc75474fb0cd35b113f554a0805677654caa/cf_units-3.3.1-cp311-abi3-macosx_15_0_arm64.whl", hash = "sha256:6f35616ab44607294920d712eb5edb3ce1c123e56e7cf1b3686fceb300cd2ef6", size = 455275, upload-time = "2026-01-16T15:09:31.165Z" },
+    { url = "https://files.pythonhosted.org/packages/79/3a/03d6c413213d09dbc2fc6baca28595200130e669afbe616d34756bc8b7b7/cf_units-3.3.1-cp311-abi3-macosx_15_0_x86_64.whl", hash = "sha256:fd893c45df1a1ac327d67884d0442edbf4cd5eb74198846dfacbbb7662fa7d2b", size = 456231, upload-time = "2026-01-16T15:09:32.858Z" },
+    { url = "https://files.pythonhosted.org/packages/89/f5/3cc05872868800d66ad1b54659449839276c447650088d500b69049a6edf/cf_units-3.3.1-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:e10abcd4e3e8cb628bc315835cf3efec8a19d31b31bfcdfb820ce32daa0adf79", size = 737286, upload-time = "2026-01-16T15:09:34.489Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/85/80742e4607f2dcd55abbe63b7a251fea4322806d3263150572606537ff97/cf_units-3.3.1-cp311-abi3-win_amd64.whl", hash = "sha256:566b3de7de87967e5fcec8f06adec60bb814705ba8d61fe440a17c0ead7fec14", size = 537479, upload-time = "2026-01-16T15:09:36.857Z" },
 ]
 
 [[package]]
@@ -565,7 +579,7 @@ wheels = [
 
 [[package]]
 name = "copernicusmarine"
-version = "2.4.0"
+version = "2.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "arcosparse" },
@@ -582,9 +596,9 @@ dependencies = [
     { name = "xarray" },
     { name = "zarr" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/36/1a/3e9d2905a6a396c9da09dc95fab0bf0ce9382732940ad1a75efdba95200b/copernicusmarine-2.4.0.tar.gz", hash = "sha256:4de79f7402f482784fbc498ad05e82af284c7aa48c070a04184e52e5c21e0383", size = 98589, upload-time = "2026-04-20T13:28:39.052Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8d/1d/af62923754b8bad9ab114321b62a46d3e870edf4122c4f91708574ef87ec/copernicusmarine-2.4.1.tar.gz", hash = "sha256:3e9bc466de65abdfa38fb48dae107cec5b58f9dc7f84bab563f94ad379d632e8", size = 98662, upload-time = "2026-05-11T08:37:13.362Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/32/0a/7f36e5016563489c55a7a035a5c9c1c54c9e1ac381a6b533f1da1b473c7b/copernicusmarine-2.4.0-py3-none-any.whl", hash = "sha256:1b4f5f3257917b03dbfd001496d855b059cec041c49112453d45fd0e49754921", size = 130499, upload-time = "2026-04-20T13:28:37.614Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/7d/fae36b221be3b491bb46ff59817e452dd3f3d842aefef399d77253ff8259/copernicusmarine-2.4.1-py3-none-any.whl", hash = "sha256:e13fb4a50e469aca4063a0de5d984af9c3da4a7343c605021b86e247613079a5", size = 130541, upload-time = "2026-05-11T08:37:11.55Z" },
 ]
 
 [[package]]
@@ -1075,7 +1089,7 @@ wheels = [
 
 [[package]]
 name = "h2mare"
-version = "0.7.0"
+version = "0.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "cartopy" },
@@ -1091,26 +1105,32 @@ dependencies = [
     { name = "ipython" },
     { name = "loguru" },
     { name = "matplotlib" },
-    { name = "mkdocs" },
-    { name = "mkdocs-material" },
     { name = "msgspec" },
     { name = "netcdf4" },
+    { name = "numpy" },
+    { name = "pandas" },
     { name = "plotly" },
     { name = "polars" },
+    { name = "pyarrow" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
+    { name = "rasterio", version = "1.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "rasterio", version = "1.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "rioxarray", version = "0.19.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "rioxarray", version = "0.22.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "scipy" },
+    { name = "shapely" },
     { name = "statsmodels" },
     { name = "tenacity" },
     { name = "tqdm" },
     { name = "typer" },
     { name = "xarray" },
+    { name = "zarr" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "cf-units" },
     { name = "ipykernel" },
     { name = "nbformat" },
     { name = "pyright" },
@@ -1120,13 +1140,17 @@ dev = [
     { name = "tox" },
     { name = "tox-uv" },
 ]
+docs = [
+    { name = "mkdocs" },
+    { name = "mkdocs-material" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "cartopy", specifier = ">=0.23.0" },
     { name = "cdsapi", specifier = ">=0.7.0" },
     { name = "cfgrib", specifier = ">=0.9.10" },
-    { name = "copernicusmarine", specifier = ">=2.0.0" },
+    { name = "copernicusmarine", specifier = ">=2.4.1" },
     { name = "dask", specifier = ">=2024.1.0" },
     { name = "duckdb", specifier = ">=1.0.0" },
     { name = "eccodes", specifier = ">=1.7.0" },
@@ -1136,25 +1160,30 @@ requires-dist = [
     { name = "ipython", specifier = ">=8.0.0" },
     { name = "loguru", specifier = ">=0.7.0" },
     { name = "matplotlib", specifier = ">=3.8.0" },
-    { name = "mkdocs", specifier = ">=1.6.1" },
-    { name = "mkdocs-material", specifier = ">=9.7.6" },
     { name = "msgspec", specifier = ">=0.18.0" },
     { name = "netcdf4", specifier = ">=1.6.0" },
+    { name = "numpy", specifier = ">=2.0" },
+    { name = "pandas", specifier = ">=2.2" },
     { name = "plotly", specifier = ">=5.24.0" },
     { name = "polars", specifier = ">=1.0.0" },
+    { name = "pyarrow", specifier = ">=16.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "pyyaml", specifier = ">=6.0.0" },
+    { name = "rasterio", specifier = ">=1.3" },
     { name = "rioxarray", specifier = ">=0.17.0" },
     { name = "scipy", specifier = ">=1.13.0" },
+    { name = "shapely", specifier = ">=2.0" },
     { name = "statsmodels", specifier = ">=0.14.6" },
     { name = "tenacity", specifier = ">=8.0.0" },
     { name = "tqdm", specifier = ">=4.66.0" },
     { name = "typer", specifier = ">=0.12.0" },
     { name = "xarray", specifier = ">=2024.1.0" },
+    { name = "zarr", specifier = ">=3.0" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "cf-units", specifier = ">=3.3" },
     { name = "ipykernel", specifier = ">=7.2.0" },
     { name = "nbformat", specifier = ">=5.10.4" },
     { name = "pyright", specifier = ">=1.1.410" },
@@ -1163,6 +1192,10 @@ dev = [
     { name = "ruff", specifier = ">=0.9.0" },
     { name = "tox", specifier = ">=4.30.3" },
     { name = "tox-uv", specifier = ">=1.28.1" },
+]
+docs = [
+    { name = "mkdocs", specifier = ">=1.6.1" },
+    { name = "mkdocs-material", specifier = ">=9.7.6" },
 ]
 
 [[package]]

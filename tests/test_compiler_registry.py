@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -10,6 +11,8 @@ import pandas as pd
 import pytest
 import xarray as xr
 
+from h2mare.models import TimeStep
+from h2mare.processing import compiler_registry
 from h2mare.processing.compiler_registry import (
     COMPILE_PROCESSORS,
     _compile_atm_accum_avg,
@@ -19,6 +22,7 @@ from h2mare.processing.compiler_registry import (
     _compile_sst,
     compile_default,
 )
+from h2mare.processing.core.cds import _EKMAN_WARMUP_DAYS
 from h2mare.types import BBox, DateRange
 
 # ---------------------------------------------------------------------------
@@ -122,6 +126,10 @@ class TestCompileBathy:
         bathy_cfg = MagicMock()
         bathy_cfg.data_file = "bathy.nc"
         bathy_cfg.local_folder = "bathy"
+        # A MagicMock invents any attribute asked of it, so this has to be set
+        # explicitly: without it bathy would appear to declare a store_root of
+        # its own and resolve under a mock instead of remote_store_root.
+        bathy_cfg.store_root = None
         compiler.app_config.variables["bathy"] = bathy_cfg
 
         fake_ds = _daily_ds("elevation", _DATES).isel(time=0).drop_vars("time")
@@ -209,6 +217,23 @@ class TestCompileO2:
             self._make_o2_compiler(tmp_path), self._make_o2_catalog(None), _DR
         )
         assert result is None
+
+    def test_missing_compile_depth_slices_raises_a_config_error(self, tmp_path):
+        """
+        A 3-D variable declaring no depth levels is a config error and must say
+        so. This was an `assert`, which `python -O` strips — with it gone, None
+        reached ds.sel(depth=None) and surfaced as a TypeError somewhere
+        unrelated to the config key that actually needed setting.
+        """
+        compiler = _make_compiler(tmp_path)
+        compiler.app_config.variables["o2"] = MagicMock(compile_depth_slices=None)
+
+        with pytest.raises(ValueError) as excinfo:
+            _compile_depth_var(compiler, self._make_o2_catalog(self._make_o2_ds()), _DR)
+
+        msg = str(excinfo.value)
+        assert "o2" in msg
+        assert "compile_depth_slices" in msg, "the message does not name the config key"
 
     def test_returns_one_variable_per_depth(self, tmp_path):
         result = _compile_depth_var(
@@ -334,6 +359,351 @@ class TestCompileAtmAccumAvg:
         assert result is not None
         assert "precip" in result.data_vars
 
+    def test_daily_store_reads_exactly_the_requested_window(self, tmp_path):
+        """The daily store already holds the features, so no warm-up is needed."""
+        compiler = _make_compiler(tmp_path)
+        catalog = _make_catalog(self._make_atm_ds())
+        _compile_atm_accum_avg(compiler, catalog, _DR)
+
+        kwargs = catalog.open_dataset.call_args.kwargs
+        assert kwargs["start_date"] == _DR.start
+
+
+class TestCompileAtmAccumAvgHourly:
+    """
+    With an hourly store the ekman chain is computed at compile time, so the
+    read has to reach back far enough to start the rolling features warm.
+    """
+
+    @staticmethod
+    def _capture_window(monkeypatch) -> dict:
+        seen: dict = {}
+
+        def _fake_open(catalog, var_key, date_range, bbox, **kwargs):
+            seen["range"] = date_range
+            return None  # short-circuits before any climatology is touched
+
+        monkeypatch.setattr(compiler_registry, "_open_or_warn", _fake_open)
+        return seen
+
+    def test_widens_the_read_by_the_ekman_warmup(self, tmp_path, monkeypatch):
+        seen = self._capture_window(monkeypatch)
+        compiler = _make_compiler(tmp_path)
+
+        result = compiler_registry._atm_accum_from_hourly(
+            compiler, _make_catalog(None), _DR
+        )
+
+        assert result is None
+        assert (_DR.start - seen["range"].start).days == _EKMAN_WARMUP_DAYS, (
+            "hourly compile must reach back far enough to warm ekman_anom_lag14"
+        )
+
+    def test_widening_extends_backwards_only(self, tmp_path, monkeypatch):
+        """The end must not move, or compile would emit days it was not asked for."""
+        seen = self._capture_window(monkeypatch)
+        compiler_registry._atm_accum_from_hourly(
+            _make_compiler(tmp_path), _make_catalog(None), _DR
+        )
+
+        assert seen["range"].end == _DR.end
+
+    def test_hourly_config_dispatches_to_the_hourly_path(self, tmp_path, monkeypatch):
+        called = {}
+
+        def _fake_hourly(compiler, catalog, date_range):
+            called["yes"] = True
+            return None
+
+        monkeypatch.setattr(compiler_registry, "_atm_accum_from_hourly", _fake_hourly)
+        compiler = _make_compiler(tmp_path)
+        compiler.app_config.variables = {
+            "atm-accum-avg": SimpleNamespace(time_step=TimeStep.HOURLY)
+        }
+
+        _compile_atm_accum_avg(compiler, _make_catalog(None), _DR)
+
+        assert called.get("yes"), "time_step: hourly must not read the daily path"
+
+    def test_daily_config_does_not_dispatch_to_the_hourly_path(
+        self, tmp_path, monkeypatch
+    ):
+        def _boom(compiler, catalog, date_range):
+            raise AssertionError("daily store must not take the hourly path")
+
+        monkeypatch.setattr(compiler_registry, "_atm_accum_from_hourly", _boom)
+        compiler = _make_compiler(tmp_path)
+        compiler.app_config.variables = {
+            "atm-accum-avg": SimpleNamespace(time_step=TimeStep.DAILY)
+        }
+
+        _compile_atm_accum_avg(compiler, _make_catalog(None), _DR)
+
+
+# ---------------------------------------------------------------------------
+# _compile_atm_instante
+# ---------------------------------------------------------------------------
+
+
+def _fake_hourly_atm_instante(start: str, end: str) -> xr.Dataset:
+    """Hourly dataset shaped like the atm-instante store, on the base grid."""
+    times = pd.date_range(start, pd.Timestamp(end) + pd.Timedelta(hours=23), freq="h")
+    lat, lon = [30.0, 30.25], [-10.0, -9.75]
+    shape = (len(times), len(lat), len(lon))
+    values = {
+        "u10": np.full(shape, 3.0, dtype="float32"),
+        "v10": np.full(shape, 4.0, dtype="float32"),
+        "tcc": np.full(shape, 0.5, dtype="float32"),
+        "msl": np.full(shape, 101325.0, dtype="float32"),
+    }
+    return xr.Dataset(
+        {k: (["time", "lat", "lon"], v) for k, v in values.items()},
+        coords={"time": times, "lat": lat, "lon": lon},
+    )
+
+
+def _hourly_instante_compiler(tmp_path) -> MagicMock:
+    compiler = _make_compiler(tmp_path)
+    compiler.app_config.variables = {
+        "atm-instante": SimpleNamespace(time_step=TimeStep.HOURLY)
+    }
+    return compiler
+
+
+class TestCompileAtmInstanteHourly:
+    """
+    With an hourly store the daily aggregates are computed at compile time, so
+    h2ds must come out with the same columns and cadence as from a daily store.
+    """
+
+    def test_hourly_config_dispatches_to_the_hourly_path(self, tmp_path, monkeypatch):
+        called = {}
+
+        def _spy(catalog, var_key, bbox, date_range, reduce_slab, warmup_days=0):
+            called["var_key"] = var_key
+            return None
+
+        monkeypatch.setattr(compiler_registry, "_reduce_hourly_in_slabs", _spy)
+
+        compiler_registry._compile_atm_instante(
+            _hourly_instante_compiler(tmp_path), _make_catalog(None), _DR
+        )
+
+        assert called.get("var_key") == "atm-instante"
+
+    def test_daily_config_does_not_dispatch_to_the_hourly_path(
+        self, tmp_path, monkeypatch
+    ):
+        def _boom(*args, **kwargs):
+            raise AssertionError("daily store must not take the hourly path")
+
+        monkeypatch.setattr(compiler_registry, "_reduce_hourly_in_slabs", _boom)
+        compiler = _make_compiler(tmp_path)
+        compiler.app_config.variables = {
+            "atm-instante": SimpleNamespace(time_step=TimeStep.DAILY)
+        }
+
+        compiler_registry._compile_atm_instante(compiler, _make_catalog(None), _DR)
+
+    def test_hourly_store_yields_the_daily_h2ds_columns(self, tmp_path):
+        ds = _fake_hourly_atm_instante("2020-01-01", "2020-01-03")
+        out = compiler_registry._compile_atm_instante(
+            _hourly_instante_compiler(tmp_path), _make_catalog(ds), _DR
+        )
+
+        assert out is not None
+        assert {"wind_mean", "wind_std", "wind_max", "u10", "v10", "tcc", "msl"} <= set(
+            out.data_vars
+        )
+        assert out.sizes["time"] == 3, "h2ds stays daily whatever the store's cadence"
+
+    def test_reduction_matches_the_daily_convert_path(self, tmp_path):
+        """u=3, v=4 → wind speed 5 m/s; msl converted Pa→hPa exactly once."""
+        ds = _fake_hourly_atm_instante("2020-01-01", "2020-01-03")
+        out = compiler_registry._compile_atm_instante(
+            _hourly_instante_compiler(tmp_path), _make_catalog(ds), _DR
+        )
+
+        assert out is not None
+        np.testing.assert_allclose(out["wind_mean"].values, 5.0, rtol=1e-6)
+        np.testing.assert_allclose(out["wind_max"].values, 5.0, rtol=1e-6)
+        np.testing.assert_allclose(out["msl"].values, 1013.25, rtol=1e-6)
+
+    def test_returns_none_when_data_missing(self, tmp_path):
+        result = compiler_registry._compile_atm_instante(
+            _hourly_instante_compiler(tmp_path), _make_catalog(None), _DR
+        )
+        assert result is None
+
+    def test_last_day_keeps_all_of_its_hours(self, tmp_path):
+        """A midnight-stamped slab end would drop the final day's other 23 steps."""
+        ds = _fake_hourly_atm_instante("2020-01-01", "2020-01-03")
+        # Make the last day's wind differ so a truncated read is visible.
+        ds["u10"].loc[{"time": slice("2020-01-03 01:00", None)}] = 30.0
+
+        out = compiler_registry._compile_atm_instante(
+            _hourly_instante_compiler(tmp_path), _make_catalog(ds), _DR
+        )
+
+        assert out is not None
+        last = float(out["wind_mean"].isel(time=-1).mean())
+        assert last > 6.0, "reading only 00:00 of the last day would give 5 m/s"
+
+
+class TestAtmInstanteSlabbing:
+    """The reduction runs slab by slab, with no warm-up to trim."""
+
+    def test_long_range_is_reduced_in_multiple_slabs(self, tmp_path, monkeypatch):
+        ds = _fake_hourly_atm_instante("2020-01-01", "2020-01-31")
+        cells = ds.sizes["lat"] * ds.sizes["lon"]
+        monkeypatch.setattr(
+            compiler_registry,
+            "_SLAB_SOURCE_BUDGET_BYTES",
+            cells * 4 * 4 * 24 * 10,  # 4 vars × float32 × 24 steps × 10 days
+        )
+        seen: list[DateRange] = []
+
+        real = compiler_registry._daily_atm_instante_for_slab
+        monkeypatch.setattr(
+            compiler_registry,
+            "_daily_atm_instante_for_slab",
+            lambda hourly, slab: (seen.append(slab), real(hourly, slab))[1],
+        )
+
+        dr = DateRange("2020-01-01", "2020-01-31")
+        out = compiler_registry._compile_atm_instante(
+            _hourly_instante_compiler(tmp_path), _make_catalog(ds), dr
+        )
+
+        assert len(seen) > 1, "a long range must not be reduced in one graph"
+        assert seen[0].start == dr.start and seen[-1].end == dr.end
+        assert out is not None
+        assert out.sizes["time"] == 31, "slabs must concatenate to the full range"
+
+    def test_read_is_not_widened_backwards(self, tmp_path, monkeypatch):
+        """Nothing here is a rolling feature, so warming would only cost reads."""
+        seen: dict = {}
+
+        def _fake_open(catalog, var_key, date_range, bbox, **kwargs):
+            seen["range"] = date_range
+            return None
+
+        monkeypatch.setattr(compiler_registry, "_open_or_warn", _fake_open)
+
+        compiler_registry._compile_atm_instante(
+            _hourly_instante_compiler(tmp_path), _make_catalog(None), _DR
+        )
+
+        assert seen["range"].start == _DR.start
+
+
+# ---------------------------------------------------------------------------
+# radiation through compile_default (it has no processor of its own)
+# ---------------------------------------------------------------------------
+
+
+def _fake_hourly_radiation(start: str, end: str) -> xr.Dataset:
+    """Hourly W/m² dataset shaped like the radiation store, on the base grid."""
+    times = pd.date_range(start, pd.Timestamp(end) + pd.Timedelta(hours=23), freq="h")
+    lat, lon = [30.0, 30.25], [-10.0, -9.75]
+    shape = (len(times), len(lat), len(lon))
+    return xr.Dataset(
+        {
+            "ssrd": (["time", "lat", "lon"], np.full(shape, 200.0, dtype="float32")),
+            "tisr": (["time", "lat", "lon"], np.full(shape, 400.0, dtype="float32")),
+            "slhf": (["time", "lat", "lon"], np.full(shape, -100.0, dtype="float32")),
+        },
+        coords={"time": times, "lat": lat, "lon": lon},
+    )
+
+
+def _hourly_radiation_compiler(tmp_path) -> MagicMock:
+    compiler = _make_compiler(tmp_path)
+    compiler.app_config.variables = {
+        "radiation": SimpleNamespace(time_step=TimeStep.HOURLY)
+    }
+    return compiler
+
+
+def _radiation_catalog(ds: xr.Dataset | None = None) -> MagicMock:
+    catalog = _make_catalog(ds)
+    catalog.var_key = "radiation"
+    return catalog
+
+
+class TestCompileRadiationHourly:
+    """
+    An hourly store needs only the daily mean — the units were settled at
+    convert. That is exactly what ``compile_default`` does, so radiation is
+    deliberately unregistered and these exercise it through the default.
+    """
+
+    def test_not_registered_so_it_rides_the_default(self):
+        assert "radiation" not in COMPILE_PROCESSORS
+
+    def test_hourly_config_dispatches_to_the_hourly_path(self, tmp_path, monkeypatch):
+        called = {}
+
+        def _spy(catalog, var_key, bbox, date_range, reduce_slab, warmup_days=0):
+            called["var_key"] = var_key
+            called["warmup"] = warmup_days
+            return None
+
+        monkeypatch.setattr(compiler_registry, "_reduce_hourly_in_slabs", _spy)
+
+        compile_default(
+            _hourly_radiation_compiler(tmp_path), _radiation_catalog(None), _DR
+        )
+
+        assert called.get("var_key") == "radiation"
+        assert called.get("warmup") == 0, "a daily mean needs nothing from earlier days"
+
+    def test_daily_config_does_not_dispatch_to_the_hourly_path(
+        self, tmp_path, monkeypatch
+    ):
+        def _boom(*args, **kwargs):
+            raise AssertionError("daily store must not take the hourly path")
+
+        monkeypatch.setattr(compiler_registry, "_reduce_hourly_in_slabs", _boom)
+        compiler = _make_compiler(tmp_path)
+        compiler.app_config.variables = {
+            "radiation": SimpleNamespace(time_step=TimeStep.DAILY)
+        }
+
+        compile_default(compiler, _radiation_catalog(None), _DR)
+
+    def test_hourly_store_yields_daily_columns_unchanged_in_units(self, tmp_path):
+        ds = _fake_hourly_radiation("2020-01-01", "2020-01-03")
+        out = compile_default(
+            _hourly_radiation_compiler(tmp_path), _radiation_catalog(ds), _DR
+        )
+
+        assert out is not None
+        assert set(out.data_vars) == {"ssrd", "tisr", "slhf"}
+        assert out.sizes["time"] == 3, "h2ds stays daily whatever the store's cadence"
+        # A mean of constants is that constant — W/m² in, W/m² out, no rescaling.
+        np.testing.assert_allclose(out["ssrd"].values, 200.0, rtol=1e-5)
+        np.testing.assert_allclose(out["slhf"].values, -100.0, rtol=1e-5)
+
+    def test_returns_none_when_data_missing(self, tmp_path):
+        result = compile_default(
+            _hourly_radiation_compiler(tmp_path), _radiation_catalog(None), _DR
+        )
+        assert result is None
+
+    def test_last_day_keeps_all_of_its_hours(self, tmp_path):
+        """A midnight-stamped slab end would average only 00:00 of the last day."""
+        ds = _fake_hourly_radiation("2020-01-01", "2020-01-03")
+        ds["ssrd"].loc[{"time": slice("2020-01-03 01:00", None)}] = 800.0
+
+        out = compile_default(
+            _hourly_radiation_compiler(tmp_path), _radiation_catalog(ds), _DR
+        )
+
+        assert out is not None
+        last = float(out["ssrd"].isel(time=-1).mean())
+        assert last > 700.0, "reading only 00:00 of the last day would give 200"
+
 
 # ---------------------------------------------------------------------------
 # _compile_sst
@@ -407,6 +777,75 @@ class TestCompileDefault:
         catalog = _make_catalog(_daily_ds("ssh", _DATES))
         result = compile_default(compiler, catalog, _DR)
         assert isinstance(result, xr.Dataset)
+
+
+class TestCompileDefaultHourly:
+    """
+    An unregistered hourly variable must still reach h2ds on the daily axis.
+    Handed over unreduced it would not fail — the compiler's outer join would
+    union 24 stamps into every day, leaving the daily variables null in 23.
+    """
+
+    @staticmethod
+    def _setup(tmp_path, ds, *, time_step):
+        compiler = _make_compiler(tmp_path)
+        compiler.app_config.variables["newvar"] = SimpleNamespace(time_step=time_step)
+        catalog = _make_catalog(ds)
+        catalog.var_key = "newvar"
+        return compiler, catalog
+
+    def test_hourly_store_is_reduced_to_a_daily_axis(self, tmp_path):
+        compiler, catalog = self._setup(
+            tmp_path,
+            _fake_hourly("2020-01-01", "2020-01-03"),
+            time_step=TimeStep.HOURLY,
+        )
+
+        result = compile_default(compiler, catalog, _DR)
+
+        assert result is not None
+        assert list(pd.DatetimeIndex(result.time.values)) == list(_DATES)
+
+    def test_reduction_is_a_mean_over_the_whole_day(self, tmp_path):
+        """Every hour of the day must contribute — a midnight-stamped slab end
+        would average the single 00:00 step instead of all 24."""
+        ds = _fake_hourly("2020-01-01", "2020-01-01")
+        # Hour-of-day as the value: the day's mean is 11.5, its first step 0.
+        ds["v0"][:] = np.arange(24, dtype="float32")[:, None, None]
+        compiler, catalog = self._setup(tmp_path, ds, time_step=TimeStep.HOURLY)
+
+        result = compile_default(
+            compiler, catalog, DateRange("2020-01-01", "2020-01-01")
+        )
+
+        assert result is not None
+        assert float(result["v0"].isel(time=0).mean()) == pytest.approx(11.5)
+
+    def test_daily_store_keeps_the_unreduced_path(self, tmp_path):
+        compiler, catalog = self._setup(
+            tmp_path, _daily_ds("newvar", _DATES), time_step=TimeStep.DAILY
+        )
+
+        result = compile_default(compiler, catalog, _DR)
+
+        assert result is not None
+        assert list(pd.DatetimeIndex(result.time.values)) == list(_DATES)
+        # One plain read, not the slabbed hourly path.
+        catalog.open_dataset.assert_called_once_with(
+            start_date=_DR.start, end_date=_DR.end, bbox=compiler.var_config.bbox
+        )
+
+    def test_var_key_absent_from_config_is_treated_as_daily(self, tmp_path):
+        """A stand-in config without the entry must keep the path every existing
+        store uses, rather than reducing an axis that is already daily."""
+        compiler = _make_compiler(tmp_path)
+        catalog = _make_catalog(_daily_ds("newvar", _DATES))
+        catalog.var_key = "not-in-config"
+
+        result = compile_default(compiler, catalog, _DR)
+
+        assert result is not None
+        assert list(pd.DatetimeIndex(result.time.values)) == list(_DATES)
 
 
 # ---------------------------------------------------------------------------
@@ -505,3 +944,242 @@ class TestProcessVariableDispatch:
             result = compiler._process_variable("ssh", _DR)
 
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Hourly reduction slabbing
+# ---------------------------------------------------------------------------
+
+
+def _fake_hourly(start: str, end: str, n_vars: int = 1) -> xr.Dataset:
+    """Hourly dataset over a whole-day span, shaped like the atm-accum store."""
+    times = pd.date_range(start, pd.Timestamp(end) + pd.Timedelta(hours=23), freq="h")
+    lat, lon = [30.0, 31.0, 32.0, 33.0], [-10.0, -9.0, -8.0, -7.0, -6.0]
+    shape = (len(times), len(lat), len(lon))
+    return xr.Dataset(
+        {
+            f"v{i}": (["time", "lat", "lon"], np.ones(shape, dtype="float32"))
+            for i in range(n_vars)
+        },
+        coords={"time": times, "lat": lat, "lon": lon},
+    )
+
+
+class TestSlabs:
+    def test_slabs_tile_the_range_without_gap_or_overlap(self):
+        dr = DateRange("2020-01-01", "2020-01-31")
+        slabs = compiler_registry._slabs(dr, 10)
+
+        assert slabs[0].start == dr.start
+        assert slabs[-1].end == dr.end
+        for prev, nxt in zip(slabs, slabs[1:]):
+            assert nxt.start == prev.end + pd.Timedelta(days=1)
+
+    def test_no_slab_exceeds_the_requested_length(self):
+        slabs = compiler_registry._slabs(DateRange("2020-01-01", "2020-01-31"), 10)
+        assert all((s.end - s.start).days + 1 <= 10 for s in slabs)
+
+    def test_range_shorter_than_a_slab_stays_whole(self):
+        dr = DateRange("2020-01-01", "2020-01-05")
+        assert compiler_registry._slabs(dr, 30) == [dr]
+
+    def test_absurd_slab_length_yields_one_slab_rather_than_overflowing(self):
+        """
+        A small store divides the byte budget into a day count far past what
+        pd.Timedelta can hold. Clamping to the range is what keeps that an
+        ordinary one-slab reduction instead of an OutOfBoundsTimedelta.
+        """
+        dr = DateRange("2020-01-01", "2020-01-05")
+        assert compiler_registry._slabs(dr, 10**12) == [dr]
+
+
+class TestSlabsAgainstStoreCoverage:
+    """
+    A compile window routinely outruns an hourly store: the CDS variables lag
+    their provider by different amounts, so a range ending today reaches past
+    whichever one is furthest behind. Slabs past the last stamp select nothing,
+    and a reducer with no warm-up resamples an empty axis and raises — which is
+    how one lagging variable took a whole 29-chunk compile down with it.
+    """
+
+    @staticmethod
+    def _short_slabs(monkeypatch, ds, days: int = 5):
+        cells = ds.sizes["lat"] * ds.sizes["lon"]
+        per_day = cells * ds["v0"].dtype.itemsize * 24
+        monkeypatch.setattr(
+            compiler_registry, "_SLAB_SOURCE_BUDGET_BYTES", per_day * days
+        )
+
+    def test_a_range_past_the_end_of_the_store_still_reduces(self, monkeypatch):
+        """The reducer is the real one, so an empty slab would raise as it did."""
+        ds = _fake_hourly("2020-01-01", "2020-01-10")
+        self._short_slabs(monkeypatch, ds)
+
+        out = compiler_registry._reduce_hourly_in_slabs(
+            _make_catalog(ds),
+            "lagging-var",
+            None,
+            DateRange("2020-01-01", "2020-01-31"),
+            compiler_registry._daily_mean_for_slab,
+        )
+
+        assert out is not None
+        assert len(out.time) == 10, "only the days the store holds"
+
+    def test_a_range_starting_before_the_store_still_reduces(self, monkeypatch):
+        ds = _fake_hourly("2020-01-20", "2020-01-31")
+        self._short_slabs(monkeypatch, ds)
+
+        out = compiler_registry._reduce_hourly_in_slabs(
+            _make_catalog(ds),
+            "late-starting-var",
+            None,
+            DateRange("2020-01-01", "2020-01-31"),
+            compiler_registry._daily_mean_for_slab,
+        )
+
+        assert out is not None
+        assert len(out.time) == 12
+
+    def test_no_overlap_at_all_returns_none(self):
+        ds = _fake_hourly("2020-01-01", "2020-01-10")
+
+        out = compiler_registry._reduce_hourly_in_slabs(
+            _make_catalog(ds),
+            "stale-var",
+            None,
+            DateRange("2021-01-01", "2021-01-31"),
+            compiler_registry._daily_mean_for_slab,
+        )
+
+        assert out is None
+
+    def test_the_reducer_never_sees_an_empty_slab(self, monkeypatch):
+        ds = _fake_hourly("2020-01-01", "2020-01-10")
+        self._short_slabs(monkeypatch, ds)
+        seen: list[int] = []
+
+        def _record(hourly, slab):
+            sub = hourly.sel(
+                time=slice(slab.start, compiler_registry._end_of_day(slab.end))
+            )
+            seen.append(sub.sizes.get("time", 0))
+            return compiler_registry._daily_mean_for_slab(hourly, slab)
+
+        compiler_registry._reduce_hourly_in_slabs(
+            _make_catalog(ds),
+            "lagging-var",
+            None,
+            DateRange("2020-01-01", "2020-01-31"),
+            _record,
+        )
+
+        assert seen and all(n > 0 for n in seen)
+
+
+class TestSlabDays:
+    def test_derived_from_data_volume_not_machine(self, monkeypatch):
+        ds = _fake_hourly("2020-01-01", "2020-01-31")
+        cells = ds.sizes["lat"] * ds.sizes["lon"]
+        per_day = cells * 4 * 24  # one float32 var, hourly
+
+        monkeypatch.setattr(
+            compiler_registry, "_SLAB_SOURCE_BUDGET_BYTES", per_day * 10
+        )
+        assert compiler_registry._slab_days(ds) == 10
+
+    def test_more_variables_means_shorter_slabs(self, monkeypatch):
+        monkeypatch.setattr(compiler_registry, "_SLAB_SOURCE_BUDGET_BYTES", 10**7)
+        one = compiler_registry._slab_days(_fake_hourly("2020-01-01", "2020-01-31", 1))
+        four = compiler_registry._slab_days(_fake_hourly("2020-01-01", "2020-01-31", 4))
+
+        assert four < one, "slab length must shrink as h2ds grows"
+
+    def test_never_returns_zero_days(self, monkeypatch):
+        """A budget smaller than a single day must still make progress."""
+        monkeypatch.setattr(compiler_registry, "_SLAB_SOURCE_BUDGET_BYTES", 1)
+        assert (
+            compiler_registry._slab_days(_fake_hourly("2020-01-01", "2020-01-05")) == 1
+        )
+
+
+class TestEndOfDay:
+    def test_covers_the_final_hourly_step(self):
+        """A midnight end bound would drop that day's other 23 steps."""
+        got = compiler_registry._end_of_day("2020-01-31")
+
+        assert got > pd.Timestamp("2020-01-31 23:00")
+        assert got < pd.Timestamp("2020-02-01")
+
+
+class TestAtmAccumSlabbing:
+    """The reduction must run slab by slab, each warmed independently."""
+
+    @staticmethod
+    def _capture_slabs(monkeypatch, ds: xr.Dataset) -> list[DateRange]:
+        seen: list[DateRange] = []
+
+        def _fake_open(catalog, var_key, date_range, bbox, **kwargs):
+            return ds
+
+        def _fake_slab(ds_hourly, slab):
+            seen.append(slab)
+            times = pd.date_range(slab.start, slab.end, freq="D")
+            return xr.Dataset(
+                {"ekman_anom": (["time"], np.ones(len(times), dtype="float32"))},
+                coords={"time": times},
+            )
+
+        monkeypatch.setattr(compiler_registry, "_open_or_warn", _fake_open)
+        monkeypatch.setattr(compiler_registry, "_daily_features_for_slab", _fake_slab)
+        return seen
+
+    def test_range_is_processed_in_multiple_slabs(self, tmp_path, monkeypatch):
+        ds = _fake_hourly("2019-12-12", "2020-01-31")
+        seen = self._capture_slabs(monkeypatch, ds)
+        cells = ds.sizes["lat"] * ds.sizes["lon"]
+        monkeypatch.setattr(
+            compiler_registry, "_SLAB_SOURCE_BUDGET_BYTES", cells * 4 * 24 * 10
+        )
+
+        dr = DateRange("2020-01-01", "2020-01-31")
+        out = compiler_registry._atm_accum_from_hourly(
+            _make_compiler(tmp_path), _make_catalog(None), dr
+        )
+
+        assert len(seen) > 1, "a long range must not be reduced in one graph"
+        assert seen[0].start == dr.start and seen[-1].end == dr.end
+        assert out is not None
+        assert out.sizes["time"] == 31, "slabs must concatenate to the full range"
+
+    def test_result_covers_every_requested_day_exactly_once(
+        self, tmp_path, monkeypatch
+    ):
+        ds = _fake_hourly("2019-12-12", "2020-01-31")
+        self._capture_slabs(monkeypatch, ds)
+        cells = ds.sizes["lat"] * ds.sizes["lon"]
+        monkeypatch.setattr(
+            compiler_registry, "_SLAB_SOURCE_BUDGET_BYTES", cells * 4 * 24 * 7
+        )
+
+        out = compiler_registry._atm_accum_from_hourly(
+            _make_compiler(tmp_path),
+            _make_catalog(None),
+            DateRange("2020-01-01", "2020-01-31"),
+        )
+
+        assert out is not None
+        times = pd.DatetimeIndex(out.time.values)
+        assert times.is_monotonic_increasing
+        assert not times.duplicated().any()
+
+    def test_missing_source_still_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            compiler_registry,
+            "_open_or_warn",
+            lambda catalog, var_key, date_range, bbox, **kw: None,
+        )
+        out = compiler_registry._atm_accum_from_hourly(
+            _make_compiler(tmp_path), _make_catalog(None), _DR
+        )
+        assert out is None

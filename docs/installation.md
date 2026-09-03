@@ -43,11 +43,13 @@ H2MARE requires two files in your working directory before running any command.
 
 ### `config.yaml`
 
-Defines variables, dataset IDs, bounding boxes, and processing parameters. Download the [template from the repository](https://github.com/h2ugoparra/h2mare/blob/main/config.yaml) and edit it to match your setup:
+Defines variables, dataset IDs, bounding boxes, and processing parameters. Start from the example, which holds four entries covering the shapes you are likely to need — a plain 2-D daily variable, a 3-D one with depth levels, an hourly packed ERA5 one, and the `h2ds` entry the compile step writes to:
 
 ```bash
-curl -O https://raw.githubusercontent.com/h2ugoparra/h2mare/main/config.yaml
+curl -o config.yaml https://raw.githubusercontent.com/h2ugoparra/h2mare/main/config.example.yaml
 ```
+
+The repository's own `config.yaml` configures 16 variables. It is a **reference** — useful for seeing how a particular source is wired up, too heavy to copy wholesale. Every field is documented in the [configuration reference](configuration.md).
 
 ### `.env`
 
@@ -69,7 +71,7 @@ If auto-detection fails — for example, you run `h2mare` from an unrelated dire
 H2MARE_ROOT=/path/to/your/h2mare/project
 ```
 
-Without it, h2mare falls back to `~/.h2mare` (library mode), where no data directories are created and commands will fail.
+Without it, h2mare falls back to `~/.h2mare`, which holds no `config.yaml`, and commands will fail.
 
 ## Data storage layout
 
@@ -88,3 +90,5 @@ $STORE_ROOT/<local_folder>/          # per-variable Zarr stores (when STORE_ROOT
 ```
 
 `local_folder` is defined per variable in `config.yaml` (e.g. `CMEMS_SST`, `CMEMS_SSH`). When `STORE_ROOT` is set, Zarr output goes there; otherwise it falls back to `data/processed/zarr/`.
+
+These directories are created on first write, not at import — so a project root only grows the branches it actually uses. Call `get_settings().ensure_directories()` to scaffold the whole tree up front.

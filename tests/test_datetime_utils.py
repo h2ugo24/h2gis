@@ -7,6 +7,7 @@ import pytest
 
 from h2mare.utils.datetime_utils import (
     date_to_standard_string,
+    end_of_day,
     more_than_one_year,
     normalize_date,
     normalize_dates,
@@ -48,12 +49,41 @@ class TestNormalizeDate:
         result = normalize_date(pd.Timestamp("2020-03-15 12:30"))
         assert result.hour == 0
 
+    @pytest.mark.parametrize("bad", [None, pd.NaT, float("nan")])
+    def test_unusable_date_names_the_argument(self, bad):
+        """
+        Regression: pd.Timestamp returns NaT for these and NaT has no
+        .normalize(), so the failure surfaced as "AttributeError: 'NaTType'
+        object has no attribute 'normalize'" — naming neither the argument nor
+        the mistake.
+        """
+        with pytest.raises(ValueError, match="Not a usable date"):
+            normalize_date(bad)
+
+
+class TestEndOfDay:
+    def test_covers_the_last_sub_daily_step(self):
+        got = end_of_day("2020-03-15")
+
+        assert got > pd.Timestamp("2020-03-15 23:00")
+        assert got < pd.Timestamp("2020-03-16")
+
+    def test_stays_within_the_day_of_a_stamped_input(self):
+        # Normalizes first, so a noon-stamped bound does not spill into the
+        # following day.
+        assert end_of_day(pd.Timestamp("2020-03-15 12:00")) < pd.Timestamp("2020-03-16")
+
 
 class TestNormalizeDates:
     def test_list_of_strings(self):
         result = normalize_dates(["2020-01-01", "2020-06-30"])
         assert len(result) == 2
         assert all(ts.hour == 0 for ts in result)
+
+    def test_one_bad_entry_in_a_list_is_reported_like_a_lone_one(self):
+        """The list branch normalized inline, so it raised AttributeError."""
+        with pytest.raises(ValueError, match="Not a usable date"):
+            normalize_dates(["2020-01-01", None])
 
     def test_tuple_of_dates(self):
         result = normalize_dates((date(2020, 1, 1), date(2020, 6, 30)))

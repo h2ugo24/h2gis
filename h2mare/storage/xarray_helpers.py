@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -15,6 +14,79 @@ def xr_float64_to_float32(ds: xr.Dataset) -> xr.Dataset:
 
 # Backward-compatible alias kept so existing call sites continue to work
 ds_float64_to_float32 = xr_float64_to_float32
+
+
+#: How much wider than the observed range to make the int16 scale.
+#:
+#: A store's scale is fixed when it is *created* and every later append
+#: inherits it, so the range this batch happens to span becomes the range the
+#: store can represent for its whole life. At 1.0 the observed data fills
+#: ±32500 of int16's ±32767 — about 0.4% headroom, which a single unusually
+#: cold day or deep low is enough to exceed, and an exceedance wraps rather
+#: than clips.
+#:
+#: 1.6 spreads the same span over 1.6× the value range, leaving roughly 60%
+#: headroom beyond the observed half-range on each side at 1.6× coarser
+#: resolution — msl ~0.24 Pa rather than ~0.15 Pa, still far inside ERA5's own
+#: precision. Appends outside even this are refused by
+#: ``storage._check_packed_range`` rather than silently wrapped.
+_INT16_HEADROOM = 1.6
+
+
+def int16_encoding(ds: xr.Dataset, level: int = 9) -> dict:
+    """
+    Scale/offset int16 encoding, one scale per data variable.
+
+    The scale spans each variable's own range, widened by
+    :data:`_INT16_HEADROOM`, over 65000 levels — which for ERA5 lands well
+    inside the source's own precision (msl ~0.24 Pa, wind ~0.002 m/s). NaN —
+    land, or a gap — round-trips through ``_FillValue``.
+
+    The headroom is not slack. This encoding is applied only when a store is
+    *created*; appends inherit it, so a scale derived from one batch has to
+    hold for every later one. Without it, data outside the first batch's range
+    overflows int16 and wraps back into the middle of the range — worse than
+    clipping, because a wrapped value looks like ordinary data.
+
+    Computing the range forces one pass over the data. That is deliberate: a
+    fixed guess would clip, and clipping is silent.
+
+    One pass, though, not one per reduction: every min and max goes into a
+    single graph so each source chunk is decoded once and fed to both. Computed
+    separately they cost a full re-read apiece — on a year of hourly ERA5 that
+    is tens of GB of GRIB decoded again for every extra call, all of it before
+    the write starts and so invisible in the log.
+    """
+    import dask
+    import zarr
+
+    logger.info(
+        f"int16_encoding: scanning {len(ds.data_vars)} variable(s) for their "
+        f"value range (one pass over the source, no output until it completes)"
+    )
+    bounds: dict[tuple[str, str], xr.DataArray] = {}
+    for name, da in ds.data_vars.items():
+        bounds[(str(name), "lo")] = da.min()
+        bounds[(str(name), "hi")] = da.max()
+    (computed,) = dask.compute(bounds)
+
+    encoding: dict = {}
+    for name in ds.data_vars:
+        lo = float(computed[(str(name), "lo")])
+        hi = float(computed[(str(name), "hi")])
+        span = hi - lo
+        if not np.isfinite(span) or span == 0:
+            # Degenerate or all-NaN: packing buys nothing and the scale would be
+            # zero or non-finite, so leave this variable on the default encoding.
+            continue
+        encoding[name] = {
+            "dtype": "int16",
+            "scale_factor": span * _INT16_HEADROOM / 65000.0,
+            "add_offset": (hi + lo) / 2.0,
+            "_FillValue": -32767,
+            "compressors": [zarr.codecs.ZstdCodec(level=level)],
+        }
+    return encoding
 
 
 def get_dataset_encoding(ds: xr.Dataset) -> dict:
@@ -236,46 +308,6 @@ def unified_time_chunk(
     return chunk_len
 
 
-def have_vars_unique_values(ds: Path | xr.Dataset) -> bool:
-    """
-    Return ``True`` if **any** variable in the given Zarr path or dataset has only one
-    unique value in its last time slice. Used to detect corrupt merge output.
-
-    Parameters
-    ----------
-    ds : pathlib.Path or xarray.Dataset
-        Either a path to a Zarr store or an already opened Dataset.
-    """
-    own_ds = False
-    if isinstance(ds, Path):
-        try:
-            ds = xr.open_zarr(ds)
-            own_ds = True
-        except Exception as e:
-            logger.error(f"Could not open Zarr store at {ds}: {e}")
-            return False
-
-    unique_found = False
-
-    try:
-        for var in ds.data_vars:
-            if "time" not in ds[var].dims:
-                continue
-            last_slice = ds[var].isel(time=-1)
-            uniq = np.unique(last_slice.values)
-            if len(uniq) == 1:
-                t = str(last_slice.time.values)[:10]
-                logger.warning(
-                    f"{var} has a single unique value ({uniq[0]:.4g}) at time={t} "
-                    f"in {ds.encoding.get('source', 'unknown')}"
-                )
-                unique_found = True
-    finally:
-        if own_ds:
-            ds.close()
-    return unique_found
-
-
 def convert360_180(_ds: xr.Dataset) -> xr.Dataset:
     """Convert 0-360 lon to -180-180 (FSLE)."""
     if _ds["lon"].min() >= 0:
@@ -333,3 +365,148 @@ def snap_grid_coords(ds: xr.Dataset, decimals: int = GRID_COORD_DECIMALS) -> xr.
             continue
         new_coords[name] = rounded
     return ds.assign_coords(new_coords) if new_coords else ds
+
+
+#: Attribute name prefixes carrying the source file's own encoding.
+_SOURCE_ENCODING_PREFIXES = ("GRIB_",)
+
+#: Attribute names carrying the source file's packing bounds. These read as
+#: physical limits and are not: CMEMS ships int16-packed data, so thetao_100
+#: arrives declaring [-32766, 21306] "degrees_C" against real values of
+#: [-2.3, 28.2]. Some variables' bounds happen to be plausible (mld's [1, 4525]
+#: metres), which is what makes keeping them worse than dropping them — a
+#: consumer cannot tell the nonsense from the sensible.
+_SOURCE_ENCODING_ATTRS = ("valid_min", "valid_max")
+
+
+def drop_source_encoding_attrs(ds: xr.Dataset, *, drop_grib: bool = True) -> xr.Dataset:
+    """
+    Strip attributes that describe the source file rather than this dataset.
+
+    They were true of the file the data came from and stopped being true the
+    moment it was regridded and re-encoded, but nothing removes them, so they
+    travel into the compiled product asserting the wrong thing. On h2ds — 280 x
+    360 at 0.25 deg — the wave variables still claimed ``GRIB_Nx=181,
+    GRIB_Ny=141, iDirectionIncrement=0.5``, ERA5's coarser wave grid; the upwell
+    counts claimed ``GRIB_units='N m**-2'`` inherited from the stress field they
+    are derived from; and ``GRIB_missingValue`` named a sentinel h2ds does not
+    use, having NaN.
+
+    Only data variables are touched, and only these families: ``standard_name``,
+    ``cell_methods``, ``unit_long`` and the rest still describe the quantity
+    itself and survive. Provenance is not lost with ``GRIB_paramId`` — the
+    variable's ``product_id``/``dataset_id`` carry it.
+
+    Args:
+        ds: Dataset to strip, modified in place and returned.
+        drop_grib: Whether to drop the ``GRIB_*`` family as well as the packing
+            bounds. True for the compiled product, whose regrid is what makes
+            those attributes lie. False on the native path: a CDS store is
+            written at ERA5's own grid and cadence, so ``GRIB_Nx``/``GRIB_Ny``
+            still describe it, and :func:`~h2mare.processing.core.cds.hourly_radiation`
+            deliberately *rewrites* ``GRIB_units`` and ``GRIB_stepType`` there to
+            stop the accumulation being differenced twice. Dropping them would
+            throw that correction away along with the ``GRIB_paramId``
+            provenance. The packing bounds go either way — they are wrong on a
+            native store too, where the values have been unpacked to float.
+    """
+    prefixes = _SOURCE_ENCODING_PREFIXES if drop_grib else ()
+    for var in ds.data_vars:
+        attrs = ds[var].attrs
+        for name in list(attrs):
+            if (
+                prefixes and name.startswith(prefixes)
+            ) or name in _SOURCE_ENCODING_ATTRS:
+                del attrs[name]
+    return ds
+
+
+#: CF attributes for the axes every store in the pipeline shares.
+#:
+#: ``time`` deliberately carries no ``units``: xarray owns the time encoding and
+#: writes ``units``/``calendar`` into ``.encoding`` at ``to_zarr``. Setting them
+#: in ``.attrs`` as well makes the write raise rather than merely disagree.
+_CF_COORD_ATTRS: dict[str, dict[str, str]] = {
+    "lon": {
+        "standard_name": "longitude",
+        "long_name": "longitude",
+        "units": "degrees_east",
+        "axis": "X",
+    },
+    "lat": {
+        "standard_name": "latitude",
+        "long_name": "latitude",
+        "units": "degrees_north",
+        "axis": "Y",
+    },
+    "depth": {
+        "standard_name": "depth",
+        "long_name": "depth",
+        "units": "m",
+        "positive": "down",
+        "axis": "Z",
+    },
+    "time": {"standard_name": "time", "long_name": "time", "axis": "T"},
+}
+
+
+def resolve_cf_attrs(var_name: str, native_var_key: str | None = None) -> dict:
+    """
+    Config's attributes for one variable, with the native overrides layered on.
+
+    Split out of :func:`apply_cf_attrs` so the repair script can compute what a
+    stored variable *should* say without opening the data — and, more to the
+    point, so it cannot compute it differently. A ``None`` value survives into
+    the result and means remove, which is the caller's to act on.
+    """
+    from h2mare.config import get_settings
+
+    settings = get_settings()
+    overrides: dict = {}
+    if native_var_key is not None:
+        overrides = settings.native_attr_overrides.get(native_var_key, {})
+    return {**settings.get_var_info(var_name), **overrides.get(var_name, {})}
+
+
+def apply_cf_attrs(ds: xr.Dataset, native_var_key: str | None = None) -> xr.Dataset:
+    """
+    Put config's metadata onto a dataset's variables and axes.
+
+    The single place both write paths get their attributes from, so a native
+    store and h2ds cannot drift into describing the same quantity differently.
+
+    Coordinates get :data:`_CF_COORD_ATTRS`. Without them a store is not merely
+    under-documented: ``rio.clip`` resolves spatial dims by name and only falls
+    back to lon/lat when they carry CF attributes, which is why geometry
+    extraction against the CDS stores and h2ds used to clip to nothing but NaN.
+
+    Args:
+        ds: Dataset to annotate, modified in place and returned.
+        native_var_key: The var_key whose *native* store is being written, or
+            None for the compiled product. Two things follow from it: the
+            ``GRIB_*`` attributes are kept (see
+            :func:`drop_source_encoding_attrs`), and that key's entry in
+            ``native_attr_overrides`` is layered over the shared table. The
+            overrides exist because a native store is not always in the units it
+            publishes downstream — ``msl`` is Pa here and hPa in h2ds, ``tp`` is
+            m here and mm there — and because an hourly field is not the daily
+            reduction its ``cell_methods`` describes. An override of ``null``
+            removes the attribute rather than setting it, which is how those
+            ``cell_methods`` come off.
+    """
+    ds = drop_source_encoding_attrs(ds, drop_grib=native_var_key is None)
+
+    for var in ds.data_vars:
+        merged = resolve_cf_attrs(str(var), native_var_key)
+        attrs = ds[var].attrs
+        for key, value in merged.items():
+            if value is None:
+                attrs.pop(key, None)
+            else:
+                attrs[key] = value
+
+    for name, coord_attrs in _CF_COORD_ATTRS.items():
+        if name in ds.coords:
+            ds[name].attrs.update(coord_attrs)
+
+    return ds

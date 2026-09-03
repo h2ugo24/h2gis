@@ -18,6 +18,13 @@ import xarray as xr
 
 DateLike = str | pd.Timestamp | datetime | date
 
+#: Which store a var_key is read from. ``native`` is its own per-variable Zarr,
+#: ``compiled`` is the h2ds every var_key is merged into, and ``auto`` picks per
+#: var_key. Lives here rather than beside its users because both the extraction
+#: side (``processing.extractor``) and the read side
+#: (``storage.var_routing``) name it, and neither may import the other.
+ReadFrom = Literal["auto", "native", "compiled"]
+
 
 def to_datetime(value) -> datetime:
     """Coerce date, pd.Timestamp, str, or datetime to stdlib datetime."""
@@ -32,11 +39,28 @@ def to_datetime(value) -> datetime:
     raise TypeError(f"Cannot convert {type(value)} to datetime")
 
 
-class TimeResolution(str, Enum):
-    """Supported period granularity for data storage."""
+class FilePeriod(str, Enum):
+    """
+    How much time one Zarr file on disk covers — one per year, or one per month.
+
+    A property of the *storage layout*, not of the data: it says nothing about
+    how far apart the steps inside a file are. That is
+    :class:`h2mare.models.TimeStep`, and the two are independent — an hourly
+    store written one file per year is ``TimeStep.HOURLY`` and
+    ``FilePeriod.YEAR`` at the same time.
+
+    Named ``TimeResolution`` until it acquired an hourly sibling to be confused
+    with; "resolution" reads as the cadence of the data, which this is not.
+    """
 
     YEAR = "year"
     MONTH = "month"
+
+
+#: Deprecated alias for :class:`FilePeriod`. Nothing in h2mare uses it — it is
+#: here so an import in a downstream repo does not break on the rename. Safe to
+#: delete once those have caught up.
+TimeResolution = FilePeriod
 
 
 @dataclass
@@ -54,6 +78,18 @@ class DateRange:
         self.end = to_datetime(self.end).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
+        # NaT reaches here intact: it is a datetime subclass, so to_datetime
+        # passes it through and .replace() returns NaT again. Every comparison
+        # against it is False, so the ordering check below waves it through and
+        # a range of NaT..NaT travels on as if it named real dates. Rejecting it
+        # at the one point every construction path goes through also covers the
+        # from_* classmethods — from_pandas has no emptiness check of its own
+        # and used to return NaT to NaT for an empty frame.
+        if pd.isna(self.start) or pd.isna(self.end):
+            raise ValueError(
+                f"DateRange bounds must be real dates, got start={self.start!r}, "
+                f"end={self.end!r} — usually an empty or all-null time column."
+            )
         if self.start > self.end:
             raise ValueError(
                 f"DateRange start ({self.start.date()}) must not be after end ({self.end.date()})"
@@ -137,9 +173,13 @@ class DateRange:
         result = df.select(
             [pl.col(time_col).min().alias("start"), pl.col(time_col).max().alias("end")]
         ).collect(engine="streaming")
-        return cls(
-            start=to_datetime(result["start"][0]), end=to_datetime(result["end"][0])
-        )
+        start, end = result["start"][0], result["end"][0]
+        # Same guard the eager from_polars has. Without it an empty frame fell
+        # through to to_datetime(None) and raised "Cannot convert <class
+        # 'NoneType'> to datetime", which does not say which column was empty.
+        if start is None or end is None:
+            raise ValueError(f"Column '{time_col}' is empty or all null.")
+        return cls(start=to_datetime(start), end=to_datetime(end))
 
     @classmethod
     def from_pandas(cls, df: pd.DataFrame, time_col: str = "time") -> DateRange:
@@ -147,7 +187,13 @@ class DateRange:
         if time_col not in df.columns:
             raise ValueError(f"Column '{time_col}' not found in Pandas DataFrame.")
         dates = df[time_col]
-        return cls(start=dates.min(), end=dates.max())
+        start, end = dates.min(), dates.max()
+        # Parity with from_polars. min()/max() on an empty or all-null column
+        # give NaT, which the constructor rejects — but only by value, so it
+        # cannot name the column the caller actually passed.
+        if pd.isna(start) or pd.isna(end):
+            raise ValueError(f"Column '{time_col}' is empty or all null.")
+        return cls(start=start, end=end)
 
     @classmethod
     def from_dataframe(cls, df, time_col: str = "time") -> DateRange:
@@ -190,9 +236,22 @@ class BBox:
         Validate bounding box format.
 
         Raises:
+            ValueError: If any bound is NaN
             ValueError: If xmin >= xmax
             ValueError: If ymin >= ymax
         """
+        # Checked before the ordering rules, which cannot see it: every
+        # comparison against NaN is False, so `xmin >= xmax` passes and an
+        # all-NaN box is accepted as valid. from_pandas produced exactly that
+        # for an empty frame — min()/max() give NaN and float(NaN) is NaN —
+        # while the polars twins already raised on the same input.
+        if any(v != v for v in (self.xmin, self.ymin, self.xmax, self.ymax)):
+            raise ValueError(
+                f"BBox bounds must be real numbers, got "
+                f"({self.xmin}, {self.ymin}, {self.xmax}, {self.ymax}) — "
+                "usually an empty or all-null lon/lat column."
+            )
+
         if self.xmin >= self.xmax:
             raise ValueError(f"Invalid bbox: xmin ({self.xmin}) >= xmax ({self.xmax})")
 
@@ -280,12 +339,18 @@ class BBox:
             ]
         ).collect(engine="streaming")
 
-        return cls(
-            xmin=float(result["min_lon"][0]),
-            ymin=float(result["min_lat"][0]),
-            xmax=float(result["max_lon"][0]),
-            ymax=float(result["max_lat"][0]),
-        )
+        bounds = [
+            result["min_lon"][0],
+            result["min_lat"][0],
+            result["max_lon"][0],
+            result["max_lat"][0],
+        ]
+        # Same guard the eager from_polars has — an empty frame otherwise
+        # reached float(None) and raised a TypeError naming neither column.
+        if any(v is None for v in bounds):
+            raise ValueError(f"'{lon_col}' or '{lat_col}' is empty or all null.")
+        xmin, ymin, xmax, ymax = (float(cast(float, v)) for v in bounds)
+        return cls(xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax)
 
     @classmethod
     def from_polars(cls, df: pl.DataFrame, lon_col: str, lat_col: str) -> BBox:
@@ -314,12 +379,18 @@ class BBox:
             raise ValueError(
                 f"'{lon_col}' or '{lat_col}' not found in Pandas DataFrame."
             )
-        return cls(
-            xmin=float(df[lon_col].min()),
-            ymin=float(df[lat_col].min()),
-            xmax=float(df[lon_col].max()),
-            ymax=float(df[lat_col].max()),
+        bounds = (
+            df[lon_col].min(),
+            df[lat_col].min(),
+            df[lon_col].max(),
+            df[lat_col].max(),
         )
+        # Parity with from_polars: an empty frame gives NaN throughout, which
+        # the constructor now rejects — this names the column while doing it.
+        if any(pd.isna(v) for v in bounds):
+            raise ValueError(f"'{lon_col}' or '{lat_col}' is empty or all null.")
+        xmin, ymin, xmax, ymax = (float(cast(float, v)) for v in bounds)
+        return cls(xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax)
 
     @classmethod
     def from_dataframe(cls, df, lon_col: str, lat_col: str) -> BBox:

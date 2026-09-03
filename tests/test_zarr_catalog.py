@@ -1,7 +1,9 @@
 """Tests for ZarrCatalog: build_file_path, dataset column, and provenance sidecars."""
 
 import json
+from types import SimpleNamespace
 from typing import Sequence
+from unittest.mock import MagicMock
 
 import msgspec
 import numpy as np
@@ -12,7 +14,7 @@ from loguru import logger
 
 from h2mare.models import AppConfig
 from h2mare.storage.zarr_catalog import ZarrCatalog
-from h2mare.types import BBox
+from h2mare.types import BBox, DateRange
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -28,17 +30,17 @@ _ENTRY = {
 }
 
 
-def _make_app_config() -> AppConfig:
+def _make_app_config(time_step: str = "daily") -> AppConfig:
     return msgspec.convert(
-        {"variables": {"sst": _ENTRY}, "secrets": {}},
+        {"variables": {"sst": {**_ENTRY, "time_step": time_step}}, "secrets": {}},
         AppConfig,
     )
 
 
-def _make_catalog(tmp_path) -> ZarrCatalog:
+def _make_catalog(tmp_path, time_step: str = "daily") -> ZarrCatalog:
     return ZarrCatalog(
         "sst",
-        app_config=_make_app_config(),
+        app_config=_make_app_config(time_step),
         store_root=tmp_path,
         auto_refresh=False,
     )
@@ -211,6 +213,43 @@ class TestDatasetColumn:
         assert rows[1]["dataset"] == "NRT_ID"
         assert rows[0]["end_date"] < rows[1]["start_date"]
 
+    def test_per_source_timestep_count_covers_a_noon_stamped_last_day(self, tmp_path):
+        """
+        Each source's num_timesteps is counted between two normalized dates, so
+        a midnight upper bound misses whatever the last day of that span holds:
+        its single noon stamp here, 23 of 24 steps on an hourly store. The
+        counts must still add up to the store.
+        """
+        import zarr
+
+        ds = _make_ds("2023-01-01", n_days=10)
+        ds = ds.assign_coords(time=ds.time.to_index() + pd.Timedelta(hours=12))
+        zarr_path = _write_zarr(tmp_path, ds)
+        root = zarr.open_group(str(zarr_path), mode="r+")
+        root.attrs["source_datasets"] = json.dumps(
+            [
+                {
+                    "dataset_id": "REP_ID",
+                    "dataset_type": "rep",
+                    "start_date": "2023-01-01",
+                    "end_date": "2023-01-05",
+                },
+                {
+                    "dataset_id": "NRT_ID",
+                    "dataset_type": "nrt",
+                    "start_date": "2023-01-06",
+                    "end_date": "2023-01-10",
+                },
+            ]
+        )
+        zarr.consolidate_metadata(str(zarr_path))
+        catalog = _make_catalog(tmp_path)
+
+        rows = catalog._index._scanner._extract_zarr_metadata(zarr_path)
+
+        assert [r["num_timesteps"] for r in rows] == [5, 5]
+        assert sum(r["num_timesteps"] for r in rows) == len(ds.time)
+
     def test_sidecar_fallback_still_works_for_old_files(self, tmp_path):
         ds = _make_ds("2023-01-01", n_days=365)
         zarr_path = _write_zarr(tmp_path, ds)
@@ -382,6 +421,126 @@ class TestVarsNonnullEnd:
         assert cov is not None
         assert cov.end == pd.Timestamp("2026-05-15")
 
+    def test_a_timeless_column_is_omitted_rather_than_raising(self, tmp_path):
+        # bathy rides in h2ds on lon/lat alone. Reducing it over every non-time
+        # dim leaves a scalar mask, and indexing the time axis with that used to
+        # raise "Multi-dimensional indexing is no longer supported".
+        ds = _make_padded_ds("2026-05-01", n_days=5, n_valid=5, var="ac_amp")
+        ds["bathy"] = (["lat", "lon"], np.ones((3, 3)))
+        zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _df_for_zarr(
+            zarr_path, ["ac_amp", "bathy"], "2026-05-05"
+        )
+
+        result = catalog.get_vars_nonnull_end(["ac_amp", "bathy"])
+
+        assert result == {"ac_amp": pd.Timestamp("2026-05-05")}
+
+
+# ---------------------------------------------------------------------------
+# Variable coverage: the leading edge, and both ends together
+#
+# xr.merge(join="outer") pads a variable to the union time axis at *both* ends,
+# so a source that starts later or ends earlier than the store reads as covered
+# across its own padding.
+# ---------------------------------------------------------------------------
+
+
+def _make_edge_padded_ds(start: str, n_days: int, valid: slice, var: str) -> xr.Dataset:
+    """Dataset where *var* holds data only within *valid*, NaN either side."""
+    times = pd.date_range(start, periods=n_days, freq="D")
+    data = np.full((n_days, 3, 3), np.nan)
+    data[valid] = 1.0
+    return xr.Dataset(
+        {var: (["time", "lat", "lon"], data)},
+        coords={"time": times, "lat": [30.0, 35.0, 40.0], "lon": [-10.0, -5.0, 0.0]},
+    )
+
+
+def _span_df(zarr_path, variables, start_date, end_date) -> pd.DataFrame:
+    """Single-row catalog df spanning the dates the file's axis actually holds."""
+    return pd.DataFrame(
+        [
+            {
+                "path": str(zarr_path),
+                "filename": zarr_path.name,
+                "variables": variables,
+                "start_date": pd.Timestamp(start_date),
+                "end_date": pd.Timestamp(end_date),
+            }
+        ]
+    )
+
+
+class TestVarsNonnullStart:
+    def test_nonnull_start_ignores_nan_head(self, tmp_path):
+        # Real data on days 4..10 of a 15-day file.
+        ds = _make_edge_padded_ds("2026-05-01", 15, slice(3, 10), "o2_0")
+        zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _span_df(
+            zarr_path, ["o2_0"], "2026-05-01", "2026-05-15"
+        )
+
+        result = catalog.get_vars_nonnull_start(["o2_0"])
+
+        assert result["o2_0"] == pd.Timestamp("2026-05-04")
+
+    def test_all_null_variable_omitted(self, tmp_path):
+        ds = _make_edge_padded_ds("2026-05-01", 5, slice(0, 0), "o2_0")
+        zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _span_df(
+            zarr_path, ["o2_0"], "2026-05-01", "2026-05-05"
+        )
+
+        assert catalog.get_vars_nonnull_start(["o2_0"]) == {}
+
+
+class TestGetVarCoverage:
+    def test_both_ends_narrow_to_real_data(self, tmp_path):
+        ds = _make_edge_padded_ds("2026-05-01", 15, slice(3, 10), "o2_0")
+        zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _span_df(
+            zarr_path, ["o2_0"], "2026-05-01", "2026-05-15"
+        )
+
+        cov = catalog.get_var_coverage("o2_0")
+
+        assert cov is not None
+        assert (cov.start, cov.end) == (
+            pd.Timestamp("2026-05-04"),
+            pd.Timestamp("2026-05-10"),
+        )
+
+    def test_file_span_kept_when_there_is_no_frontier_to_measure(self, tmp_path):
+        """A timeless column has no dates of its own; the file's span is the answer."""
+        ds = _make_padded_ds("2026-05-01", n_days=5, n_valid=5, var="ac_amp")
+        ds["bathy"] = (["lat", "lon"], np.ones((3, 3)))
+        zarr_path = _write_zarr(tmp_path, ds, name="h2ds_2026.zarr")
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _span_df(
+            zarr_path, ["ac_amp", "bathy"], "2026-05-01", "2026-05-05"
+        )
+
+        cov = catalog.get_var_coverage("bathy")
+
+        assert cov is not None
+        assert (cov.start, cov.end) == (
+            pd.Timestamp("2026-05-01"),
+            pd.Timestamp("2026-05-05"),
+        )
+
+    def test_unknown_variable_is_none(self, tmp_path):
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _span_df(
+            tmp_path / "h2ds_2026.zarr", ["ac_amp"], "2026-05-01", "2026-05-05"
+        )
+
+        assert catalog.get_var_coverage("not_a_var") is None
+
 
 # ---------------------------------------------------------------------------
 # get_bbox
@@ -404,6 +563,64 @@ class TestGetBbox:
         catalog = _make_catalog(tmp_path)
         catalog.var_config.bbox = BBox(-10.0, 30.0, 0.0, 40.0)
         assert catalog.get_bbox() == BBox(-10.0, 30.0, 0.0, 40.0)
+
+
+# ---------------------------------------------------------------------------
+# get_store_bbox
+# ---------------------------------------------------------------------------
+
+
+def _df_with_extent(rows: Sequence[tuple[float, float, float, float]]) -> pd.DataFrame:
+    """Catalog df carrying only what the extent union reads."""
+    return pd.DataFrame(
+        [
+            {"path": f"f{i}.zarr", "xmin": x0, "ymin": y0, "xmax": x1, "ymax": y1}
+            for i, (x0, y0, x1, y1) in enumerate(rows)
+        ]
+    )
+
+
+class TestGetStoreBbox:
+    def test_returns_none_for_an_empty_catalog(self, tmp_path):
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = pd.DataFrame()
+        assert catalog.get_store_bbox() is None
+
+    def test_unions_the_extents_of_every_file(self, tmp_path):
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _df_with_extent(
+            [(-10.0, 30.0, 0.0, 40.0), (-5.0, 25.0, 10.0, 35.0)]
+        )
+        assert catalog.get_store_bbox() == BBox(-10.0, 25.0, 10.0, 40.0)
+
+    def test_reports_the_store_not_the_configured_bbox(self, tmp_path):
+        # The point of the method: config says what was asked for, the files
+        # say what arrived. A wider store must not be reported as the request.
+        catalog = _make_catalog(tmp_path)
+        catalog.var_config.bbox = BBox(-10.0, 30.0, 0.0, 40.0)
+        catalog._index._df_cache = _df_with_extent([(-20.0, 20.0, 10.0, 50.0)])
+
+        assert catalog.get_store_bbox() == BBox(-20.0, 20.0, 10.0, 50.0)
+        assert catalog.get_bbox() == BBox(-10.0, 30.0, 0.0, 40.0)
+
+    def test_returns_none_when_the_extent_columns_are_absent(self, tmp_path):
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _df_for_zarr(
+            tmp_path / "h2ds_2026.zarr", ["sst"], "2026-05-15"
+        )
+        assert catalog.get_store_bbox() is None
+
+    def test_returns_none_for_a_degenerate_extent(self, tmp_path):
+        # A single-cell store has xmin == xmax, which BBox rejects; the
+        # inspector must degrade to "unknown" rather than raise.
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _df_with_extent([(0.0, 0.0, 0.0, 0.0)])
+        assert catalog.get_store_bbox() is None
+
+    def test_returns_none_when_extents_are_nan(self, tmp_path):
+        catalog = _make_catalog(tmp_path)
+        catalog._index._df_cache = _df_with_extent([(float("nan"), 30.0, 0.0, 40.0)])
+        assert catalog.get_store_bbox() is None
 
 
 # ---------------------------------------------------------------------------
@@ -738,7 +955,25 @@ def _grid_ds(
     )
 
 
-def _scanned_catalog(tmp_path, datasets: dict, *, verbose: bool = False) -> ZarrCatalog:
+def _hourly_grid_ds(start: str, n_hours: int, variables: Sequence[str] = ("sst",)):
+    """Hourly counterpart of :func:`_grid_ds`, on the same 6x6 test grid."""
+    times = pd.date_range(start, periods=n_hours, freq="h")
+    data = {
+        name: (
+            ["time", "lat", "lon"],
+            np.full((n_hours, len(_LATS), len(_LONS)), float(i + 1)),
+        )
+        for i, name in enumerate(variables)
+    }
+    return xr.Dataset(
+        data,
+        coords={"time": times, "lat": list(_LATS), "lon": list(_LONS)},
+    )
+
+
+def _scanned_catalog(
+    tmp_path, datasets: dict, *, verbose: bool = False, time_step: str = "daily"
+) -> ZarrCatalog:
     """Write *datasets* as zarr stores, then return a catalog that scanned them.
 
     Built with auto_refresh=True and a tmp metadata root, so the catalog rows
@@ -748,7 +983,7 @@ def _scanned_catalog(tmp_path, datasets: dict, *, verbose: bool = False) -> Zarr
         _write_zarr(tmp_path, ds, name=name)
     return ZarrCatalog(
         "sst",
-        app_config=_make_app_config(),
+        app_config=_make_app_config(time_step),
         store_root=tmp_path,
         metadata_root=tmp_path / "metadata",
         auto_refresh=True,
@@ -951,6 +1186,72 @@ class TestOpenDatasetIntegration:
         ds = catalog.open_dataset(start_date="2020-01-01", end_date="2020-01-03")
         assert all(pd.Timestamp(t).hour == 0 for t in ds.time.values)
 
+    def test_hourly_range_keeps_the_final_day_whole(self, tmp_path):
+        """
+        The end date names a calendar day, so the window must cover all of it.
+        An inclusive slice at midnight returned only 00:00 of the final day —
+        25 of 48 steps here.
+        """
+        catalog = _scanned_catalog(
+            tmp_path,
+            {"hourly.zarr": _hourly_grid_ds("2020-01-01", 48)},
+            time_step="hourly",
+        )
+        ds = catalog.open_dataset(start_date="2020-01-01", end_date="2020-01-02")
+        times = pd.DatetimeIndex(ds.time.values)
+        assert len(times) == 48, f"final day truncated: got {len(times)}"
+        assert times.is_unique
+
+    def test_hourly_dates_selection_returns_whole_days(self, tmp_path):
+        """Selecting a date must yield that day's 24 steps, not just midnight."""
+        catalog = _scanned_catalog(
+            tmp_path,
+            {"hourly.zarr": _hourly_grid_ds("2020-01-01", 48)},
+            time_step="hourly",
+        )
+        ds = catalog.open_dataset(dates=["2020-01-02"])
+        times = pd.DatetimeIndex(ds.time.values)
+        assert len(times) == 24, f"expected a whole day, got {len(times)}"
+        assert set(times.normalize().unique()) == {pd.Timestamp("2020-01-02")}
+
+    def test_daily_range_end_stays_inclusive(self, tmp_path):
+        """The daily window is unchanged by the half-open upper bound."""
+        catalog = _scanned_catalog(tmp_path, {"d.zarr": _grid_ds("2020-01-01", 5)})
+        ds = catalog.open_dataset(start_date="2020-01-01", end_date="2020-01-03")
+        assert len(ds.time) == 3
+
+    def test_hourly_store_keeps_its_sub_daily_stamps(self, tmp_path):
+        """
+        time_step=hourly must skip the midnight snap. Normalizing an hourly axis
+        maps all 24 steps of a day onto one stamp — a year of 8784 steps becomes
+        366 duplicated timestamps, silently.
+        """
+        catalog = _make_catalog(tmp_path, time_step="hourly")
+        ds = xr.Dataset(
+            {"sst": (["time"], np.arange(48.0))},
+            coords={"time": pd.date_range("2020-01-01", periods=48, freq="h")},
+        )
+
+        out = catalog._reader._normalize_time(ds)
+        times = pd.DatetimeIndex(out.time.values)
+        assert len(times) == 48
+        assert times.is_unique, "hourly stamps were collapsed"
+        assert sorted({t.hour for t in times}) == list(range(24))
+
+    def test_daily_store_is_still_normalised(self, tmp_path):
+        """The default cadence keeps the existing midnight snap."""
+        catalog = _make_catalog(tmp_path)  # time_step defaults to daily
+        out = catalog._reader._normalize_time(_grid_ds("2020-01-01", 3, hour=12))
+        assert all(pd.Timestamp(t).hour == 0 for t in out.time.values)
+
+    def test_var_config_without_time_step_defaults_to_daily(self, tmp_path):
+        """A stand-in config predating the field must keep the old behaviour."""
+        catalog = _make_catalog(tmp_path)
+        catalog._reader._index.var_config = SimpleNamespace()  # no time_step
+
+        out = catalog._reader._normalize_time(_grid_ds("2020-01-01", 3, hour=12))
+        assert all(pd.Timestamp(t).hour == 0 for t in out.time.values)
+
     def test_normalize_time_passes_through_without_time_coord(self, tmp_path):
         """Static fields (e.g. bathy) have no time axis and must survive intact."""
         catalog = _make_catalog(tmp_path)
@@ -967,3 +1268,199 @@ class TestOpenDatasetIntegration:
 
         with pytest.raises(FileNotFoundError, match="Catalog is empty"):
             catalog.open_dataset(start_date="2020-01-01", end_date="2020-01-03")
+
+
+# ---------------------------------------------------------------------------
+# get_nonnull_days
+#
+# The set-valued counterpart to get_vars_nonnull_end. That one answers "how far
+# has this variable got", which cannot see a null day *inside* an
+# otherwise-compiled span: the frontier moves past it and nothing asks again.
+# ---------------------------------------------------------------------------
+
+
+class TestGetNonnullDays:
+    def _store(self, tmp_path, null_days=(), name="v_2020.zarr", hour=0):
+        times = pd.date_range("2020-01-01", "2020-01-10", freq="D") + pd.Timedelta(
+            hours=hour
+        )
+        nulls = pd.DatetimeIndex(null_days)
+        data = np.random.default_rng(0).uniform(1, 2, size=(len(times), 2, 2))
+        for i, t in enumerate(times):
+            if t in nulls:
+                data[i, :, :] = np.nan
+        ds = xr.Dataset(
+            {"sst": (["time", "lat", "lon"], data)},
+            coords={"time": times, "lat": [30.0, 35.0], "lon": [-10.0, -5.0]},
+        )
+        root = tmp_path / "store"
+        root.mkdir(exist_ok=True)
+        ds.to_zarr(root / name)
+        return root
+
+    def _call(self, root, window, var_names, tmp_path):
+        from h2mare.storage.zarr_catalog import ZarrCatalog
+
+        cat = ZarrCatalog.__new__(ZarrCatalog)
+        cat._index = MagicMock()
+        df = pd.DataFrame(
+            [
+                {
+                    "path": str(p),
+                    "variables": ["sst"],
+                    "start_date": pd.Timestamp("2020-01-01"),
+                    "end_date": pd.Timestamp("2020-01-10"),
+                }
+                for p in sorted(root.glob("*.zarr"))
+            ]
+        )
+        type(cat._index).df = property(lambda self, _df=df: _df)
+        return ZarrCatalog.get_nonnull_days(cat, window, var_names)
+
+    def test_returns_the_days_with_data(self, tmp_path):
+        root = self._store(tmp_path)
+        window = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"))
+
+        out = self._call(root, window, ["sst"], tmp_path)
+
+        assert len(out["sst"]) == 10
+
+    def test_a_null_day_is_excluded(self, tmp_path):
+        root = self._store(tmp_path, null_days=[pd.Timestamp("2020-01-05")])
+        window = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"))
+
+        out = self._call(root, window, ["sst"], tmp_path)
+
+        assert pd.Timestamp("2020-01-05") not in out["sst"]
+        assert len(out["sst"]) == 9
+
+    def test_window_bounds_the_scan(self, tmp_path):
+        root = self._store(tmp_path)
+        window = DateRange(pd.Timestamp("2020-01-03"), pd.Timestamp("2020-01-05"))
+
+        out = self._call(root, window, ["sst"], tmp_path)
+
+        assert len(out["sst"]) == 3
+
+    def test_none_reduces_across_every_variable(self, tmp_path):
+        root = self._store(tmp_path)
+        window = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"))
+
+        out = self._call(root, window, None, tmp_path)
+
+        assert len(out["__any__"]) == 10
+
+    def test_a_variable_with_no_data_is_omitted(self, tmp_path):
+        root = self._store(tmp_path, null_days=pd.date_range("2020-01-01", periods=10))
+        window = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"))
+
+        assert self._call(root, window, ["sst"], tmp_path) == {}
+
+    def test_last_day_of_a_noon_stamped_store_is_still_scanned(self, tmp_path):
+        """
+        The window end is a date, the store's stamps need not be midnight. A
+        bound taken verbatim drops the final day, so a day that has data is
+        reported as having none — and the compiler then treats it as a hole to
+        refill on every run.
+        """
+        root = self._store(tmp_path, hour=12)
+        window = DateRange(pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-10"))
+
+        out = self._call(root, window, ["sst"], tmp_path)
+
+        assert pd.Timestamp("2020-01-10") in out["sst"]
+        assert len(out["sst"]) == 10
+
+
+# ---------------------------------------------------------------------------
+# __repr__
+# ---------------------------------------------------------------------------
+
+
+class TestRepr:
+    def test_states_the_data_cadence(self, tmp_path):
+        assert "time_step=hourly" in repr(_make_catalog(tmp_path, time_step="hourly"))
+        assert "time_step=daily" in repr(_make_catalog(tmp_path))
+
+    def test_reports_the_file_period_beside_the_cadence(self, tmp_path):
+        """
+        Two different facts, and either alone gets read as the other: how the
+        store is cut into files, versus how far apart its steps are. An hourly
+        store written one file per year is both at once, so both are shown.
+        """
+        text = repr(_make_catalog(tmp_path, time_step="hourly"))
+
+        assert "file_period=year" in text
+        assert "time_step=hourly" in text
+        # The word this field used to carry, and the reason it was renamed.
+        assert "resolution" not in text
+
+
+# ---------------------------------------------------------------------------
+# Relocating a variable to another store root
+# ---------------------------------------------------------------------------
+
+
+class TestCatalogBuiltForAnotherRoot:
+    """
+    Regression: the catalog sidecar is named for the var_key alone and lives
+    under the project's METADATA_DIR, so nothing ties it to the root it was
+    built from. Once a variable can name its own store_root in config.yaml,
+    repointing one is an ordinary edit — and the stale catalog left behind
+    holds the previous root's absolute paths.
+
+    The usual staleness check cannot catch it: has_changes() swallows the
+    scanner's FileNotFoundError and reports False, and the disk-vs-catalog
+    comparison is gated on store_root.exists(). So a root that is unmounted or
+    not yet created served the old location's files instead.
+    """
+
+    def _write_sidecar(self, metadata_root, records):
+        metadata_root.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(records).to_parquet(
+            metadata_root / "sst_zarr_catalog.parquet", index=False
+        )
+
+    def _catalog(self, store_root, metadata_root, scanner):
+        catalog = ZarrCatalog(
+            "sst",
+            app_config=_make_app_config(),
+            store_root=store_root,
+            metadata_root=metadata_root,
+            auto_refresh=False,
+            warn_if_missing=False,
+        )
+        catalog._index._scanner = scanner
+        return catalog
+
+    def test_old_roots_catalog_is_discarded_rather_than_served(self, tmp_path):
+        old_root = tmp_path / "old_drive"
+        new_root = tmp_path / "new_drive"  # deliberately absent, as if unmounted
+        metadata_root = tmp_path / "metadata"
+        self._write_sidecar(metadata_root, [_record(old_root / "a.zarr")])
+
+        scanner = _FakeScanner(changes=False)
+        catalog = self._catalog(new_root, metadata_root, scanner)
+
+        df = catalog.df
+
+        assert scanner.scan_calls == 1, "the foreign catalog should force a rescan"
+        assert df.empty, "no file from the old root may be reported under the new one"
+
+    def test_catalog_matching_the_root_is_still_served_without_rescanning(
+        self, tmp_path
+    ):
+        """The guard must not fire for the ordinary case, or every read rescans."""
+        store_root = tmp_path / "store"
+        store_root.mkdir()
+        (store_root / "a.zarr").mkdir()
+        metadata_root = tmp_path / "metadata"
+        self._write_sidecar(metadata_root, [_record(store_root / "a.zarr")])
+
+        scanner = _FakeScanner(changes=False)
+        catalog = self._catalog(store_root, metadata_root, scanner)
+
+        df = catalog.df
+
+        assert scanner.scan_calls == 0
+        assert len(df) == 1

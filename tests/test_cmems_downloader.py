@@ -13,7 +13,7 @@ from h2mare.downloader.cmems_downloader import (
     generate_copernicus_patterns,
 )
 from h2mare.models import AppConfig
-from h2mare.types import DateRange, DownloadTask, TimeResolution
+from h2mare.types import DateRange, DownloadTask, FilePeriod
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -33,6 +33,7 @@ _ENTRY = {
 
 _ENTRY_NO_NRT = {**_ENTRY, "dataset_id_nrt": None}
 _ENTRY_NO_SUBSET = {**_ENTRY, "subset": False, "dataset_id_nrt": None}
+_ENTRY_HOURLY = {**_ENTRY, "time_step": "hourly"}
 
 
 def _make_config(entry=_ENTRY) -> AppConfig:
@@ -54,6 +55,16 @@ def dl_no_subset(tmp_path):
     return CMEMSDownloader(
         "sst",
         app_config=_make_config(_ENTRY_NO_SUBSET),
+        store_root=tmp_path / "store",
+        download_root=tmp_path,
+    )
+
+
+@pytest.fixture
+def dl_hourly(tmp_path):
+    return CMEMSDownloader(
+        "sst",
+        app_config=_make_config(_ENTRY_HOURLY),
         store_root=tmp_path / "store",
         download_root=tmp_path,
     )
@@ -266,7 +277,7 @@ class TestExecuteTask:
             patch.object(dl, "download_subset") as mock_subset,
             patch.object(dl, "_retry_call", **self._NO_RETRY),
         ):
-            dl._execute_task(task, TimeResolution.MONTH)
+            dl._execute_task(task, FilePeriod.MONTH)
 
         assert mock_subset.call_count == 3  # Jan, Feb, Mar
 
@@ -280,7 +291,7 @@ class TestExecuteTask:
             patch.object(dl_no_subset, "download_original") as mock_original,
             patch.object(dl_no_subset, "_retry_call", **self._NO_RETRY),
         ):
-            dl_no_subset._execute_task(task, TimeResolution.MONTH)
+            dl_no_subset._execute_task(task, FilePeriod.MONTH)
 
         mock_original.assert_called_once()
 
@@ -298,7 +309,7 @@ class TestExecuteTask:
             patch.object(dl, "_retry_call", **self._NO_RETRY),
         ):
             with pytest.raises(ConnectionError, match="API down"):
-                dl._execute_task(task, TimeResolution.MONTH)
+                dl._execute_task(task, FilePeriod.MONTH)
 
     def test_subset_true_passes_chunk_dates_to_download_subset(self, dl):
         task = DownloadTask(
@@ -310,9 +321,110 @@ class TestExecuteTask:
             patch.object(dl, "download_subset") as mock_subset,
             patch.object(dl, "_retry_call", **self._NO_RETRY),
         ):
-            dl._execute_task(task, TimeResolution.MONTH)
+            dl._execute_task(task, FilePeriod.MONTH)
 
         call_args = mock_subset.call_args
         assert call_args[0][0] == "cmems-rep-sst"
         assert pd.Timestamp(call_args[0][1]) == pd.Timestamp("2020-06-01")
         assert pd.Timestamp(call_args[0][2]) == pd.Timestamp("2020-06-30")
+
+
+# ---------------------------------------------------------------------------
+# Dataset availability — the trailing day
+# ---------------------------------------------------------------------------
+
+
+class TestAvailabilityTrailingDay:
+    """
+    Store coverage is day-granular, so a day ingested while the provider is
+    still publishing it counts as covered and its remaining hours are never
+    fetched again. The trailing day is held back until it is whole.
+    """
+
+    @staticmethod
+    def _availability(dl, first: str, last: str) -> pd.Timestamp:
+        with patch(
+            "h2mare.downloader.cmems_downloader.get_dataset_time_range",
+            return_value=(pd.Timestamp(first), pd.Timestamp(last)),
+        ):
+            return pd.Timestamp(dl.get_rep_availability().end)
+
+    def test_hourly_partial_last_day_is_held_back(self, dl_hourly):
+        end = self._availability(dl_hourly, "2020-01-01", "2020-06-30 05:00")
+
+        assert end == pd.Timestamp("2020-06-29")
+
+    def test_hourly_complete_last_day_is_kept(self, dl_hourly):
+        end = self._availability(dl_hourly, "2020-01-01", "2020-06-30 23:00")
+
+        assert end == pd.Timestamp("2020-06-30")
+
+    def test_daily_keeps_the_day_its_last_stamp_falls_in(self, dl):
+        # One step per day, so the day holding the last stamp is complete by
+        # definition — noon stamps must not be mistaken for a partial day.
+        end = self._availability(dl, "2020-01-01", "2020-06-30 12:00")
+
+        assert end == pd.Timestamp("2020-06-30")
+
+    def test_a_history_of_one_partial_day_does_not_go_empty(self, dl_hourly):
+        """Holding the day back would put end before start, which DateRange
+        rejects outright — a brand-new product must not raise."""
+        end = self._availability(dl_hourly, "2020-06-30 00:00", "2020-06-30 05:00")
+
+        assert end == pd.Timestamp("2020-06-30")
+
+
+# ---------------------------------------------------------------------------
+# download_subset — the end bound handed to the toolbox
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadSubsetEndBound:
+    """
+    A chunk end is a date, and the toolbox reads it as an instant. On an hourly
+    variable that must be widened to the end of the day, or every chunk arrives
+    23 hours short — silently, since the loss sits at the tail of the span where
+    the convert step only warns.
+    """
+
+    @staticmethod
+    def _requested_end(dl, end="2020-06-30") -> pd.Timestamp:
+        with patch(
+            "h2mare.downloader.cmems_downloader.download_subset"
+        ) as mock_download:
+            dl.download_subset(
+                "cmems-rep-sst", pd.Timestamp("2020-06-01"), pd.Timestamp(end)
+            )
+        return pd.Timestamp(mock_download.call_args.kwargs["end"])
+
+    def test_hourly_requests_the_whole_final_day(self, dl_hourly):
+        end = self._requested_end(dl_hourly)
+
+        assert end >= pd.Timestamp("2020-06-30 23:00")
+        assert end < pd.Timestamp("2020-07-01")
+
+    def test_daily_keeps_the_midnight_bound(self, dl):
+        # Deliberate: every existing store was written under this bound, and a
+        # daily product's single step of the day already falls inside it.
+        assert self._requested_end(dl) == pd.Timestamp("2020-06-30")
+
+    def test_hourly_start_is_untouched(self, dl_hourly):
+        # Widening only applies to the upper bound — midnight already names the
+        # first step of the start day.
+        with patch(
+            "h2mare.downloader.cmems_downloader.download_subset"
+        ) as mock_download:
+            dl_hourly.download_subset(
+                "cmems-rep-sst", pd.Timestamp("2020-06-01"), pd.Timestamp("2020-06-30")
+            )
+
+        assert pd.Timestamp(mock_download.call_args.kwargs["start"]) == pd.Timestamp(
+            "2020-06-01"
+        )
+
+    def test_hourly_chunks_do_not_overlap_at_the_boundary(self, dl_hourly):
+        """Consecutive chunks must meet, not overlap: the widened end of one
+        stops one nanosecond before the next chunk's start."""
+        jan_end = self._requested_end(dl_hourly, end="2020-01-31")
+
+        assert jan_end < pd.Timestamp("2020-02-01")

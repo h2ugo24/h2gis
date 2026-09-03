@@ -70,25 +70,21 @@ def run(
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        is_flag=True,
         help="Plan the download and log tasks without fetching any data.",
     ),
     no_convert: bool = typer.Option(
         False,
         "--no-convert",
-        is_flag=True,
         help="Download raw files but skip Zarr conversion and compile.",
     ),
     no_compile: bool = typer.Option(
         False,
         "--no-compile",
-        is_flag=True,
         help="Skip the compile step (h2ds dataset merge) after Zarr conversion.",
     ),
     no_parquet: bool = typer.Option(
         False,
         "--no-parquet",
-        is_flag=True,
         help=(
             "Skip the Zarr → Parquet conversion step after compilation. "
             "Implied automatically by --no-compile and --no-convert."
@@ -97,13 +93,11 @@ def run(
     h2ds_zarr_backup: bool = typer.Option(
         False,
         "--h2ds-zarr-backup",
-        is_flag=True,
         help="Copy the compiled h2ds zarr files to the local backup store.",
     ),
     h2ds_parquet_backup: bool = typer.Option(
         False,
         "--h2ds-parquet-backup",
-        is_flag=True,
         help="Copy the h2ds Parquet output to the remote store.",
     ),
     h2ds_zarr_backup_dir: Optional[Path] = typer.Option(
@@ -148,13 +142,32 @@ def run(
         )
         raise typer.Exit(code=1)
 
-    store_root = store_path or get_settings().STORE_ROOT
+    # Applied to settings rather than passed down, so every step resolves the
+    # same root — including the ones nothing threads an argument to. See
+    # Settings.override_store_root.
+    if store_path is not None:
+        get_settings().override_store_root(store_path)
+
+    # STORE_ROOT is the root for variables that do not name one themselves, so
+    # it is only required when at least one selected variable relies on it. A
+    # config where every variable declares its own store_root is complete
+    # without it, and refusing to run would be wrong.
+    store_root = get_settings().STORE_ROOT
     if store_root is None:
-        typer.echo(
-            "Error: STORE_ROOT is not set. Define it in .env or pass --store-path.",
-            err=True,
-        )
-        raise typer.Exit(code=1)
+        variables = get_settings().app_config.variables
+        rootless = sorted(k for k in selected if variables[k].store_root is None)
+        if rootless:
+            typer.echo(
+                "Error: STORE_ROOT is not set and these variable(s) do not "
+                f"declare a store_root of their own: {', '.join(rootless)}. "
+                "Define STORE_ROOT in .env, pass --store-path, or give each "
+                "variable a store_root in config.yaml.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        # Never consulted — every selected variable resolves to its own root —
+        # but PipelineManager needs a default to hold.
+        store_root = get_settings().ZARR_DIR
 
     success = PipelineManager(
         app_config=get_settings().app_config,
